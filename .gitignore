@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+/installer/target
+
+# Editor / OS cruft
+*.rs.bk
+*.swp
+*~
+.DS_Store
+
+# Note: Cargo.lock IS committed — this is a binary application, so a pinned
+# lockfile gives reproducible builds.

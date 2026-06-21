@@ -1,0 +1,29 @@
+#!/bin/sh
+# Launch the TUI installer with a proper controlling terminal on tty1.
+#
+# A bare dinit `process` service does not acquire a controlling tty, which a
+# full-screen TUI needs (for resize signals, etc.). `setsid -c` creates a new
+# session and makes the given tty controlling, then execs the installer.
+#
+# If the installer exits non-zero (crash), we drop to a recovery shell rather
+# than respawn-looping silently — easier to debug a broken live image.
+
+# Size the console font to the screen so the TUI is readable on everything from
+# a small VM window to a 4K panel: a bigger framebuffer gets a bigger font.
+# Best-effort — if the resolution can't be read or a font is missing, the
+# default font stays. Terminus fonts ship with the terminus-font package.
+if command -v setfont >/dev/null 2>&1 && [ -r /sys/class/graphics/fb0/virtual_size ]; then
+    fbw=0
+    IFS=, read -r fbw _ < /sys/class/graphics/fb0/virtual_size 2>/dev/null
+    case "$fbw" in
+        ''|*[!0-9]*) fbw=0 ;;
+    esac
+    if   [ "$fbw" -ge 3840 ]; then setfont ter-132n 2>/dev/null || setfont ter-128n 2>/dev/null || true   # 4K
+    elif [ "$fbw" -ge 2560 ]; then setfont ter-128n 2>/dev/null || setfont ter-124n 2>/dev/null || true   # 1440p
+    elif [ "$fbw" -ge 1920 ]; then setfont ter-124n 2>/dev/null || setfont ter-120n 2>/dev/null || true   # 1080p
+    elif [ "$fbw" -ge 1280 ]; then setfont ter-120n 2>/dev/null || true                                    # 720p
+    fi
+    # below 1280 (or unknown): keep the default console font
+fi
+
+exec setsid -c /usr/bin/artix-installer <>/dev/tty1 >&0 2>&1 || exec /bin/sh
