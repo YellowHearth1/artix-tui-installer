@@ -13,13 +13,13 @@
 <img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
 
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
-<img alt="i18n" src="https://img.shields.io/badge/i18n-українська_%7C_english-FFD700?style=for-the-badge">
+<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english-FFD700?style=for-the-badge">
 <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
 
-<img alt="Останній коміт" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square&label=останній%20коміт">
-<img alt="Зірки" src="https://img.shields.io/github/stars/YellowHearth1/artix-tui-installer?style=flat-square&label=зірки">
+<img alt="Останній коміт" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square&label=%D0%BE%D1%81%D1%82%D0%B0%D0%BD%D0%BD%D1%96%D0%B9%20%D0%BA%D0%BE%D0%BC%D1%96%D1%82">
+<img alt="Зірки" src="https://img.shields.io/github/stars/YellowHearth1/artix-tui-installer?style=flat-square&label=%D0%B7%D1%96%D1%80%D0%BA%D0%B8">
 <img alt="Issues" src="https://img.shields.io/github/issues/YellowHearth1/artix-tui-installer?style=flat-square">
-<img alt="Розмір" src="https://img.shields.io/github/repo-size/YellowHearth1/artix-tui-installer?style=flat-square&label=розмір">
+<img alt="Розмір" src="https://img.shields.io/github/repo-size/YellowHearth1/artix-tui-installer?style=flat-square&label=%D1%80%D0%BE%D0%B7%D0%BC%D1%96%D1%80">
 
 <br>
 
