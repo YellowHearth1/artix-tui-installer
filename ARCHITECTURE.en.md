@@ -34,7 +34,7 @@ main.rs (terminal, event loop)
 | `src/system/runner.rs` | plan execution, log streaming, `capture()` | — |
 | `src/rollback.rs` | btrfs rollback (snapshot picker) | — |
 | `src/assets/` | waybar/wofi/fastfetch configs, the Pinnacle config tarball | Pinnacle config: unpack `pinnacle.tar.gz`, edit, repack |
-| `iso-profile/` | live-ISO profile for `buildiso` (packages, dinit services, overlay) | a live-ISO service → symlink in `live-overlay/etc/dinit.d/boot.d/` |
+| `iso-profile/` | live-ISO profile for `buildiso` (packages, dinit services, overlay); but the profile `buildiso` actually reads is a separate `profile.yaml` (outside this repo), not `Packages-Live`/`live-overlay/` here | a live-ISO service → add it to `live-session.services:` in `profile.yaml` |
 
 ## Making a typical change
 
@@ -54,8 +54,10 @@ the draw router. Modals — don't forget `any_modal_open()`.
 **Add a bootloader** → `ORDER` in `src/screens/options.rs`, a branch in
 `match c.bootloader` in `install/mod.rs`, an i18n hint, README.
 
-**Wi-Fi behaviour** → `src/screens/wifi.rs`; the daemon on the ISO is enabled
-by the `iso-profile/live-overlay/etc/dinit.d/boot.d/NetworkManager` symlink.
+**Wi-Fi behaviour** → `src/screens/wifi.rs`; the NetworkManager daemon on the
+live ISO is enabled via the `live-session.services:` list in `profile.yaml`
+(the file `buildiso` actually reads), NOT a symlink in this repo's
+`iso-profile/live-overlay/` — files placed there don't reach the built ISO.
 
 ## Building & checks
 

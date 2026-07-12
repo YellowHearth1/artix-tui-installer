@@ -114,28 +114,20 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     //    --needed makes this a no-op on this distro's own ISO (already there);
     //    -Sy refreshes first so a stale live db doesn't cause "target not found".
     // 0a) Optionally rebuild the pacman mirrorlists BEFORE anything downloads:
-    //     regional mirrors (seeded from the timezone) active and speed-ranked on
-    //     top, the full list kept commented below for relocation, unwanted
-    //     mirrors filtered out. We write MIRROR_OPTIMIZE_SCRIPT to the live system
-    //     and run it with the region's country names as positional args. Doing
-    //     it up front means host-tools and every later pacman call use the fast
-    //     mirrors. Best-effort throughout (see the script).
+    //     the optimizer probes EVERY mirror in the list (12 in parallel, 6s cap
+    //     each), writes the reachable ones fastest-first and comments the dead
+    //     or crawling ones out. Doing it up front means host-tools, basestrap
+    //     and every later pacman call only ever see mirrors that answered
+    //     seconds ago — a server that degraded since the ISO was built can no
+    //     longer stall the install. Best-effort throughout (see the script).
     if c.optimize_mirrors {
-        let countries = mirror_region_countries(&c.timezone);
         // Quoted heredoc keeps the script's $@/$1/`cmd`/$() literal on write.
         let write_cmd = format!(
             "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF",
             MIRROR_OPTIMIZE_SCRIPT
         );
         plan.push(act("sh", &["-c", &write_cmd]));
-        // Country names may contain spaces ("United States"), so pass each as a
-        // separate argv entry rather than one space-split string. We rank the
-        // nearest 5 countries on top (speed-probed); every other mirror in the
-        // world is still emitted active below by assemble(), just unranked — so
-        // there's always a fallback without probing hundreds of servers.
-        let mut argv: Vec<&str> = vec!["/tmp/optmirrors.sh"];
-        argv.extend(countries.iter().copied().take(5));
-        plan.push(act("sh", &argv));
+        plan.push(act("sh", &["/tmp/optmirrors.sh"]));
     }
 
     let mut host_tools: Vec<&str> =
@@ -267,7 +259,17 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     // letting the user watch the base download and judge their connection speed.
     // basestrap forces --noconfirm for the base set (no provider prompts), and
     // the PTY runner auto-answers any "Proceed? [Y/n]" with Y, so it won't stall.
-    plan.push(act_interactive("sh", &["-c", &basestrap_cmd]));
+    // One stalled mirror mid-basestrap used to abort the whole install
+    // (pacman's low-speed cutoff → "failed to commit transaction") and force a
+    // restart from step 1. Retry up to 3 times: packages already downloaded
+    // sit in the pacman cache, so a retry only re-fetches what's missing and
+    // typically finishes in seconds. With the mirror optimizer (0a) on, the
+    // retry also walks a list that was health-checked moments ago.
+    let basestrap_retry = format!(
+        "for a in 1 2 3; do {basestrap_cmd} && exit 0; [ $a = 3 ] && exit 1; \
+         echo \">>> basestrap failed (attempt $a/3) - retrying in 5s...\"; sleep 5; done"
+    );
+    plan.push(act_interactive("sh", &["-c", &basestrap_retry]));
 
     // 2b) Ban XLibre on the TARGET. basestrap has just created
     //     /mnt/etc/pacman.conf; block the `xlibre` group + every xlibre-*
@@ -629,50 +631,33 @@ pub fn build_plan(app: &App) -> Vec<Action> {
              fi; \
              true",
         ));
-        // Apply the same mirror treatment to the chaotic-mirrorlist (region on
-        // top, unwanted mirrors filtered out), inside the chroot where it lives.
+        // Apply the same mirror treatment to the chaotic-mirrorlist (full
+        // health check, fastest-first), inside the chroot where it lives.
         //
         // IMPORTANT: artix-chroot (like arch-chroot) runs each invocation in its
         // own unshare namespace with a FRESH tmpfs on /tmp, so a file written by
         // one chroot call is GONE in the next. We therefore WRITE the script and
         // RUN it in a SINGLE chroot call, so both see the same /tmp. Best-effort.
         if c.optimize_mirrors {
-            let countries = mirror_region_countries(&c.timezone);
-            // Country names may contain spaces; single-quote each for the shell.
-            // Same nearest-5 cap as the regional list for consistency (chaotic
-            // also has its geo-mirror as the primary always-up fallback).
-            let mut args = String::new();
-            for c in countries.iter().take(5) {
-                args.push_str(" '");
-                args.push_str(c);
-                args.push('\'');
-            }
             let combined = format!(
                 "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-                 sh /tmp/optmirrors.sh --chaotic{}",
-                MIRROR_OPTIMIZE_SCRIPT, args
+                 sh /tmp/optmirrors.sh --chaotic",
+                MIRROR_OPTIMIZE_SCRIPT
             );
             plan.push(chroot(&combined));
         }
     }
 
-    // Optimize the Arch mirrorlist (extra/multilib) the same way — region on
-    // top with per-country headers, unwanted mirrors filtered out — in the chroot, where
+    // Optimize the Arch mirrorlist (extra/multilib) the same way — full
+    // health check, fastest-first — in the chroot, where
     // /etc/pacman.d/mirrorlist-arch exists (it's absent on the live ISO, so it
     // can't be ranked earlier). Single chroot call (each gets a fresh /tmp).
     // Runs before Phase 2 so those package downloads use the better mirrors.
     if c.optimize_mirrors {
-        let countries = mirror_region_countries(&c.timezone);
-        let mut args = String::new();
-        for c in countries {
-            args.push_str(" '");
-            args.push_str(c);
-            args.push('\'');
-        }
         let combined = format!(
             "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-             sh /tmp/optmirrors.sh --arch{}",
-            MIRROR_OPTIMIZE_SCRIPT, args
+             sh /tmp/optmirrors.sh --arch",
+            MIRROR_OPTIMIZE_SCRIPT
         );
         plan.push(chroot(&combined));
     }
@@ -1315,9 +1300,18 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         if usb {
             let dev = c.usb_key_device.replace('\'', "");
             let pass_esc = luks_pass.replace('\'', "'\\''");
+            // A previous failed attempt can leave the stick mounted at
+            // /run/artix-usbkey — possibly several times over if the user
+            // retried more than once (each run stacks another mount, and one
+            // umount pops only one layer). wipefs then dies with "probing
+            // initialization failed: Device or resource busy" and the retry
+            // never gets going. So: unmount in a loop until nothing is left,
+            // flush buffers, and wipe with -f.
             plan.push(act("sh", &["-c", &format!(
-                "umount '{dev}'* 2>/dev/null; \
-                 wipefs -a '{dev}' && mkfs.fat -I -F 32 -n ARTIXKEY '{dev}' && \
+                "for i in 1 2 3 4 5; do umount /run/artix-usbkey 2>/dev/null || \
+                   umount '{dev}'* 2>/dev/null || break; done; \
+                 blockdev --flushbufs '{dev}' 2>/dev/null || true; \
+                 wipefs -af '{dev}' && mkfs.fat -I -F 32 -n ARTIXKEY '{dev}' && \
                  mkdir -p /run/artix-usbkey && mount -t vfat '{dev}' /run/artix-usbkey && \
                  dd if=/dev/urandom of=/run/artix-usb.key bs=512 count=8 && chmod 600 /run/artix-usb.key && \
                  rootpart=$(blkid -t PARTLABEL=ROOT -o device | head -n1) && \

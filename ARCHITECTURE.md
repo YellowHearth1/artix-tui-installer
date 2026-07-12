@@ -34,7 +34,7 @@ main.rs (термінал, цикл подій)
 | `src/system/runner.rs` | виконання плану, стрімінг логу, `capture()` | — |
 | `src/rollback.rs` | btrfs-відкат (меню знімків) | — |
 | `src/assets/` | waybar/wofi/fastfetch конфіги, тарбол конфігу Pinnacle | конфіг Pinnacle: розпакуй `pinnacle.tar.gz`, зміни, запакуй назад |
-| `iso-profile/` | профіль live-ISO для `buildiso` (пакети, dinit-сервіси, overlay) | сервіс на live-ISO → симлінк у `live-overlay/etc/dinit.d/boot.d/` |
+| `iso-profile/` | профіль live-ISO для `buildiso` (пакети, dinit-сервіси, overlay); але справжній профіль, який читає `buildiso` — це окремий `profile.yaml` (поза цим репо), а не `Packages-Live`/`live-overlay/` тут | сервіс на live-ISO → додай його в `live-session.services:` у `profile.yaml` |
 
 ## Як зробити типову зміну
 
@@ -54,8 +54,10 @@ draw. Модалки — не забудь `any_modal_open()`.
 **Додати завантажувач** → `ORDER` у `src/screens/options.rs`, гілка в
 `match c.bootloader` у `install/mod.rs`, i18n-підказка, README.
 
-**Wi-Fi поведінка** → `src/screens/wifi.rs`; демон на ISO вмикається
-симлінком `iso-profile/live-overlay/etc/dinit.d/boot.d/NetworkManager`.
+**Wi-Fi поведінка** → `src/screens/wifi.rs`; демон NetworkManager на живому
+ISO вмикається через список `live-session.services:` у `profile.yaml` (файлі,
+який реально читає `buildiso`), а НЕ симлінком у `iso-profile/live-overlay/`
+цього репо — файли з `live-overlay/` у зібраний ISO не потрапляють.
 
 ## Збірка й перевірки
 

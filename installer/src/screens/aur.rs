@@ -263,19 +263,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 pub fn tick(app: &mut App) {
     // Drain a finished AUR search.
     if let Some(rx) = &app.aur_rx {
-        if let Ok(res) = rx.try_recv() {
-            app.aur_searching = false;
-            app.aur_rx = None;
-            match res {
-                Ok(list) => {
-                    app.aur_results = list;
-                    app.aur_error = None;
-                    app.aur_cursor = 0;
+        // ALL three channel states must be handled — see packages.rs::tick for
+        // the story (a dead worker must surface as an error, not a forever-
+        // spinner).
+        match rx.try_recv() {
+            Ok(res) => {
+                app.aur_searching = false;
+                app.aur_rx = None;
+                match res {
+                    Ok(list) => {
+                        app.aur_results = list;
+                        app.aur_error = None;
+                        app.aur_cursor = 0;
+                    }
+                    Err(e) => {
+                        app.aur_results.clear();
+                        app.aur_error = Some(e);
+                    }
                 }
-                Err(e) => {
-                    app.aur_results.clear();
-                    app.aur_error = Some(e);
-                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                app.aur_searching = false;
+                app.aur_rx = None;
+                app.aur_results.clear();
+                app.aur_error = Some("search worker crashed - press Enter to retry".into());
             }
         }
     }

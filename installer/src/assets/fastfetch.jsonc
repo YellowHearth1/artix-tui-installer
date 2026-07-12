@@ -1,7 +1,9 @@
 {
 "logo": {
-    // auto: kitty graphics у kitty, sixel у foot/wezterm, фолбек деінде
-    "type": "auto",
+    // ЯВНО kitty-direct: термінал сесії — kitty, а "auto" на практиці
+    // зривається (детект протоколу не спрацьовує) і логотип друкується
+    // як сирий PNG ("PNG" + знаки питання). Пряма вказівка — стабільна.
+    "type": "kitty-direct",
     "source": "$HOME/.config/fastfetch/fastfetch.png",
     "padding": {
       "top": 5
@@ -122,6 +124,6 @@
     {
             "type": "custom",
             "format": "\u001b[90m  \u001b[31m  \u001b[32m  \u001b[33m  \u001b[34m  \u001b[35m  \u001b[36m  \u001b[37m      \u001b[90m  \u001b[31m  \u001b[32m  \u001b[33m  \u001b[34m  \u001b[35m  \u001b[36m  \u001b[37m                 "
-    },
+    }
     ]
 }
