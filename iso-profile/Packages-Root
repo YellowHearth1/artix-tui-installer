@@ -1,0 +1,31 @@
+# Packages installed into the live ISO root (the installer environment).
+# Init: dinit only.
+base
+base-devel
+dinit
+elogind-dinit
+dbus-dinit
+dbus-dinit-user
+linux
+linux-firmware
+# Networking tools the installer drives:
+networkmanager
+networkmanager-dinit
+wireless_tools
+wpa_supplicant
+# Disk / filesystem utilities the installer shells out to:
+gptfdisk
+dosfstools
+e2fsprogs
+util-linux
+parted
+# Bootstrap + chroot helpers:
+artools-pkg
+arch-install-scripts
+# The installer binary is added via the overlay (see profile.conf).
+nano
+# Console font for the live TTY (the installer runs on a Linux VT, which needs
+# a PSF font; Terminus renders the TUI glyphs crisply).
+terminus-font
+# kbd provides setfont/loadkeys used to apply the console font.
+kbd

@@ -1,0 +1,8 @@
+# Live-only packages (not copied to the installed system).
+# Keep minimal: the installer is the only "app" the live image needs.
+
+# Seat management for the LIVE environment. Per project decision the live ISO
+# uses seatd (lightweight) for seat/device access during boot. The installed
+# system's seat backend is chosen separately by the user in the installer.
+seatd
+seatd-dinit

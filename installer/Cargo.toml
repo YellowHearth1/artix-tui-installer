@@ -1,0 +1,46 @@
+[package]
+name = "artix-installer"
+version = "193.0.0"
+edition = "2021"
+description = "TUI installer for an Artix/dinit based distribution"
+license = "Apache-2.0"
+repository = "https://github.com/YellowHearth1/artix-tui-installer"
+readme = "../README.md"
+
+[[bin]]
+name = "artix-installer"
+path = "src/main.rs"
+
+[dependencies]
+# TUI core. ratatui 0.30 + crossterm 0.29 (updated pair).
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Error handling
+anyhow = "1"
+
+# Serialization for state, locale files, machine-readable command output
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Embed locale files into the binary (no separate files on the live ISO)
+rust-embed = "8"
+
+# Channels / async-ish log streaming without a full async runtime
+crossbeam-channel = "0.5"
+
+# Timezone list
+chrono-tz = "0.10"
+
+# Pseudo-terminal for interactive install mode: lets pacman think it's talking
+# to a real terminal, so we can stream its output into the TUI and feed answers
+# (provider numbers) back from an in-TUI input field.
+portable-pty = "0.9"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+

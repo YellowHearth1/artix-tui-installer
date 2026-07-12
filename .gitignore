@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target
+/installer/target
+
+# Editor / OS cruft
+*.rs.bk
+*.swp
+*~
+.DS_Store
+
+# Release artifacts — NEVER commit these to git. They bloat the repo history
+# and blow past storage quotas. Distribute binaries/tarballs via releases
+# (Forgejo/GitHub release attachments), not the git tree.
+*.tar.gz
+*.tar
+*.tgz
+*.rmeta
+# Compiled installer binaries (any name we've used for a built artifact)
+/artix-installer
+/installer/artix-installer
+bin18*
+artix-installer-bin
+/versions
+
+# Note: Cargo.lock IS committed — this is a binary application, so a pinned
+# lockfile gives reproducible builds.
+
+# Exception: the Pinnacle config tarball is a real source asset, not a build artifact
+!installer/src/assets/pinnacle.tar.gz

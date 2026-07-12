@@ -1,0 +1,5 @@
+To make the installer own tty1, ensure the live profile does NOT also start a
+getty/agetty service on tty1. In artools dinit profiles the tty services are
+usually named `tty1`..`tty6` under /etc/dinit.d. Either remove `tty1` from the
+boot bundle, or add `installer` to the bundle and drop `tty1`. Verify with:
+    dinitctl list
