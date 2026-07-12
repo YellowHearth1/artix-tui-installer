@@ -32,9 +32,25 @@ pub fn handle(app: &mut App) -> Result<()> {
 /// Returns true if the key was consumed globally.
 fn handle_global(app: &mut App, key: KeyEvent) -> bool {
     match (key.code, key.modifiers) {
-        // q quits, but not while installing on the Summary screen — there the
-        // screen itself guards against quitting mid-install.
-        (KeyCode::Char('q'), KeyModifiers::NONE) if app.screen != Screen::Summary => {
+        // q quits — but NEVER while a screen is capturing text (package/AUR
+        // search, user fields, timezone/keyboard filters, the Wi-Fi password,
+        // the options passphrase): a stray 'q' inside "quentin" or a LUKS
+        // passphrase must land in the field, not vaporize the session with
+        // every choice made so far. Ctrl+C stays the universal quit; Esc walks
+        // back. Summary additionally guards itself against a mid-install quit.
+        (KeyCode::Char('q'), KeyModifiers::NONE)
+            if !matches!(
+                app.screen,
+                Screen::Summary
+                    | Screen::Packages
+                    | Screen::Aur
+                    | Screen::User
+                    | Screen::Timezone
+                    | Screen::Keyboard
+                    | Screen::Wifi
+                    | Screen::Options
+            ) =>
+        {
             app.should_quit = true;
             true
         }

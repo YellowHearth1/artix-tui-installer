@@ -408,19 +408,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 pub fn tick(app: &mut App) {
     // Drain a finished repo search first.
     if let Some(rx) = &app.pkg_rx {
-        if let Ok(res) = rx.try_recv() {
-            app.pkg_searching = false;
-            app.pkg_rx = None;
-            match res {
-                Ok(list) => {
-                    app.pkg_results = list;
-                    app.pkg_error = None;
-                    app.cursor = 0;
+        // ALL three channel states must be handled. Matching only `Ok` left a
+        // dead worker (panic mid-search) spinning "searching…" forever with no
+        // way to retry — the same silent-limbo class as the old Wi-Fi bug.
+        match rx.try_recv() {
+            Ok(res) => {
+                app.pkg_searching = false;
+                app.pkg_rx = None;
+                match res {
+                    Ok(list) => {
+                        app.pkg_results = list;
+                        app.pkg_error = None;
+                        app.cursor = 0;
+                    }
+                    Err(e) => {
+                        app.pkg_results.clear();
+                        app.pkg_error = Some(e);
+                    }
                 }
-                Err(e) => {
-                    app.pkg_results.clear();
-                    app.pkg_error = Some(e);
-                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                app.pkg_searching = false;
+                app.pkg_rx = None;
+                app.pkg_results.clear();
+                app.pkg_error = Some("search worker crashed - press Enter to retry".into());
             }
         }
     }

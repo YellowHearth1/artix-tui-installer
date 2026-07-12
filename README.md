@@ -2,6 +2,32 @@
 
 # 🐧 Artix TUI Інсталятор
 
+**🇺🇦 Українська** · [🇬🇧 English](README.en.md)
+
+### Двомовний TUI-інсталятор Artix Linux — dinit, LUKS, btrfs-відкат, Wayland. Без systemd.
+
+<img alt="Rust" src="https://img.shields.io/badge/Rust-1.90+-B7410E?style=for-the-badge&logo=rust&logoColor=white">
+<img alt="ratatui" src="https://img.shields.io/badge/TUI-ratatui-1D9BF0?style=for-the-badge">
+<img alt="Artix Linux" src="https://img.shields.io/badge/Artix-Linux-10A0CC?style=for-the-badge&logo=artixlinux&logoColor=white">
+<img alt="init: dinit" src="https://img.shields.io/badge/init-dinit-4E9A06?style=for-the-badge">
+<img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
+
+<a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
+<img alt="i18n" src="https://img.shields.io/badge/i18n-українська_%7C_english-FFD700?style=for-the-badge">
+<img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
+
+<img alt="Останній коміт" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square&label=останній%20коміт">
+<img alt="Зірки" src="https://img.shields.io/github/stars/YellowHearth1/artix-tui-installer?style=flat-square&label=зірки">
+<img alt="Issues" src="https://img.shields.io/github/issues/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Розмір" src="https://img.shields.io/github/repo-size/YellowHearth1/artix-tui-installer?style=flat-square&label=розмір">
+
+<br>
+
+<img src="screenshots/14-summary.png" alt="Інсталятор у дії — екран перевірки та встановлення" width="900">
+
+<br>
+
+
 [![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Документація_розробника-ARCHITECTURE.md-6e40c9?style=for-the-badge)](ARCHITECTURE.md)
 **[Мапа коду, типові зміни, збірка й тести → ARCHITECTURE.md](ARCHITECTURE.md)**
 

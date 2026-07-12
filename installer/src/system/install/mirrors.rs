@@ -1,292 +1,139 @@
-//! Pacman mirror optimization.
+//! Pacman mirrorlist optimization.
 //!
-//! `MIRROR_OPTIMIZE_SCRIPT` ranks the nearest countries' mirrors by real
-//! speed and keeps EVERY other world mirror active below as fallback
-//! (nearest-first, Russian mirrors excluded entirely — see strip_ru).
-//! `mirror_region_countries` maps the chosen timezone to that country list;
-//! only countries actually present in the Artix mirrorlist matter.
+//! `MIRROR_OPTIMIZE_SCRIPT` (v2) health-checks EVERY mirror in a list right
+//! before packages are installed: alive ones are rewritten fastest-first,
+//! dead or crawling ones are commented out. v1 ranked only the nearest
+//! countries and trusted the rest — a mirror that degraded mid-install then
+//! killed the whole transaction ("Operation too slow ... failed to commit")
+//! at 95%. The old timezone→countries table is gone with it: a full probe of
+//! the real population beats geographic guessing.
+//!
+//! The same script serves three lists via a mode flag: Artix (default, on the
+//! live system before basestrap), `--arch` and `--chaotic` (inside the chroot,
+//! where those lists exist). Best-effort by design: on any failure it leaves
+//! the original list untouched and exits 0.
 
-/// Build the entire install plan in order.
-/// Maps the chosen timezone to mirror-list country NAMES (as they appear in the
-/// `## Country` headers of the Artix/Arch mirrorlists), used to find and
-/// uncomment the regional mirrors. The user's own country comes first, then
-/// nearby neighbors. rankmirrors then sorts these by real speed, so the set
-/// only needs to be "the right part of the world". Falls back to a continent
-/// set, then a safe default. Names must match the generators' headers exactly.
-/// Shell script that rewrites a pacman mirrorlist so the regional mirrors are
-/// active and ranked by speed at the TOP, the full list is kept (commented)
-/// below for easy relocation, and unwanted mirrors are filtered out. It's a script
-/// (not inline) because the logic is substantial and reused for Artix and Arch.
-/// Positional args ($@) are the regional country names to surface. Everything
-/// is best-effort: missing rankmirrors, no network, or an unreachable generator
-/// all fall back gracefully, never aborting the install.
 pub(crate) const MIRROR_OPTIMIZE_SCRIPT: &str = r###"#!/bin/sh
+# Artix installer — mirror optimizer v2 (full-population health check).
+#
+# WHY v2: v1 speed-ranked only the ~5 nearest countries' mirrors and left the
+# rest active-but-untested below. A mirror that was fine at ranking time could
+# degrade to a crawl mid-install; pacman's low-speed cutoff then killed the
+# whole transaction at 95% ("Operation too slow ... failed to commit"), and
+# the user had to restart from scratch. v2 probes EVERY mirror in the list
+# right before packages are installed: alive ones are written fastest-first,
+# dead or crawling ones are commented out with a reason. One bad server can
+# no longer take the install down — it simply isn't in the active list.
+#
+# Modes:  (default)  Artix   /etc/pacman.d/mirrorlist          probe: system.db
+#         --arch     Arch    /etc/pacman.d/mirrorlist-arch     probe: core.db
+#         --chaotic  Chaotic /etc/pacman.d/chaotic-mirrorlist  probe: chaotic-aur.db
+# Best-effort: any failure leaves the original list in place and exits 0.
 set -u
 log() { echo ">>> $*"; }
 
-MODE=region
+MODE=artix
 case "${1:-}" in
-  --arch) MODE=arch; shift;;
-  --chaotic) MODE=chaotic; shift;;
+  --arch) MODE=arch;;
+  --chaotic) MODE=chaotic;;
 esac
 
-HAVE_RANK=0
-command -v rankmirrors >/dev/null 2>&1 && HAVE_RANK=1
+command -v curl >/dev/null 2>&1 || {
+  log "curl not found - skipping mirror optimization (lists left as-is)."
+  exit 0
+}
 
-# country names -> /tmp/mo_args (region/arch modes)
-: > /tmp/mo_args
-for a in "$@"; do printf '%s\n' "$a" >> /tmp/mo_args; done
-
-# Silently filter out excluded mirrors: their section headers, their
-# server lines, and the matching CDN country entries. Nothing about them
-# is left anywhere in the generated list.
-strip_ru() {
+# Project stance: excluded mirrors are removed entirely - section headers,
+# server lines, and the chaotic ru-mirror hostnames. Nothing tested, nothing
+# kept, nothing mentioned.
+strip_excluded() {
   awk '
     /[Rr]ussia/ { next }
-    /[Ss]erver[[:space:]]*=.*\.ru\//                       { next }
+    /[Ss]erver[[:space:]]*=.*\.ru\//                          { next }
     /[Ss]erver[[:space:]]*=.*\/\/ru-?[0-9]*-?mirror\.chaotic/ { next }
     { print }
   '
 }
 
-# Active block for Artix/Arch: per target country, a "## Country" header then
-# its uncommented Server lines. Ranked-fastest first for speed, but — crucially
-# — we DO NOT drop the rest: every remaining mirror of the country is appended
-# below the ranked ones as fallbacks. If the top mirrors die mid-download (slow
-# to a crawl, or time out), pacman simply walks down the list to the next one
-# instead of aborting the whole transaction. Countries are already ordered
-# nearest-first by the caller, so the overall list runs closest→farthest, with
-# the always-up (if distant) main Artix mirror as the final safety net.
-build_regional() {
-  full="$1"; : > /tmp/mo_active
-  while IFS= read -r country; do
-    [ -n "$country" ] || continue
-    servers=$(awk -v C="$country" '$0==("## " C){f=1;next} /^## /{f=0} f' "$full" \
-              | sed -E 's/^#*[[:space:]]*Server/Server/' | grep '^Server' || true)
-    [ -n "$servers" ] || continue
-    # Rank only a bounded head of the candidates, so rankmirrors (which probes
-    # each mirror over the network) stays fast even for countries with 100+
-    # mirrors. The ranked ones go on top…
-    head_set=$(printf '%s\n' "$servers" | head -n 10)
-    ranked=""
-    if [ "$HAVE_RANK" = 1 ]; then
-      ranked=$(printf '%s\n' "$head_set" | rankmirrors - 2>/dev/null | grep '^Server' || true)
-    fi
-    [ -n "$ranked" ] || ranked="$head_set"
-    # …and EVERY other mirror of this country is appended below as a fallback
-    # (order as listed upstream), deduplicated against the ranked head. Nothing
-    # is discarded — a distant-but-alive mirror is always better than a dead
-    # "fast" one when the transaction would otherwise fail. POSIX sh: dedup via
-    # temp files (no process substitution).
-    printf '%s\n' "$ranked" > /tmp/mo_ranked
-    rest=$(printf '%s\n' "$servers" | awk 'NR==FNR{seen[$0]=1;next} !seen[$0]' /tmp/mo_ranked -)
-    {
-      printf '## %s\n' "$country"
-      printf '%s\n' "$ranked"
-      [ -n "$rest" ] && printf '%s\n' "$rest"
-      printf '\n'
-    } >> /tmp/mo_active
-  done < /tmp/mo_args
-}
+TAB=$(printf '\t')
 
-# Map a country NAME to its Chaotic-AUR 2-letter code (only those Chaotic
-# actually hosts a country mirror for); empty when there is none.
-chaotic_code() {
-  case "$1" in
-    Poland) echo pl;; Germany) echo de;; France) echo fr;; Italy) echo it;;
-    Spain) echo es;; Sweden) echo se;; Greece) echo gr;; Switzerland) echo ch;;
-    "United Kingdom") echo gb;; Netherlands) echo nl;; "United States") echo us;;
-    Canada) echo ca;; Brazil) echo br;; Japan) echo jp;; "South Korea") echo kr;;
-    Taiwan) echo tw;; Singapore) echo sg;; "Hong Kong") echo hk;; India) echo in;;
-    Australia) echo au;; "New Zealand") echo nz;; Indonesia) echo id;;
-    Israel) echo il;; Mexico) echo mx;; Chile) echo cl;; Colombia) echo co;;
-    Peru) echo pe;; "Saudi Arabia") echo sa;; "South Africa") echo za;;
-    Thailand) echo th;; "United Arab Emirates") echo ae;; Argentina) echo ar;;
-    Vietnam) echo vn;; Nigeria) echo ng;; *) echo "";;
-  esac
-}
-
-# Active block for chaotic: geo-mirror (auto-routes to closest) + cdn-mirror
-# (reliable fallback), then the per-country virtual mirror for each nearby
-# region Chaotic hosts (e.g. for Ukraine's neighbours -> pl, de). Each of those
-# auto-routes within its country, making solid close fallbacks behind geo.
-build_chaotic_active() {
-  full="$1"; : > /tmp/mo_active
-  geo=$(grep -E '^#?[[:space:]]*Server[[:space:]]*=.*geo-mirror\.chaotic' "$full" | head -1 | sed -E 's/^#*[[:space:]]*//')
-  cdn=$(grep -E '^#?[[:space:]]*Server[[:space:]]*=.*cdn-mirror\.chaotic' "$full" | head -1 | sed -E 's/^#*[[:space:]]*//')
-  { [ -n "$geo" ] && printf '## Geo mirror (auto-routes to the closest up-to-date mirror)\n%s\n\n' "$geo"
-    [ -n "$cdn" ] && printf '## CDN mirror (reliable fallback)\n%s\n\n' "$cdn"; } >> /tmp/mo_active
-  while IFS= read -r country; do
-    [ -n "$country" ] || continue
-    code=$(chaotic_code "$country")
-    [ -n "$code" ] || continue
-    line=$(grep -E "^#?[[:space:]]*Server[[:space:]]*=.*//${code}-mirror\.chaotic" "$full" | head -1 | sed -E 's/^#*[[:space:]]*//')
-    [ -n "$line" ] && printf '## %s (closest country mirror)\n%s\n\n' "$country" "$line" >> /tmp/mo_active
-  done < /tmp/mo_args
-}
-
-assemble() {
-  ml="$1"; label="$2"; full="$3"; out=/tmp/mo_out
-  # Collect the Server lines already placed in the active (ranked, regional)
-  # block, so we don't list them twice below.
-  grep '^Server' /tmp/mo_active 2>/dev/null | sed -E 's/^[[:space:]]*//' > /tmp/mo_active_srv || : > /tmp/mo_active_srv
-  {
-    echo "## $label mirrors"
-    echo "## Nearest mirrors (ranked by real speed) are on top; ALL other"
-    echo "## mirrors follow, active too, ordered as upstream lists them, so a"
-    echo "## download never stalls for lack of a fallback. Russian mirrors are"
-    echo "## excluded entirely."
-    echo "##"
-    echo ""
-    if [ -s /tmp/mo_active ]; then cat /tmp/mo_active
-    else echo "## (no regional match — the full list below is active)"; echo ""; fi
-    echo "## ------------------------------------------------------------------"
-    echo "## All remaining mirrors (active, farther away). Reorder freely."
-    echo "## ------------------------------------------------------------------"
-    # In the upstream mirrorlist EVERY Server line is COMMENTED (#Server) except
-    # the few we activated regionally. This lower section must therefore UNcomment
-    # each remaining mirror (strip the leading #), skipping any already ranked on
-    # top, so the whole world stays active as fallback. A country header is
-    # emitted only when it still has a kept mirror below it (no empty duplicates).
-    # Handles both "#Server = …" and bare "Server = …" forms.
-    awk '
-      NR==FNR { active[$0]=1; next }
-      /^##/ {
-        pending=$0; have_pending=1; next
-      }
-      /^[[:space:]]*#?[[:space:]]*Server/ {
-        line=$0
-        sub(/^[[:space:]]*#?[[:space:]]*/, "", line)   # drop leading # and spaces
-        if (!(line in active)) {
-          if (have_pending) { print ""; print pending; have_pending=0 }
-          print line                                    # emit ACTIVE (uncommented)
-        }
-        next
-      }
-      { if (have_pending) { print pending; have_pending=0 } print }
-    ' /tmp/mo_active_srv "$full"
-  } > "$out"
-  mv "$out" "$ml"
-}
-
-process() {
-  ml="$1"; gen="$2"; label="$3"; mode="$4"
-  [ -e "$ml" ] || { log "$label: $ml absent, skipping."; return 0; }
-  cp "$ml" "$ml.bak" 2>/dev/null || true
-  full=/tmp/mo_full; : > "$full"
-  if [ "$gen" != "-" ]; then
-    curl -fsS --connect-timeout 10 --max-time 45 "$gen" 2>/dev/null > "$full" || : > "$full"
+optimize() {
+  file="$1"; label="$2"; repo="$3"; db="$4"
+  if [ ! -f "$file" ]; then
+    log "[$label] $file not found - skipping."
+    return 0
   fi
-  [ -s "$full" ] || cp "$ml.bak" "$full" 2>/dev/null || : > "$full"
-  [ -s "$full" ] || { log "$label: no mirror data, skipping."; return 0; }
-  strip_ru < "$full" > "$full.x" && mv "$full.x" "$full"
-  if [ "$mode" = chaotic ]; then build_chaotic_active "$full"; else build_regional "$full"; fi
-  assemble "$ml" "$label" "$full"
-  na=$(grep -c '^Server' "$ml" 2>/dev/null || echo 0)
-  log "$label: $na active mirror(s) on top; full list below."
+  cp -f "$file" "$file.bak-installer" 2>/dev/null || true
+
+  # Candidate set: every Server line, active or commented - the stock lists
+  # ship the whole mirror population commented out, which is exactly what we
+  # want to test. Deduped; excluded mirrors dropped before any probing.
+  strip_excluded < "$file" \
+    | sed -n 's/^[#[:space:]]*Server[[:space:]]*=[[:space:]]*//p' \
+    | sed 's/[[:space:]].*$//' \
+    | sort -u > /tmp/mo_cand
+  total=$(wc -l < /tmp/mo_cand)
+  if [ "$total" -eq 0 ]; then
+    log "[$label] no candidate mirrors found in $file - skipping."
+    return 0
+  fi
+  log "[$label] probing all $total mirrors (12 in parallel, 6s cap each)..."
+
+  # Build probe jobs: substitute $repo/$arch in the server template and point
+  # at the repo database - a small file every healthy mirror must serve.
+  : > /tmp/mo_jobs
+  while IFS= read -r srv; do
+    base=$(printf '%s' "$srv" | sed "s|\$repo|$repo|g; s|\$arch|x86_64|g; s|/*$||")
+    printf '%s\t%s\n' "$base/$db" "$srv" >> /tmp/mo_jobs
+  done < /tmp/mo_cand
+
+  : > /tmp/mo_ok
+  : > /tmp/mo_dead
+  n=0
+  while IFS="$TAB" read -r probe srv; do
+    (
+      t=$(curl -fsS --max-time 6 -o /dev/null -w '%{time_total}' "$probe" 2>/dev/null) \
+        && printf '%s %s\n' "$t" "$srv" >> /tmp/mo_ok \
+        || printf '%s\n' "$srv" >> /tmp/mo_dead
+    ) &
+    n=$((n+1))
+    if [ $((n % 12)) -eq 0 ]; then wait; fi
+  done < /tmp/mo_jobs
+  wait
+
+  ok=$(wc -l < /tmp/mo_ok)
+  dead=$(wc -l < /tmp/mo_dead)
+  if [ "$ok" -eq 0 ]; then
+    log "[$label] every mirror failed the probe - network trouble? Keeping the original list."
+    return 0
+  fi
+
+  sort -n /tmp/mo_ok > /tmp/mo_sorted
+  {
+    echo "# $label mirrorlist - rebuilt by the Artix installer (full health check)."
+    echo "# $ok reachable mirrors, fastest first; $dead unreachable/too-slow disabled below."
+    echo "# Original saved next to this file as *.bak-installer."
+    echo ""
+    while read -r t srv; do
+      printf 'Server = %s\n' "$srv"
+    done < /tmp/mo_sorted
+    if [ "$dead" -gt 0 ]; then
+      echo ""
+      echo "# Failed the pre-install health check (unreachable or >6s):"
+      while IFS= read -r srv; do
+        printf '#Server = %s\n' "$srv"
+      done < /tmp/mo_dead
+    fi
+  } > "$file"
+
+  fastest=$(head -n 1 /tmp/mo_sorted | awk '{printf "%s (%ss)", $2, $1}')
+  log "[$label] done: $ok active, $dead disabled. Fastest: $fastest"
 }
 
 case "$MODE" in
-  chaotic) process /etc/pacman.d/chaotic-mirrorlist "-" "Chaotic-AUR" chaotic;;
-  arch)    process /etc/pacman.d/mirrorlist-arch "https://archlinux.org/mirrorlist/all/" "Arch" region;;
-  *)       process /etc/pacman.d/mirrorlist "https://packages.artixlinux.org/mirrorlist/?country=all&protocol=https" "Artix" region;;
+  chaotic) optimize /etc/pacman.d/chaotic-mirrorlist "Chaotic-AUR" chaotic-aur chaotic-aur.db;;
+  arch)    optimize /etc/pacman.d/mirrorlist-arch    "Arch"       core        core.db;;
+  *)       optimize /etc/pacman.d/mirrorlist         "Artix"      system      system.db;;
 esac
-log "Mirror optimization complete.""###;
-
-pub(crate) fn mirror_region_countries(timezone: &str) -> &'static [&'static str] {
-    match timezone {
-        "Europe/Kyiv" | "Europe/Kiev" => &[
-            "Ukraine",
-            "Poland",
-            "Germany",
-            "Czechia",
-            "Netherlands",
-            "France",
-            "Slovakia",
-            "Hungary",
-            "Romania",
-        ],
-        "Europe/Warsaw" => &[
-            "Poland",
-            "Germany",
-            "Czechia",
-            "Ukraine",
-            "Slovakia",
-            "Lithuania",
-        ],
-        "Europe/Berlin" | "Europe/Vienna" | "Europe/Zurich" => &[
-            "Germany",
-            "Netherlands",
-            "Austria",
-            "Czechia",
-            "Poland",
-            "France",
-            "Switzerland",
-        ],
-        "Europe/Paris" | "Europe/Brussels" | "Europe/Amsterdam" => &[
-            "France",
-            "Netherlands",
-            "Germany",
-            "Belgium",
-            "United Kingdom",
-        ],
-        "Europe/London" | "Europe/Dublin" => &[
-            "United Kingdom",
-            "Ireland",
-            "Netherlands",
-            "France",
-            "Germany",
-        ],
-        "Europe/Moscow" => &["Finland", "Ukraine", "Germany", "Kazakhstan"],
-        "Europe/Madrid" | "Europe/Lisbon" => &["Spain", "Portugal", "France", "Germany"],
-        "Europe/Rome" => &["Italy", "France", "Germany", "Austria", "Switzerland"],
-        "Europe/Stockholm" | "Europe/Helsinki" | "Europe/Oslo" | "Europe/Copenhagen" => {
-            &["Sweden", "Finland", "Norway", "Denmark", "Germany"]
-        }
-        "America/New_York" | "America/Toronto" | "America/Chicago" => &["United States", "Canada"],
-        "America/Los_Angeles" | "America/Vancouver" | "America/Denver" => {
-            &["United States", "Canada"]
-        }
-        "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => {
-            &["Brazil", "Chile", "United States"]
-        }
-        "Asia/Tokyo" => &["Japan", "South Korea", "Taiwan", "Singapore", "Hong Kong"],
-        "Asia/Singapore" | "Asia/Kuala_Lumpur" | "Asia/Jakarta" => {
-            &["Singapore", "Hong Kong", "Japan", "India"]
-        }
-        "Asia/Kolkata" | "Asia/Calcutta" => &["India", "Singapore", "Hong Kong"],
-        "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Taipei" => {
-            &["Hong Kong", "Taiwan", "Singapore", "Japan"]
-        }
-        "Australia/Sydney" | "Australia/Melbourne" | "Australia/Perth" => {
-            &["Australia", "New Zealand", "Singapore"]
-        }
-        _ => match timezone.split('/').next().unwrap_or("") {
-            "Europe" => &[
-                "Germany",
-                "France",
-                "Netherlands",
-                "Poland",
-                "United Kingdom",
-                "Sweden",
-                "Czechia",
-                "Austria",
-                "Finland",
-            ],
-            "America" => &["United States", "Canada", "Brazil"],
-            "Asia" => &[
-                "Japan",
-                "Singapore",
-                "India",
-                "South Korea",
-                "Hong Kong",
-                "Taiwan",
-            ],
-            "Africa" => &["South Africa", "Germany", "France"],
-            "Australia" | "Pacific" => &["Australia", "New Zealand", "Singapore"],
-            "Indian" => &["India", "Singapore", "South Africa"],
-            "Atlantic" => &["United Kingdom", "United States", "Germany"],
-            _ => &["Germany", "United States", "Netherlands"],
-        },
-    }
-}
+log "Mirror check complete."
+"###;

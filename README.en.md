@@ -2,6 +2,32 @@
 
 # 🐧 Artix TUI Installer
 
+[🇺🇦 Українська](README.md) · **🇬🇧 English**
+
+### A bilingual Artix Linux TUI installer — dinit, LUKS, btrfs rollback, Wayland. systemd-free.
+
+<img alt="Rust" src="https://img.shields.io/badge/Rust-1.90+-B7410E?style=for-the-badge&logo=rust&logoColor=white">
+<img alt="ratatui" src="https://img.shields.io/badge/TUI-ratatui-1D9BF0?style=for-the-badge">
+<img alt="Artix Linux" src="https://img.shields.io/badge/Artix-Linux-10A0CC?style=for-the-badge&logo=artixlinux&logoColor=white">
+<img alt="init: dinit" src="https://img.shields.io/badge/init-dinit-4E9A06?style=for-the-badge">
+<img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
+
+<a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
+<img alt="i18n" src="https://img.shields.io/badge/i18n-українська_%7C_english-FFD700?style=for-the-badge">
+<img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
+
+<img alt="Last commit" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Stars" src="https://img.shields.io/github/stars/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Issues" src="https://img.shields.io/github/issues/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Repo size" src="https://img.shields.io/github/repo-size/YellowHearth1/artix-tui-installer?style=flat-square">
+
+<br>
+
+<img src="screenshots/en/14-summary.png" alt="The installer in action — review & install screen" width="900">
+
+<br>
+
+
 [![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Developer_Docs-ARCHITECTURE.en.md-6e40c9?style=for-the-badge)](ARCHITECTURE.en.md)
 **[Code map, common changes, build & tests → ARCHITECTURE.en.md](ARCHITECTURE.en.md)**
 
