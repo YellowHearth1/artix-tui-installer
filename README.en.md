@@ -13,7 +13,7 @@
 <img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
 
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
-<img alt="i18n" src="https://img.shields.io/badge/i18n-українська_%7C_english-FFD700?style=for-the-badge">
+<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english-FFD700?style=for-the-badge">
 <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
 
 <img alt="Last commit" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square">
