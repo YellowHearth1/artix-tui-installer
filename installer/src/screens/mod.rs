@@ -19,6 +19,7 @@ pub mod summary;
 mod timezone;
 mod user;
 pub mod wifi;
+mod wifitest;
 
 use crate::app::{App, Screen};
 use crossterm::event::KeyEvent;
@@ -44,6 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         Screen::Finish => finish::draw(f, app, area),
         Screen::Mode => mode::draw(f, app, area),
         Screen::Recovery => recovery::draw(f, app, area),
+        Screen::WifiTest => wifitest::draw(f, app, area),
     }
 }
 
@@ -66,6 +68,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Screen::Finish => finish::handle_key(app, key),
         Screen::Mode => mode::handle_key(app, key),
         Screen::Recovery => recovery::handle_key(app, key),
+        Screen::WifiTest => wifitest::handle_key(app, key),
     }
 }
 
@@ -96,6 +99,7 @@ pub fn footer_hint(app: &App) -> Option<String> {
         Screen::Security => Some(options::footer_hint(app)),
         Screen::Options => Some(options::footer_hint(app)),
         Screen::Recovery => Some(recovery::footer_hint(app)),
+        Screen::WifiTest => Some(wifitest::footer_hint(app)),
         _ => None,
     }
 }

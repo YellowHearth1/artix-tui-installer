@@ -30,6 +30,7 @@ pub enum Screen {
     // navigation is handled explicitly, not via next()/prev().
     Mode = 15,
     Recovery = 16,
+    WifiTest = 17,
 }
 
 impl Screen {
@@ -715,6 +716,10 @@ pub struct App {
     pub wifi_status: String,
     /// Whether `wifi_status` is an error (warn colour) or plain info (dim).
     pub wifi_status_is_error: bool,
+    /// Output of the embedded Wi-Fi test harness (mode screen → "Wi-Fi test").
+    pub wifitest_log: Vec<String>,
+    /// True while the harness is running, so the screen can say "working…".
+    pub wifitest_running: bool,
     /// Set once the post-connect background install of live-environment
     /// prerequisites (git + install tools) has been kicked off, so it runs at
     /// most once even if the user revisits the network step.
@@ -858,6 +863,8 @@ impl App {
             wifi_password: String::new(),
             wifi_status: String::new(),
             wifi_status_is_error: false,
+            wifitest_log: Vec::new(),
+            wifitest_running: false,
             prereq_started: false,
             finish_cursor: 0,
             pkg_query: String::new(),

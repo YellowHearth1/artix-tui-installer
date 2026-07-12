@@ -56,7 +56,10 @@ fn handle_global(app: &mut App, key: KeyEvent) -> bool {
             if any_modal_open(app) {
                 return false;
             }
-            if app.screen == Screen::Mode || app.screen == Screen::Recovery {
+            if app.screen == Screen::Mode
+                || app.screen == Screen::Recovery
+                || app.screen == Screen::WifiTest
+            {
                 // Outside the linear flow: these screens own their Esc (Mode →
                 // Language, Recovery → Mode). goto_prev() would index past ALL.
                 false

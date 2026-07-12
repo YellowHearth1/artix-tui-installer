@@ -153,7 +153,10 @@ fn run_interactive_step(
 
     // Leave raw mode / alternate screen so the child draws to a normal terminal.
     restore_terminal()?;
-    let recovery = matches!(app.screen, crate::app::Screen::Recovery);
+    let recovery = matches!(
+        app.screen,
+        crate::app::Screen::Recovery | crate::app::Screen::WifiTest
+    );
     let finish = matches!(app.screen, crate::app::Screen::Finish);
     // Both the recovery tool and the end-of-install "enter the system" option
     // drop into a chroot on the installed system; on exit, both unmount it
@@ -445,7 +448,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // "current" so NONE of the install steps render as done/active — they all
     // show as pending, which reads correctly (no install step is in progress).
     let current = match app.screen {
-        Screen::Mode | Screen::Recovery => usize::MAX,
+        Screen::Mode | Screen::Recovery | Screen::WifiTest => usize::MAX,
         s => s as usize,
     };
     let mut lines: Vec<Line> = Vec::new();
@@ -547,6 +550,7 @@ fn screen_title(app: &App) -> String {
     match app.screen {
         Screen::Mode => return format!(" {} ", t(app.lang, "mode.title")),
         Screen::Recovery => return format!(" {} ", t(app.lang, "rec.title")),
+        Screen::WifiTest => return format!(" {} ", t(app.lang, "wt.title")),
         _ => {}
     }
     let key = match app.screen {
@@ -566,7 +570,7 @@ fn screen_title(app: &App) -> String {
         Screen::Summary => "sum.title",
         Screen::Finish => "fin.title",
         // Handled above with an early return.
-        Screen::Mode | Screen::Recovery => unreachable!(),
+        Screen::Mode | Screen::Recovery | Screen::WifiTest => unreachable!(),
     };
     format!(
         " {} / 15  ·  {} ",

@@ -6,7 +6,6 @@
 //! `mirror_region_countries` maps the chosen timezone to that country list;
 //! only countries actually present in the Artix mirrorlist matter.
 
-
 /// Build the entire install plan in order.
 /// Maps the chosen timezone to mirror-list country NAMES (as they appear in the
 /// `## Country` headers of the Artix/Arch mirrorlists), used to find and

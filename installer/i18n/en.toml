@@ -254,6 +254,15 @@ title = "What would you like to do?"
 hint = "Install a fresh system, or recover an existing one."
 install = "Install system"
 recovery = "Recover system"
+wifitest = "Wi-Fi test (for a virtual machine)"
+
+[wt]
+title = "Wi-Fi test in a virtual machine"
+hint = "Creates a simulated Wi-Fi radio and access point, so the network screen can be tested without real hardware."
+run = "Enter — run it"
+running = "Working…"
+done = "Done. Esc to go back, then pick Install system and walk the Wi-Fi screen."
+back = "Esc — back"
 
 [rec]
 title = "System recovery"

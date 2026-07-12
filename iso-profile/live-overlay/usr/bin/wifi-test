@@ -22,7 +22,16 @@ PASS="testtest123"
 say() { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
 die() { printf '\n\033[1;31m!! %s\033[0m\n' "$1"; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "Run as root (sudo sh wifi-test.sh)"
+# Needs root (modprobe, hostapd, nmcli device set). If launched as a normal
+# user, re-exec through sudo rather than just failing — the copy in the live
+# user's home is meant to be double-clickable-simple.
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        say "Needs root — re-running through sudo…"
+        exec sudo sh "$0" "$@"
+    fi
+    die "Run as root:  sudo sh $0"
+fi
 
 # ── 1. simulated radios ──────────────────────────────────────────────────────
 say "Loading mac80211_hwsim (2 virtual radios)…"
