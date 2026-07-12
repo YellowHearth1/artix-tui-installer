@@ -1,6 +1,6 @@
 [package]
 name = "artix-installer"
-version = "200.0.0"
+version = "201.0.0"
 edition = "2021"
 description = "TUI installer for an Artix/dinit based distribution"
 license = "Apache-2.0"

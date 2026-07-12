@@ -268,6 +268,18 @@ pub fn tick(app: &mut App) {
                     // Connected — fetch the live-environment prerequisites in
                     // the background so they're ready when needed.
                     start_prereqs(app);
+                    // goto_next() honours `can_advance`, and on the Password
+                    // stage every draw pass sets it to FALSE (Enter there
+                    // means "connect", not "next screen"). We have just
+                    // VERIFIED the connection, so flip the gate ourselves —
+                    // otherwise goto_next() is a silent no-op and the user is
+                    // left on a blank password screen wondering what happened.
+                    // Resetting the stage to Choose also makes a later Back-
+                    // visit to this screen start from the top, which is the
+                    // sensible place once we're online.
+                    app.wifi_stage = Stage::Choose;
+                    app.cursor = 0;
+                    app.can_advance = true;
                     app.goto_next();
                 }
                 Err(detail) => {
