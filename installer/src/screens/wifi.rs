@@ -49,7 +49,9 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(1),
+            // Two rows for the status line: error messages carry the actual
+            // nmcli reason and won't always fit one row on an 80-col console.
+            Constraint::Length(2),
             Constraint::Length(3),
         ])
         .spacing(1)
@@ -113,7 +115,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             theme::dim()
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(app.wifi_status.clone(), style))),
+            Paragraph::new(Line::from(Span::styled(app.wifi_status.clone(), style)))
+                .wrap(ratatui::widgets::Wrap { trim: true }),
             rows[2],
         );
     }
@@ -543,15 +546,39 @@ fn device_connected_named(adapter: &str) -> bool {
     false
 }
 
-/// First line of an error blob, clipped to something that fits a status row.
+/// First line of an error blob, with nmcli's boilerplate stripped, clipped to
+/// fit the status row.
+///
+/// Raw nmcli errors bury the useful part at the END: "nmcli failed: Error:
+/// Connection activation failed: Secrets were required, but not provided." On
+/// a narrow console the status row clips the tail — exactly the part that
+/// tells the user WHAT went wrong. So peel the constant prefixes off and show
+/// the reason itself ("Secrets were required…", "IP configuration could not
+/// be completed").
 fn first_line_trimmed(e: &str) -> String {
-    let line = e
+    let mut line = e
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim();
-    let mut s: String = line.chars().take(80).collect();
-    if line.chars().count() > 80 {
+    const PREFIXES: [&str; 4] = [
+        "nmcli failed:",
+        "Warning:",
+        "Error:",
+        "Connection activation failed:",
+    ];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for p in PREFIXES {
+            if let Some(rest) = line.strip_prefix(p) {
+                line = rest.trim_start();
+                changed = true;
+            }
+        }
+    }
+    let mut s: String = line.chars().take(90).collect();
+    if line.chars().count() > 90 {
         s.push('…');
     }
     s

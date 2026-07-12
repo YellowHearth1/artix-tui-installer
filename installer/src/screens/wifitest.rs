@@ -56,10 +56,29 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|l| Line::from(Span::styled(l.clone(), theme::normal())))
             .collect()
     };
+    // The harness output is longer than a short console can show (a stock
+    // 80×25 text console fits ~18 lines here, the output is ~24). The TAIL is
+    // the part that matters — the verdict plus the box with the adapter,
+    // network and password to type — so when the content overflows, anchor
+    // the view to the bottom. Wrapping can add extra visual rows on narrow
+    // consoles, so count wrapped rows, not just lines.
+    let inner_w = rows[1].width.saturating_sub(2).max(1) as usize;
+    let inner_h = rows[1].height.saturating_sub(2) as usize;
+    let total_rows: usize = app
+        .wifitest_log
+        .iter()
+        .map(|l| {
+            let w = l.chars().count().max(1);
+            w.div_ceil(inner_w)
+        })
+        .sum::<usize>()
+        .max(1);
+    let scroll = total_rows.saturating_sub(inner_h) as u16;
     f.render_widget(
         Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL))
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll, 0)),
         rows[1],
     );
 
