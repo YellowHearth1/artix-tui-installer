@@ -80,8 +80,11 @@ EOF
 **Wi-Fi у віртуалці без адаптера — однією командою.** У живому ISO (від root):
 
 ```sh
-sh scripts/wifi-test.sh
+wifi-test
 ```
+
+(Скрипт лежить на живому ISO як `/usr/bin/wifi-test`. Поза ISO —
+`sh scripts/wifi-test.sh` з кореня репозиторію.)
 
 Скрипт вантажить `mac80211_hwsim` (два віртуальні радіо), піднімає на одному
 hostapd із мережею **ArtixTest** / паролем **testtest123**, а друге лишає

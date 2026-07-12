@@ -80,8 +80,11 @@ via OVMF).
 **Wi-Fi in a VM with no adapter — one command.** In the live ISO (as root):
 
 ```sh
-sh scripts/wifi-test.sh
+wifi-test
 ```
+
+(It ships on the live ISO as `/usr/bin/wifi-test`. Outside the ISO, run
+`sh scripts/wifi-test.sh` from the repo root.)
 
 It loads `mac80211_hwsim` (two virtual radios), runs hostapd on one broadcasting
 **ArtixTest** / **testtest123**, and leaves the other for the installer. Then walk
