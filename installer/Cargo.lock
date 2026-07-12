@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "artix-installer"
-version = "195.0.0"
+version = "200.0.0"
 dependencies = [
  "anyhow",
  "chrono-tz",

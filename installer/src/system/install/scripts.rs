@@ -1007,6 +1007,35 @@ pkill hostapd 2>/dev/null || true
 hostapd -B /tmp/hostapd.conf >/tmp/hostapd.log 2>&1 || die "hostapd failed — see /tmp/hostapd.log"
 sleep 2
 
+# ── 3b. hand out IP addresses ────────────────────────────────────────────────
+# hostapd only does the 802.11 half: radio, encryption, authentication. Once a
+# client associates it asks for an IP over DHCP — and with nobody answering,
+# NetworkManager waits out the DHCP timeout and then fails the connection with
+# "IP configuration could not be completed". So the AP needs an address itself
+# and a DHCP server behind it. dnsmasq is the smallest thing that does both.
+say "Giving $ap an address and starting DHCP…"
+ip addr flush dev "$ap" 2>/dev/null || true
+ip addr add 10.42.0.1/24 dev "$ap" 2>/dev/null || true
+ip link set "$ap" up 2>/dev/null || true
+
+if command -v dnsmasq >/dev/null 2>&1; then
+    pkill -f "dnsmasq.*$ap" 2>/dev/null || true
+    dnsmasq \
+        --interface="$ap" \
+        --bind-interfaces \
+        --dhcp-range=10.42.0.10,10.42.0.100,12h \
+        --dhcp-option=3,10.42.0.1 \
+        --dhcp-option=6,10.42.0.1 \
+        --pid-file=/tmp/dnsmasq-wifitest.pid \
+        >/tmp/dnsmasq.log 2>&1 \
+        || die "dnsmasq failed — see /tmp/dnsmasq.log"
+    sleep 1
+else
+    printf '\n\033[1;33m~~ dnsmasq is not installed — the client will associate but get no IP,\n'
+    printf '   and NetworkManager will fail with "IP configuration could not be\n'
+    printf '   completed". Add dnsmasq to the ISO to test the full flow.\033[0m\n'
+fi
+
 # ── 4. report ────────────────────────────────────────────────────────────────
 if nmcli -t -f SSID dev wifi list --rescan yes 2>/dev/null | grep -q "^$SSID$"; then
     say "SUCCESS — NetworkManager can see the network."

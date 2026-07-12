@@ -210,39 +210,30 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Stage::Password => match key.code {
-            KeyCode::Char(c) => app.wifi_password.push(c),
-            KeyCode::Backspace => {
+            // Ignore typing while a connection attempt is in flight — the
+            // password is already captured; editing it mid-attempt would be
+            // confusing and wouldn't change the running nmcli.
+            KeyCode::Char(c) if app.wifi_connect_rx.is_none() => app.wifi_password.push(c),
+            KeyCode::Backspace if app.wifi_connect_rx.is_none() => {
                 app.wifi_password.pop();
             }
             KeyCode::Enter => {
-                // Try to connect and VERIFY the result. Early versions fired
-                // nmcli blind and advanced unconditionally — a wrong password
-                // sailed through and the install then died much later on the
-                // mirror step with a confusing error. Now: only advance once
-                // nmcli reports the device as actually connected; otherwise
-                // stay here, keep the typed password for editing, and show
-                // what went wrong.
-                match connect(app) {
-                    Ok(()) => {
-                        set_status(app, "", false);
-                        // Connected — fetch the live-environment prerequisites
-                        // in the background so they're ready when needed.
-                        start_prereqs(app);
-                        app.goto_next();
-                    }
-                    Err(detail) => {
-                        let mut msg = t(app.lang, "wifi.err_connect");
-                        if !detail.is_empty() {
-                            // First line of nmcli's stderr, trimmed — enough to
-                            // tell auth failure from "no such SSID".
-                            msg.push_str(" — ");
-                            msg.push_str(&detail);
-                        }
-                        set_status_owned(app, msg, true);
-                    }
+                // Kick off the connection in the BACKGROUND. `nmcli dev wifi
+                // connect` blocks until the association either succeeds or the
+                // supplicant gives up — seconds on real hardware, and it can
+                // hang indefinitely on a flaky or simulated radio. Running it
+                // inline froze the whole TUI (no repaint, no keys) and looked
+                // like a crash. So: spawn it, show "connecting…", poll in
+                // tick(), and give up after a timeout.
+                if app.wifi_connect_rx.is_none() {
+                    start_connect(app);
                 }
             }
             KeyCode::Esc => {
+                // Abandon any in-flight attempt: drop the receiver so tick()
+                // stops waiting on it (the thread finishes harmlessly).
+                app.wifi_connect_rx = None;
+                app.wifi_connect_started = None;
                 app.wifi_stage = Stage::Networks;
                 set_status(app, "", false);
             }
@@ -251,7 +242,70 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-pub fn tick(_app: &mut App) {}
+/// Called once per frame. Polls the in-flight connection attempt (if any) so
+/// the UI can stay alive while nmcli does its thing, and gives up after a
+/// timeout instead of hanging forever.
+pub fn tick(app: &mut App) {
+    // Nothing in flight → nothing to do.
+    if app.wifi_connect_rx.is_none() {
+        return;
+    }
+
+    // Poll the worker. Three outcomes, and ALL of them must be handled — an
+    // earlier version only matched `Ok(result)` and silently ignored a
+    // disconnected channel, which left the screen in a dead limbo: the
+    // "connecting…" status cleared, nothing advanced, nothing was said.
+    let polled = app.wifi_connect_rx.as_ref().map(|rx| rx.try_recv());
+
+    match polled {
+        // Worker finished and sent its verdict.
+        Some(Ok(result)) => {
+            app.wifi_connect_rx = None;
+            app.wifi_connect_started = None;
+            match result {
+                Ok(()) => {
+                    set_status(app, "", false);
+                    // Connected — fetch the live-environment prerequisites in
+                    // the background so they're ready when needed.
+                    start_prereqs(app);
+                    app.goto_next();
+                }
+                Err(detail) => {
+                    let mut msg = t(app.lang, "wifi.err_connect");
+                    if !detail.is_empty() {
+                        msg.push_str(" — ");
+                        msg.push_str(&detail);
+                    }
+                    set_status_owned(app, msg, true);
+                }
+            }
+        }
+        // Worker is still running — keep waiting, but not forever.
+        Some(Err(crossbeam_channel::TryRecvError::Empty)) => {
+            if let Some(started) = app.wifi_connect_started {
+                // nmcli has no reliable timeout of its own here: a hung
+                // supplicant, or a DHCP server that never answers, would
+                // otherwise leave the user staring at "connecting…" for a
+                // minute with no way to retry. 25s is well past a normal
+                // association (a second or two) but short of NetworkManager's
+                // own DHCP give-up.
+                if started.elapsed() > std::time::Duration::from_secs(25) {
+                    app.wifi_connect_rx = None;
+                    app.wifi_connect_started = None;
+                    set_status(app, "wifi.err_timeout", true);
+                }
+            }
+        }
+        // The worker thread died without sending anything (panicked, or was
+        // killed). Never leave the user in silence — say so and let them retry.
+        Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {
+            app.wifi_connect_rx = None;
+            app.wifi_connect_started = None;
+            set_status(app, "wifi.err_connect", true);
+        }
+        None => {}
+    }
+}
 
 /// One-line status under the list: what just happened / what to press next.
 fn set_status(app: &mut App, key_or_empty: &str, is_error: bool) {
@@ -388,38 +442,60 @@ fn scan(app: &mut App) {
     }
 }
 
-/// Connect using the chosen adapter (`ifname <dev>`) and report the outcome.
+/// Start a connection attempt in a background thread.
 ///
 /// Open networks: the `password` argument is only passed when the user typed
 /// one — nmcli rejects an empty password on open APs. After nmcli returns
 /// success we double-check the device really reached `connected` state, so a
 /// half-finished association can't slip through as a false positive.
-fn connect(app: &mut App) -> Result<(), String> {
-    let mut args = vec!["dev", "wifi", "connect", app.wifi_ssid.as_str()];
-    if !app.wifi_password.is_empty() {
-        args.push("password");
-        args.push(app.wifi_password.as_str());
-    }
-    if !app.wifi_adapter.is_empty() {
-        args.push("ifname");
-        args.push(&app.wifi_adapter);
-    }
-    match crate::system::runner::capture("nmcli", &args) {
-        Ok(_) => {
-            // Belt and suspenders: confirm the chosen device (or any wifi
-            // device when none was pinned) is in the `connected` state.
-            if device_connected(app) {
-                Ok(())
-            } else {
-                Err(String::new())
-            }
+///
+/// The whole thing runs OFF the UI thread; `tick()` picks up the result.
+fn start_connect(app: &mut App) {
+    let ssid = app.wifi_ssid.clone();
+    let password = app.wifi_password.clone();
+    let adapter = app.wifi_adapter.clone();
+
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    app.wifi_connect_rx = Some(rx);
+    app.wifi_connect_started = Some(std::time::Instant::now());
+    set_status(app, "wifi.connecting", false);
+
+    std::thread::spawn(move || {
+        let mut args: Vec<&str> = vec!["dev", "wifi", "connect", ssid.as_str()];
+        if !password.is_empty() {
+            args.push("password");
+            args.push(password.as_str());
         }
-        Err(e) => Err(first_line_trimmed(&e)),
-    }
+        if !adapter.is_empty() {
+            args.push("ifname");
+            args.push(adapter.as_str());
+        }
+        let result = match crate::system::runner::capture("nmcli", &args) {
+            Ok(_) => {
+                // nmcli returned success — but confirm the device REALLY is in
+                // the `connected` state before we let the user move on. A
+                // half-finished association (associated, but DHCP still
+                // pending or failed) would otherwise sail through and only
+                // blow up much later, on the mirror step, with a baffling
+                // error. When the check fails, say so specifically rather than
+                // returning a blank error — a silent failure is the worst
+                // outcome of all.
+                if device_connected_named(&adapter) {
+                    Ok(())
+                } else {
+                    Err(state_of(&adapter))
+                }
+            }
+            Err(e) => Err(first_line_trimmed(&e)),
+        };
+        let _ = tx.send(result);
+    });
 }
 
-/// True when the selected Wi-Fi device reports STATE == connected.
-fn device_connected(app: &App) -> bool {
+/// The device's reported STATE, for use in an error message when we expected
+/// `connected` and got something else ("connecting", "disconnected", …). Gives
+/// the user a real clue instead of a blank "couldn't connect".
+fn state_of(adapter: &str) -> String {
     if let Ok(out) =
         crate::system::runner::capture("nmcli", &["-t", "-f", "DEVICE,STATE", "device"])
     {
@@ -427,7 +503,26 @@ fn device_connected(app: &App) -> bool {
             let mut parts = l.splitn(2, ':');
             let dev = parts.next().unwrap_or("").trim();
             let state = parts.next().unwrap_or("").trim();
-            let dev_matches = app.wifi_adapter.is_empty() || dev == app.wifi_adapter;
+            if (adapter.is_empty() || dev == adapter) && !state.is_empty() {
+                return format!("{dev}: {state}");
+            }
+        }
+    }
+    String::new()
+}
+
+/// True when the given Wi-Fi device (or any, when the name is empty) reports
+/// STATE == connected. Takes the device NAME rather than `&App`, so the
+/// background connect thread can call it without borrowing app state.
+fn device_connected_named(adapter: &str) -> bool {
+    if let Ok(out) =
+        crate::system::runner::capture("nmcli", &["-t", "-f", "DEVICE,STATE", "device"])
+    {
+        for l in out.lines() {
+            let mut parts = l.splitn(2, ':');
+            let dev = parts.next().unwrap_or("").trim();
+            let state = parts.next().unwrap_or("").trim();
+            let dev_matches = adapter.is_empty() || dev == adapter;
             if dev_matches && state == "connected" {
                 return true;
             }

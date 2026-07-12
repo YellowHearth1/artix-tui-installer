@@ -11,3 +11,4 @@ seatd-dinit
 # point on a mac80211_hwsim radio, iw enumerates the simulated radios.
 hostapd
 iw
+dnsmasq

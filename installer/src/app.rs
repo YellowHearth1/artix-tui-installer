@@ -720,6 +720,15 @@ pub struct App {
     pub wifitest_log: Vec<String>,
     /// True while the harness is running, so the screen can say "working…".
     pub wifitest_running: bool,
+    /// Receiver for the in-flight `nmcli connect` attempt. Some(..) means a
+    /// connection is being tried right now — the UI stays responsive and
+    /// `wifi::tick` polls this each frame. Ok(()) = connected, Err(msg) =
+    /// failed (msg may be empty when nmcli "succeeded" but the device never
+    /// reached the connected state).
+    pub wifi_connect_rx: Option<crossbeam_channel::Receiver<Result<(), String>>>,
+    /// When the current attempt started, so we can give up instead of hanging
+    /// forever — nmcli can block indefinitely on a flaky or simulated radio.
+    pub wifi_connect_started: Option<std::time::Instant>,
     /// Set once the post-connect background install of live-environment
     /// prerequisites (git + install tools) has been kicked off, so it runs at
     /// most once even if the user revisits the network step.
@@ -865,6 +874,8 @@ impl App {
             wifi_status_is_error: false,
             wifitest_log: Vec::new(),
             wifitest_running: false,
+            wifi_connect_rx: None,
+            wifi_connect_started: None,
             prereq_started: false,
             finish_cursor: 0,
             pkg_query: String::new(),
