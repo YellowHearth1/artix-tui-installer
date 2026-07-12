@@ -75,10 +75,22 @@ EOF
 ```
 
 **Testing the TUI without hardware:** the installer runs great in QEMU (UEFI
-via OVMF). **Wi-Fi in a VM with no adapter:** inside the guest,
-`modprobe mac80211_hwsim` creates virtual Wi-Fi radios; run hostapd on one and
-walk the whole Wi-Fi screen for real with the other. Or just boot the ISO from
-a USB stick on a laptop — the Wi-Fi screen is ~20 seconds in, no install needed.
+via OVMF).
+
+**Wi-Fi in a VM with no adapter — one command.** In the live ISO (as root):
+
+```sh
+sh scripts/wifi-test.sh
+```
+
+It loads `mac80211_hwsim` (two virtual radios), runs hostapd on one broadcasting
+**ArtixTest** / **testtest123**, and leaves the other for the installer. Then walk
+the Wi-Fi screen normally. Worth testing a **wrong** password too (must stay on
+the screen with an error) and Enter on an empty list (must rescan, never sit
+silent).
+
+Alternatively, boot the ISO from a USB stick on a laptop — the Wi-Fi screen is
+~20 seconds in, no install needed.
 
 ## Style
 

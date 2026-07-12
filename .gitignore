@@ -24,6 +24,3 @@ artix-installer-bin
 
 # Note: Cargo.lock IS committed — this is a binary application, so a pinned
 # lockfile gives reproducible builds.
-
-# Exception: the Pinnacle config tarball is a real source asset, not a build artifact
-!installer/src/assets/pinnacle.tar.gz

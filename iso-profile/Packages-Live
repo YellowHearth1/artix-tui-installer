@@ -6,3 +6,8 @@
 # system's seat backend is chosen separately by the user in the installer.
 seatd
 seatd-dinit
+
+# Wi-Fi testing in a VM (scripts/wifi-test.sh): hostapd fakes an access
+# point on a mac80211_hwsim radio, iw enumerates the simulated radios.
+hostapd
+iw
