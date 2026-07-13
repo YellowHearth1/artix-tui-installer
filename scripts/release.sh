@@ -145,7 +145,7 @@ _Both links **always** resolve to the newest build — no README edits needed._
 | **btrfs** зі знімками та відкатом | **btrfs** with snapshots and rollback |
 | Вибір ядра, DE та Wayland-композиторів | Kernel, DE and Wayland compositor choice |
 | **Chaotic-AUR**, оптимізація дзеркал | **Chaotic-AUR**, mirror optimization |
-| **EFISTUB** / GRUB / systemd-boot | **EFISTUB** / GRUB / systemd-boot |
+| **EFISTUB** / GRUB / rEFInd / Limine | **EFISTUB** / GRUB / rEFInd / Limine |
 EOF
 )" \
     "$BIN#artix-installer" \
