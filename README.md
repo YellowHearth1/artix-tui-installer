@@ -229,16 +229,27 @@ cargo build --release
 host-інструменти, яких він потребує (artools, gptfdisk, cryptsetup тощо), він
 доставляє сам під час роботи.
 
-### Готовий бінарник (найпростіше)
+### Готовий ISO-образ (найпростіше)
 
-Завантажте зібраний інсталятор зі [сторінки релізів](https://github.com/YellowHearth1/artix-tui-installer/releases)
-і запустіть від root:
+Live-образ Artix зі вшитим інсталятором — записати на флешку й завантажитись:
+
+```sh
+curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-tui-dinit-x86_64.iso
+```
+
+### Готовий бінарник
+
+Якщо система вже завантажена (напр. з офіційного Artix-ISO) — просто запустіть
+інсталятор від root:
 
 ```sh
 curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-installer
 chmod +x artix-installer
 sudo ./artix-installer
 ```
+
+Обидва посилання завжди ведуть на **найсвіжішу збірку** — `latest` GitHub
+розвʼязує сам. Усі збірки — на [сторінці релізів](https://github.com/YellowHearth1/artix-tui-installer/releases).
 
 ### Збірка з джерел
 
