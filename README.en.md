@@ -228,16 +228,27 @@ that ship a desktop and a graphical installer (Calamares) — there you just ope
 terminal and run this TUI instead of Calamares. Every host tool it needs (artools,
 gptfdisk, cryptsetup, …) is pulled in automatically while it runs.
 
-### Pre-built binary (easiest)
+### Prebuilt ISO (easiest)
 
-Download the built installer from the [releases page](https://github.com/YellowHearth1/artix-tui-installer/releases)
-and run it as root:
+An Artix live image with the installer baked in — write it to a USB stick and boot:
+
+```sh
+curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-tui-dinit-x86_64.iso
+```
+
+### Prebuilt binary
+
+If you're already booted (e.g. from the official Artix ISO), just run the
+installer as root:
 
 ```sh
 curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-installer
 chmod +x artix-installer
 sudo ./artix-installer
 ```
+
+Both links always resolve to the **newest build** — GitHub handles `latest`
+itself. Every build is listed on the [releases page](https://github.com/YellowHearth1/artix-tui-installer/releases).
 
 ### Build from source
 
