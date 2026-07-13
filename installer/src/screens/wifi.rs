@@ -109,7 +109,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     // Live status line: errors in the warn colour, plain info dimmed. Empty
     // string renders as an empty row (harmless).
     if !app.wifi_status.is_empty() {
-        let style = if app.wifi_status_is_error {
+        let style = if app.wifi_status_success {
+            // Bright and bold: the one status the user must not miss.
+            theme::accent().add_modifier(ratatui::style::Modifier::BOLD)
+        } else if app.wifi_status_is_error {
             theme::warn()
         } else {
             theme::dim()
@@ -213,22 +216,36 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Stage::Password => match key.code {
-            // Ignore typing while a connection attempt is in flight — the
-            // password is already captured; editing it mid-attempt would be
-            // confusing and wouldn't change the running nmcli.
-            KeyCode::Char(c) if app.wifi_connect_rx.is_none() => app.wifi_password.push(c),
-            KeyCode::Backspace if app.wifi_connect_rx.is_none() => {
+            // Ignore typing while a connection attempt is in flight (the
+            // password is already captured) — and after a SUCCESS (editing a
+            // password for a network we're already on makes no sense; Enter
+            // moves on, Esc walks back).
+            KeyCode::Char(c) if app.wifi_connect_rx.is_none() && !app.wifi_status_success => {
+                app.wifi_password.push(c)
+            }
+            KeyCode::Backspace if app.wifi_connect_rx.is_none() && !app.wifi_status_success => {
                 app.wifi_password.pop();
             }
             KeyCode::Enter => {
-                // Kick off the connection in the BACKGROUND. `nmcli dev wifi
-                // connect` blocks until the association either succeeds or the
-                // supplicant gives up — seconds on real hardware, and it can
-                // hang indefinitely on a flaky or simulated radio. Running it
-                // inline froze the whole TUI (no repaint, no keys) and looked
-                // like a crash. So: spawn it, show "connecting…", poll in
-                // tick(), and give up after a timeout.
-                if app.wifi_connect_rx.is_none() {
+                if app.wifi_status_success {
+                    // The user has SEEN the bright "connected" line — advance.
+                    // goto_next() honours can_advance, and Password draws set
+                    // it false (Enter here normally means "connect"), so flip
+                    // the gate for this one verified transition. Reset to
+                    // Choose so a Back-visit starts from the top.
+                    set_status(app, "", false);
+                    app.wifi_stage = Stage::Choose;
+                    app.cursor = 0;
+                    app.can_advance = true;
+                    app.goto_next();
+                } else if app.wifi_connect_rx.is_none() {
+                    // Kick off the connection in the BACKGROUND. `nmcli dev
+                    // wifi connect` blocks until the association either
+                    // succeeds or the supplicant gives up — seconds on real
+                    // hardware, and it can hang indefinitely on a flaky or
+                    // simulated radio. Running it inline froze the whole TUI
+                    // and looked like a crash. So: spawn it, show
+                    // "connecting…", poll in tick(), time out after 25s.
                     start_connect(app);
                 }
             }
@@ -267,23 +284,14 @@ pub fn tick(app: &mut App) {
             app.wifi_connect_started = None;
             match result {
                 Ok(()) => {
-                    set_status(app, "", false);
                     // Connected — fetch the live-environment prerequisites in
                     // the background so they're ready when needed.
                     start_prereqs(app);
-                    // goto_next() honours `can_advance`, and on the Password
-                    // stage every draw pass sets it to FALSE (Enter there
-                    // means "connect", not "next screen"). We have just
-                    // VERIFIED the connection, so flip the gate ourselves —
-                    // otherwise goto_next() is a silent no-op and the user is
-                    // left on a blank password screen wondering what happened.
-                    // Resetting the stage to Choose also makes a later Back-
-                    // visit to this screen start from the top, which is the
-                    // sensible place once we're online.
-                    app.wifi_stage = Stage::Choose;
-                    app.cursor = 0;
-                    app.can_advance = true;
-                    app.goto_next();
+                    // DON'T jump ahead silently. A grey "connecting…" line
+                    // vanishing into a sudden screen change read as "…did it
+                    // even work?" — so say it did, loudly, and let Enter do
+                    // the advancing (see the Password key handler).
+                    set_status_success(app, "wifi.connected");
                 }
                 Err(detail) => {
                     let mut msg = t(app.lang, "wifi.err_connect");
@@ -330,11 +338,21 @@ fn set_status(app: &mut App, key_or_empty: &str, is_error: bool) {
         t(app.lang, key_or_empty)
     };
     app.wifi_status_is_error = is_error;
+    app.wifi_status_success = false;
 }
 
 fn set_status_owned(app: &mut App, msg: String, is_error: bool) {
     app.wifi_status = msg;
     app.wifi_status_is_error = is_error;
+    app.wifi_status_success = false;
+}
+
+/// Success status: bright so it cannot be missed, and it doubles as the
+/// "connected — Enter advances" flag read by the Password key handler.
+fn set_status_success(app: &mut App, key: &str) {
+    app.wifi_status = t(app.lang, key);
+    app.wifi_status_is_error = false;
+    app.wifi_status_success = true;
 }
 
 /// Make sure the NetworkManager daemon is actually up before talking to it.
