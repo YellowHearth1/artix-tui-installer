@@ -716,6 +716,11 @@ pub struct App {
     pub wifi_status: String,
     /// Whether `wifi_status` is an error (warn colour) or plain info (dim).
     pub wifi_status_is_error: bool,
+    /// True when the status line announces a VERIFIED successful connection.
+    /// Doubles as the "Enter now advances" flag for the Password stage — the
+    /// user confirms they've seen the success instead of being silently
+    /// teleported to the next screen.
+    pub wifi_status_success: bool,
     /// Output of the embedded Wi-Fi test harness (mode screen → "Wi-Fi test").
     pub wifitest_log: Vec<String>,
     /// True while the harness is running, so the screen can say "working…".
@@ -872,6 +877,7 @@ impl App {
             wifi_password: String::new(),
             wifi_status: String::new(),
             wifi_status_is_error: false,
+            wifi_status_success: false,
             wifitest_log: Vec::new(),
             wifitest_running: false,
             wifi_connect_rx: None,

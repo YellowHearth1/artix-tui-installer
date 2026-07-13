@@ -77,6 +77,9 @@ optimize() {
     log "[$label] no candidate mirrors found in $file - skipping."
     return 0
   fi
+  log "================================================="
+  log " Repository mirror optimization: $label"
+  log "================================================="
   log "[$label] probing all $total mirrors (12 in parallel, 6s cap each)..."
 
   # Build probe jobs: substitute $repo/$arch in the server template and point
@@ -97,7 +100,11 @@ optimize() {
         || printf '%s\n' "$srv" >> /tmp/mo_dead
     ) &
     n=$((n+1))
-    if [ $((n % 12)) -eq 0 ]; then wait; fi
+    if [ $((n % 12)) -eq 0 ]; then
+      wait
+      alive_now=$(wc -l < /tmp/mo_ok)
+      log "[$label] $n/$total probed, $alive_now alive so far..."
+    fi
   done < /tmp/mo_jobs
   wait
 
