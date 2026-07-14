@@ -94,7 +94,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let k = OPTIONS[app.kernel_cursor.min(OPTIONS.len() - 1)];
-            app.config.kernel = format!("{:?}", k);
+            app.config.kernel = k;
             app.goto_next();
         }
         _ => {}

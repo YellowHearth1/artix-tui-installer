@@ -645,7 +645,7 @@ pub(crate) const PINNACLE_RUN_CONFIG: &str = r##"#!/bin/sh
 # returns in milliseconds, and it transparently rebuilds after you edit
 # src/main.rs (then just reload the config from inside Pinnacle).
 cd "$(dirname "$0")" || exit 1
-if ! cargo build --release --locked >run-config.log 2>&1; then
+if ! cargo build --release >run-config.log 2>&1; then
     command -v notify-send >/dev/null 2>&1 && \
         notify-send "Pinnacle config" "Build failed - see ~/.config/pinnacle/run-config.log"
     exit 1
@@ -676,7 +676,42 @@ pub(crate) const WAYBAR_STYLE_CSS: &str = include_str!("../../assets/waybar.styl
 /// extracted into ~/.config/pinnacle only when pinnacle-comp is among the
 /// selected AUR packages. Shipped as one archive because it's a multi-file,
 /// multi-directory tree — far cleaner than a dozen include_str! constants.
-pub(crate) const PINNACLE_CONFIG_TARBALL: &[u8] = include_bytes!("../../assets/pinnacle.tar.gz");
+/// The Pinnacle config tree, as plain files under `assets/pinnacle/`.
+///
+/// This used to be a single `pinnacle.tar.gz` embedded with `include_bytes!`,
+/// which meant the config a user is invited to edit was an opaque 15 KB blob:
+/// invisible in review, undiffable in git, and unchangeable without
+/// regenerating the whole archive. They're ordinary text files — so they're
+/// kept as ordinary text files, and the install writes each one out.
+///
+/// `Cargo.lock` is deliberately NOT shipped: cargo regenerates it, and a lock
+/// frozen at tarball-build time would pin stale dependency versions.
+pub(crate) const PINNACLE_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../assets/pinnacle/Cargo.toml"),
+    ),
+    (
+        "pinnacle.toml",
+        include_str!("../../assets/pinnacle/pinnacle.toml"),
+    ),
+    (
+        "src/main.rs",
+        include_str!("../../assets/pinnacle/src/main.rs"),
+    ),
+    (
+        "scripts/clipboard.sh",
+        include_str!("../../assets/pinnacle/scripts/clipboard.sh"),
+    ),
+    (
+        "scripts/launcher.sh",
+        include_str!("../../assets/pinnacle/scripts/launcher.sh"),
+    ),
+    (
+        "scripts/mango-tags.sh",
+        include_str!("../../assets/pinnacle/scripts/mango-tags.sh"),
+    ),
+];
 
 pub(crate) const NFTABLES_CONFIG_TEMPLATE: &str = r#"#!/usr/sbin/nft -f
 #

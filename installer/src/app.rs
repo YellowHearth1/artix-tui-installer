@@ -79,7 +79,7 @@ impl Screen {
 
 /// How the installed system's accounts are set up (user choice on the User
 /// screen). Covers the four combinations the user asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AccountMode {
     /// Create a user; root gets its own separate password.
     UserSeparateRoot,
@@ -109,7 +109,7 @@ impl AccountMode {
 /// Linux kernel choice. Installed during basestrap so the system boots with
 /// the selected kernel + matching headers (needed for DKMS modules like the
 /// NVIDIA drivers).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kernel {
     Linux,
     Zen,
@@ -118,6 +118,16 @@ pub enum Kernel {
 }
 
 impl Kernel {
+    /// Name for the summary screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kernel::Linux => "Linux",
+            Kernel::Zen => "Zen",
+            Kernel::Hardened => "Hardened",
+            Kernel::Lts => "LTS",
+        }
+    }
+
     pub fn packages(self) -> &'static [&'static str] {
         match self {
             Kernel::Linux => &["linux", "linux-headers"],
@@ -128,8 +138,124 @@ impl Kernel {
     }
 }
 
+/// Which seat manager acquires input/DRM for graphical sessions. Both work; the
+/// choice matters because each brings its own per-user session launcher and its
+/// own dinit services, and mixing them breaks logins.
+///
+/// Serialises as "elogind"/"seatd" — the strings this used to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatProvider {
+    Elogind,
+    Seatd,
+}
+
+impl SeatProvider {
+    /// Packages: the daemon plus its Artix dinit service package.
+    pub fn packages(self) -> &'static [&'static str] {
+        match self {
+            SeatProvider::Elogind => &["elogind", "elogind-dinit"],
+            SeatProvider::Seatd => &["seatd", "seatd-dinit"],
+        }
+    }
+
+    /// The dinit service named after the daemon (not after the package).
+    pub fn service(self) -> &'static str {
+        match self {
+            SeatProvider::Elogind => "elogind",
+            SeatProvider::Seatd => "seatd",
+        }
+    }
+
+    /// The per-user launcher that spawns the user's dinit instance on login —
+    /// which is what brings up D-Bus, PipeWire and sound. Must match the seat
+    /// backend: userspawn belongs to elogind, turnstiled to seatd.
+    pub fn user_launcher(self) -> &'static str {
+        match self {
+            SeatProvider::Elogind => "userspawn",
+            SeatProvider::Seatd => "turnstiled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SeatProvider::Elogind => "elogind",
+            SeatProvider::Seatd => "seatd",
+        }
+    }
+}
+
+/// Firmware boot mode. Detected from /sys/firmware/efi at startup, overridable
+/// on the disk screen (a UEFI machine can still be installed BIOS-style).
+///
+/// Serialises as "uefi"/"bios" — the strings this used to be, so configs saved
+/// by older builds still load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootMode {
+    Uefi,
+    Bios,
+}
+
+impl BootMode {
+    pub fn is_uefi(self) -> bool {
+        self == BootMode::Uefi
+    }
+
+    /// Label for the summary screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            BootMode::Uefi => "UEFI",
+            BootMode::Bios => "BIOS",
+        }
+    }
+
+    /// The other mode — for the Space/Enter toggle on the disk screen.
+    pub fn toggled(self) -> Self {
+        match self {
+            BootMode::Uefi => BootMode::Bios,
+            BootMode::Bios => BootMode::Uefi,
+        }
+    }
+}
+
+/// How the installed system boots. EFISTUB has no bootloader at all — the
+/// firmware loads the kernel directly — which is why it's in this enum rather
+/// than being modelled as "no bootloader".
+///
+/// Serialises as "grub"/"refind"/"limine"/"efistub", matching the strings this
+/// used to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bootloader {
+    Grub,
+    Refind,
+    Limine,
+    Efistub,
+}
+
+impl Bootloader {
+    /// EFISTUB is the only option that can be Secure Boot-prepared by us: with
+    /// no bootloader in the chain, the kernel image itself is what gets signed.
+    pub fn supports_secureboot_prep(self) -> bool {
+        self == Bootloader::Efistub
+    }
+
+    /// Human-readable name, as shown on the options and summary screens. Lives
+    /// on the type so the spelling can't drift between the three places that
+    /// used to carry their own copy of this mapping.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Bootloader::Grub => "GRUB",
+            Bootloader::Refind => "rEFInd",
+            Bootloader::Limine => "Limine",
+            Bootloader::Efistub => "EFISTUB",
+        }
+    }
+}
+
 /// One of the fixed GPU driver bundles that head the package list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GpuDriver {
     None,
     Nvidia,
@@ -140,6 +266,22 @@ pub enum GpuDriver {
 }
 
 impl GpuDriver {
+    /// The three NVIDIA stacks target the same hardware with conflicting kernel
+    /// modules, so picking one must drop the others. Intel and AMD combine
+    /// freely — with each other and with one NVIDIA stack (hybrid graphics).
+    pub fn is_nvidia_family(self) -> bool {
+        matches!(
+            self,
+            GpuDriver::Nvidia | GpuDriver::Nvidia580xx | GpuDriver::Nouveau
+        )
+    }
+
+    /// True for the proprietary stacks (which need the DKMS/persistence bits);
+    /// nouveau is open-source and needs none of that.
+    pub fn is_proprietary_nvidia(self) -> bool {
+        matches!(self, GpuDriver::Nvidia | GpuDriver::Nvidia580xx)
+    }
+
     /// The exact package set for each bundle (from the spec).
     pub fn packages(self) -> &'static [&'static str] {
         match self {
@@ -442,7 +584,7 @@ pub const DINIT_SERVICES: &[&str] = &[
 ///     formatted. `fs` is the detected filesystem (e.g. "ntfs").
 /// In both cases fstab records it so it mounts on every boot. The system disk
 /// itself is never represented here.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtraDisk {
     pub disk: String,       // "/dev/sdb" (whole disk) or "/dev/sdb1" (partition)
     pub mountpoint: String, // e.g. "/home", "/data", "/mnt/windows"
@@ -468,14 +610,14 @@ pub struct ExtraDisk {
     pub mount_name: String, // folder name (home/mnt) or full path (custom)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstallConfig {
     pub lang: String,     // "en" | "uk" — UI language
     pub locale: String,   // e.g. "uk_UA.UTF-8" — system locale
     pub timezone: String, // e.g. "Europe/Kyiv"
     pub keymap: String,   // console keymap, e.g. "ua"
     pub xkb_layouts: Vec<String>,
-    pub kernel: String,        // serialized Kernel
+    pub kernel: Kernel,
     pub desktops: Vec<String>, // serialized Desktop names (multi-select; empty = headless)
     /// Chosen session type for desktops that support both: "wayland" or "x11".
     /// Ignored for single-session desktops. Default follows Desktop::default_session.
@@ -483,8 +625,11 @@ pub struct InstallConfig {
     /// Seat/session manager: "elogind" (universal — works with X11 and Wayland,
     /// integrates with PAM/polkit; the safe default) or "seatd" (minimal, seat
     /// management only). Default "elogind".
-    pub seat_provider: String,
-    pub gpu: String, // serialized GpuDriver
+    pub seat_provider: SeatProvider,
+    /// GPU driver bundles to install. A SET, not one choice: hybrid graphics
+    /// (an NVIDIA dGPU next to an Intel/AMD iGPU) needs both stacks. Empty is
+    /// impossible — the screen falls back to `[GpuDriver::None]`.
+    pub gpu: Vec<GpuDriver>,
     pub extra_packages: Vec<String>,
     /// Additional whole disks assigned to mountpoints (e.g. /home on a separate
     /// HDD, or a storage disk at /data). Empty on single-disk systems. The
@@ -494,8 +639,8 @@ pub struct InstallConfig {
     /// AUR packages the user typed (space-separated), built via paru at the end
     /// of install as the new user. Empty = none.
     pub aur_packages: Vec<String>,
-    pub disk: String,      // e.g. "/dev/sda"
-    pub boot_mode: String, // "bios" | "uefi"
+    pub disk: String, // e.g. "/dev/sda"
+    pub boot_mode: BootMode,
     /// If true, the user gets passwordless sudo (NOPASSWD); else password each time.
     pub passwordless_sudo: bool,
     /// Privilege-escalation tool: false = sudo (default), true = doas (an
@@ -553,7 +698,7 @@ pub struct InstallConfig {
     /// Bootloader to install: "grub" (default), "refind", or "limine".
     /// Only GRUB can decrypt an encrypted /boot, so full-disk encryption forces
     /// GRUB; the others are offered for plaintext and root-only LUKS setups.
-    pub bootloader: String,
+    pub bootloader: Bootloader,
     /// Display manager: "sddm" (default for graphical desktops), "none", or a
     /// greetd greeter: "agreety", "tuigreet", "gtkgreet", "regreet", "wlgreet"
     /// (the greetd variants from the Arch Wiki that exist as repo packages).
@@ -582,7 +727,7 @@ pub struct InstallConfig {
     pub root_password: String,
     pub root_same_as_user: bool,
     /// Serialized AccountMode (e.g. "UserSeparateRoot").
-    pub account_mode: String,
+    pub account_mode: AccountMode,
 }
 
 impl Default for InstallConfig {
@@ -593,11 +738,11 @@ impl Default for InstallConfig {
             timezone: "Europe/Kyiv".into(),
             keymap: "ua".into(),
             xkb_layouts: vec!["ua".into(), "gb".into()],
-            kernel: "Linux".into(),
+            kernel: Kernel::Linux,
             desktops: Vec::new(),
             session: "wayland".into(),
-            seat_provider: "elogind".into(),
-            gpu: "None".into(),
+            seat_provider: SeatProvider::Elogind,
+            gpu: vec![GpuDriver::None],
             // Default-checked package set: pre-selected on a fresh run, all
             // ordinary entries the user can untick in the packages screen.
             // The distro's own configs ride on these: zsh → shipped .zshrc +
@@ -615,7 +760,7 @@ impl Default for InstallConfig {
             extra_disks: Vec::new(),
             aur_packages: Vec::new(),
             disk: String::new(),
-            boot_mode: "uefi".into(),
+            boot_mode: BootMode::Uefi,
             passwordless_sudo: false,
             use_doas: false,
             chaotic_aur: false,
@@ -632,7 +777,7 @@ impl Default for InstallConfig {
             btrfs_snapshots: false,
             btrfs_compress: false,
             btrfs_discard: false,
-            bootloader: "grub".into(),
+            bootloader: Bootloader::Grub,
             display_manager: "sddm".into(),
             usb_key_device: String::new(),
             usb_key_only: false,
@@ -642,7 +787,7 @@ impl Default for InstallConfig {
             user_password: String::new(),
             root_password: String::new(),
             root_same_as_user: true,
-            account_mode: "UserSameRoot".into(),
+            account_mode: AccountMode::UserSameRoot,
         }
     }
 }
@@ -840,9 +985,9 @@ impl App {
         // default to the correct mode (so grub installs as x86_64-efi under
         // UEFI, i386-pc under BIOS) instead of relying on the user to toggle it.
         config.boot_mode = if std::path::Path::new("/sys/firmware/efi").exists() {
-            "uefi".into()
+            BootMode::Uefi
         } else {
-            "bios".into()
+            BootMode::Bios
         };
         App {
             screen: Screen::Language,
@@ -937,6 +1082,10 @@ impl App {
         if self.can_advance && self.screen != Screen::Finish {
             self.screen = self.screen.next();
             self.cursor = 0;
+            // Same reasoning as goto_prev: the screen we're LEAVING must not
+            // hand its focus row to the one we're entering, and the screen
+            // we're entering must start clean when we later walk back to it.
+            self.reset_screen_focus();
         }
     }
 
@@ -945,7 +1094,30 @@ impl App {
         if self.screen != Screen::Finish {
             self.screen = self.screen.prev();
             self.cursor = 0;
+            self.reset_screen_focus();
         }
+    }
+
+    /// Clear the per-screen focus rows and any open modal.
+    ///
+    /// `cursor` alone is not the whole story: several screens track WHICH ROW
+    /// has focus in their own field (the desktop screen's DE-vs-login-manager
+    /// focus, the disk screen's boot/disk/swap/fs focus, and so on). Leaving
+    /// those set means walking back into a screen lands mid-way through it —
+    /// on the desktop screen that made Enter jump straight forward again
+    /// instead of reopening the seat picker, so the desktop and seat choices
+    /// became unreachable once made. Navigation must hand a screen back in the
+    /// state it would have on a first visit.
+    fn reset_screen_focus(&mut self) {
+        self.de_focus = 0;
+        self.disk_focus = 0;
+        self.pkg_focus = 0;
+        self.user_focus = 0;
+        self.recovery_focus = 0;
+        self.storage_cursor = 0;
+        // A modal left flagged open would render over the screen on arrival.
+        self.seat_modal_open = false;
+        self.storage_opts_modal_open = false;
     }
 
     pub fn push_log<S: Into<String>>(&mut self, line: S) {

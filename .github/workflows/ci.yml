@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets you re-run the checks by hand from the Actions tab.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build · clippy · fmt · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: installer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Cache the registry and the target dir: a warm run finishes in seconds
+      # instead of rebuilding every dependency from scratch.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            installer/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('installer/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Formatting first: it's instant, and a diff here means the rest of the
+      # review is going to be noise.
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --release
+
+      # -D warnings makes every lint an error. Clippy catches what the compiler
+      # accepts but a reviewer would not: needless clones, redundant closures,
+      # comparison chains that should be matches.
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+  # The install plan embeds a lot of shell. `dash -n` parses it as POSIX sh —
+  # the actual interpreter in the chroot — so a bashism or an unbalanced quote
+  # is caught here rather than halfway through someone's installation.
+  shell:
+    name: shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dash
+        run: sudo apt-get update && sudo apt-get install -y dash
+
+      - name: Check the shipped scripts
+        run: |
+          fail=0
+          for f in $(find scripts installer/src/assets -name '*.sh' 2>/dev/null); do
+            if dash -n "$f"; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # The version on screen comes from Cargo.toml. The CHANGELOG is written by
+  # hand. When they disagree, the number a user reports means nothing — which
+  # defeats the entire point of showing it.
+  version:
+    name: version matches changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare Cargo.toml and CHANGELOG.md
+        run: |
+          cargo_ver=$(grep -m1 '^version' installer/Cargo.toml | sed 's/.*"\(.*\)".*/\1/' | cut -d. -f1)
+          log_ver=$(grep -m1 '^## \[' CHANGELOG.md | sed 's/^## \[\([0-9]*\)\].*/\1/')
+          echo "Cargo.toml: $cargo_ver"
+          echo "CHANGELOG:  $log_ver"
+          if [ "$cargo_ver" != "$log_ver" ]; then
+            echo "::error::Cargo.toml says $cargo_ver but the CHANGELOG's newest entry is $log_ver"
+            exit 1
+          fi
+
+  # Both translations must define exactly the same keys. A key present in one
+  # and missing from the other renders as a raw identifier on screen.
+  i18n:
+    name: translation parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare uk.toml and en.toml
+        run: |
+          python3 - <<'EOF'
+          import sys, tomllib
+
+          def keys(d, prefix=""):
+              out = set()
+              for k, v in d.items():
+                  if isinstance(v, dict):
+                      out |= keys(v, f"{prefix}{k}.")
+                  else:
+                      out.add(f"{prefix}{k}")
+              return out
+
+          with open("installer/i18n/uk.toml", "rb") as f:
+              uk = keys(tomllib.load(f))
+          with open("installer/i18n/en.toml", "rb") as f:
+              en = keys(tomllib.load(f))
+
+          if uk == en:
+              print(f"parity ok: {len(uk)} keys")
+              sys.exit(0)
+
+          for k in sorted(uk - en):
+              print(f"missing from en.toml: {k}")
+          for k in sorted(en - uk):
+              print(f"missing from uk.toml: {k}")
+          sys.exit(1)
+          EOF

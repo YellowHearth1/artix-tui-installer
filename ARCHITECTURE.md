@@ -25,16 +25,62 @@ main.rs (термінал, цикл подій)
 | `src/theme.rs` | кольори/стилі | — |
 | `src/screens/*.rs` | по файлу на екран (мова, диск, wifi, options, summary…) | поведінка конкретного екрана |
 | `src/screens/wifi.rs` | Wi-Fi: nmcli, страховка запуску NetworkManager, retry-логіка | правило: Enter ніколи не «мовчить» |
-| `src/system/install/mod.rs` | `build_plan` — серце: 40+ нумерованих кроків установки | новий крок установки |
+| `src/system/install/mod.rs` | `build_plan` — серце: читається як зміст (25 кроків по рядку), а деталі — у восьми `plan_*` функціях (див. нижче) | новий крок установки |
 | `src/system/install/helpers.rs` | конструктори Action (`act`, `chroot`, `write_target_file`…), LUKS/rootflags | — |
 | `src/system/install/scripts.rs` | УСІ вбудовані скрипти/сервіси/дотфайли/асети | правити текст скрипта — тут, і лише тут |
 | `src/system/install/packages.rs` | DE/GPU/ядро → списки пакетів | додати пакет за замовчуванням |
-| `src/system/install/mirrors.rs` | ранжування дзеркал + таблиця країн за таймзоною | — |
+| `src/system/install/mirrors.rs` | перевірка **всіх** дзеркал (Artix + Arch + Chaotic) перед встановленням: живі — найшвидші першими, мертві — вимкнені | — |
 | `src/system/disk.rs` | lsblk-розбір, план розмітки | — |
 | `src/system/runner.rs` | виконання плану, стрімінг логу, `capture()` | — |
 | `src/rollback.rs` | btrfs-відкат (меню знімків) | — |
-| `src/assets/` | waybar/wofi/fastfetch конфіги, тарбол конфігу Pinnacle | конфіг Pinnacle: розпакуй `pinnacle.tar.gz`, зміни, запакуй назад |
+| `src/assets/` | waybar/wofi/fastfetch конфіги; `pinnacle/` — конфіг композитора звичайними файлами | конфіг Pinnacle: просто відредагуй файл у `assets/pinnacle/` |
 | `iso-profile/` | профіль live-ISO для `buildiso` (пакети, dinit-сервіси, overlay); але справжній профіль, який читає `buildiso` — це окремий `profile.yaml` (поза цим репо), а не `Packages-Live`/`live-overlay/` тут | сервіс на live-ISO → додай його в `live-session.services:` у `profile.yaml` |
+
+## Як улаштований `build_plan`
+
+Це найбільший файл, тож варто знати його форму. `build_plan` **не містить**
+логіки установки — він її **перелічує**:
+
+```rust
+pub fn build_plan(app: &App) -> Vec<Action> {
+    // 0)  інструменти хоста
+    // 1)  диск: розмітка, форматування, монтування
+    // 2)  basestrap: база + обрані пакети
+    // 3)  fstab (+ додаткові диски)     → plan_fstab()
+    // ...
+    // 9)  облікові записи               → plan_accounts()
+    // 9b) GTK-закладки + D-Bus сесія    → plan_session_env()
+    // 9c) initramfs + ключі LUKS        → plan_initramfs_luks()
+    // 10) завантажувач                  → plan_bootloader()
+    // 11) фаєрвол                       → plan_firewall()
+    // 12) сервіси dinit + AUR           → plan_services()
+}
+```
+
+Кожна `plan_*` — **чиста функція**: читає `InstallConfig`, дописує кроки в план,
+більше нічого. Тому її можна перевірити тестом, не торкаючись диска:
+
+```rust
+let t = plan_text(&build_plan(&app));
+assert!(t.contains("groupadd -f log"));
+```
+
+**Порядок кроків критичний** (fstab до завантажувача, акаунти до сервісів) —
+компілятор його не перевірить, тому не переставляйте виклики без причини.
+
+## Типи замість рядків
+
+`InstallConfig` не зберігає вибір користувача рядками. `boot_mode` — це
+`BootMode`, а не `"uefi"`; `bootloader` — `Bootloader`; `gpu` —
+`Vec<GpuDriver>`, а не CSV. Це не стилістика:
+
+- додасте варіант до `enum` — компілятор **змусить** обробити його в кожному
+  `match`, включно з екраном вибору;
+- знання про залежності живе **в методі типу**, а не розкидане по файлах:
+  `SeatProvider::user_launcher()` знає, що elogind тягне `userspawn`, а seatd —
+  `turnstiled`.
+
+Не додавайте нових полів-рядків там, де є скінченний набір варіантів.
 
 ## Як зробити типову зміну
 
@@ -61,9 +107,54 @@ ISO вмикається через список `live-session.services:` у `pr
 
 ## Збірка й перевірки
 
+Усе, що робить CI, можна прогнати локально — і варто, перед комітом:
+
 ```sh
-cd installer && cargo build --release        # rustc ≥ 1.90
-# parity перекладів:
+cd installer
+cargo fmt --check                          # єдиний стиль
+cargo build --release                      # rustc ≥ 1.90
+cargo clippy --release -- -D warnings      # те, що компілятор пропускає
+cargo test --release                       # тести-регресії (див. нижче)
+```
+
+**Тести — це баги, які вже колись сталися.** Кожен `#[test]` у
+`system/install/mod.rs` фіксує помилку, що реально доїхала до користувача:
+флешка-ключ, яку форматували; група `log`, без якої логи не читались;
+`useradd` до `groupadd`; AUR-перевірка, що брехала про `-git`-пакети. План — це
+чисті дані, тож установку можна перевірити, не торкаючись диска:
+
+```rust
+let t = plan_text(&build_plan(&app));
+assert!(t.contains("groupadd -f log"));
+```
+
+Знайшли баг — **спершу напишіть тест**, що його ловить, потім лагодьте. Інакше
+він повернеться при першому ж рефакторингу.
+
+**Три рівні тестів, і кожен ловить своє:**
+
+| Де | Що перевіряє | Приклад бага, який ловить |
+|---|---|---|
+| `system/install/mod.rs` | **план установки** — чисті дані, диск не потрібен | флешку-ключ форматували; `useradd` до `groupadd` |
+| `screens/mod.rs` | **рендер** через `TestBackend` (малює в пам'ять) | паніка в `draw()`; курсор за межами списку; сирий i18n-ключ на екрані |
+| `event.rs` | **клавіші** — `handle_global` викликається напряму | `q` вбивала інсталятор із поля пароля |
+
+`TestBackend` — вбудований у ratatui backend, що малює в буфер замість
+термінала. Дає змогу відрендерити будь-який екран у юніт-тесті:
+
+```rust
+let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+let text = term.backend().to_string();   // весь екран рядком
+```
+
+Чому це важливо саме тут: інсталятор працює **на фізичній консолі з live-ISO**.
+Паніка в `draw()` — це не стектрейс у логах, а мертва машина посеред установки,
+без шляху назад. Тому кожен екран перевіряється на трьох розмірах (80×24 —
+обіцяний мінімум) і в обох мовах.
+
+```sh
+# parity перекладів (CI робить те саме):
 python3 - <<'EOF'
 import tomllib
 def f(d,p=""):

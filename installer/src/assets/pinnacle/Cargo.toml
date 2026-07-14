@@ -1,0 +1,12 @@
+[package]
+name = "pinnacle-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pinnacle-api = { git = "https://github.com/pinnacle-comp/pinnacle", tag = "v0.2.0", features = ["snowcap"] }
+snowcap-api = { git = "https://github.com/pinnacle-comp/pinnacle", tag = "v0.2.0" }
+
+[features]
+default = ["snowcap"]
+snowcap = ["pinnacle-api/snowcap"]

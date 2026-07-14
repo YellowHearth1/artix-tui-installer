@@ -25,16 +25,63 @@ main.rs (terminal, event loop)
 | `src/theme.rs` | colours/styles | — |
 | `src/screens/*.rs` | one file per screen (language, disk, wifi, options, summary…) | that screen's behaviour |
 | `src/screens/wifi.rs` | Wi-Fi: nmcli, NetworkManager start fallback, retry logic | rule: Enter is never a silent no-op |
-| `src/system/install/mod.rs` | `build_plan` — the heart: 40+ numbered install steps | a new install step |
+| `src/system/install/mod.rs` | `build_plan` — the core: reads like a table of contents (25 steps, one line each), with the detail in eight `plan_*` functions (see below) | a new install step |
 | `src/system/install/helpers.rs` | Action constructors (`act`, `chroot`, `write_target_file`…), LUKS/rootflags | — |
 | `src/system/install/scripts.rs` | ALL embedded scripts/services/dotfiles/assets | editing a script's text happens here, and only here |
 | `src/system/install/packages.rs` | DE/GPU/kernel → package lists | add a default package |
-| `src/system/install/mirrors.rs` | mirror ranking + timezone→countries table | — |
+| `src/system/install/mirrors.rs` | health-checks **every** mirror (Artix + Arch + Chaotic) before installing: live ones fastest-first, dead ones commented out | — |
 | `src/system/disk.rs` | lsblk parsing, partition plan | — |
 | `src/system/runner.rs` | plan execution, log streaming, `capture()` | — |
 | `src/rollback.rs` | btrfs rollback (snapshot picker) | — |
-| `src/assets/` | waybar/wofi/fastfetch configs, the Pinnacle config tarball | Pinnacle config: unpack `pinnacle.tar.gz`, edit, repack |
+| `src/assets/` | waybar/wofi/fastfetch configs; `pinnacle/` holds the compositor config as plain files | Pinnacle config: just edit the file under `assets/pinnacle/` |
 | `iso-profile/` | live-ISO profile for `buildiso` (packages, dinit services, overlay); but the profile `buildiso` actually reads is a separate `profile.yaml` (outside this repo), not `Packages-Live`/`live-overlay/` here | a live-ISO service → add it to `live-session.services:` in `profile.yaml` |
+
+## How `build_plan` is laid out
+
+It's the biggest file, so it's worth knowing its shape. `build_plan` does not
+*contain* the install logic — it *lists* it:
+
+```rust
+pub fn build_plan(app: &App) -> Vec<Action> {
+    // 0)  host tooling
+    // 1)  disk: partition, format, mount
+    // 2)  basestrap: base + chosen packages
+    // 3)  fstab (+ extra disks)         → plan_fstab()
+    // ...
+    // 9)  accounts                      → plan_accounts()
+    // 9b) GTK bookmarks + D-Bus session → plan_session_env()
+    // 9c) initramfs + LUKS keyfiles     → plan_initramfs_luks()
+    // 10) bootloader                    → plan_bootloader()
+    // 11) firewall                      → plan_firewall()
+    // 12) dinit services + AUR          → plan_services()
+}
+```
+
+Each `plan_*` is a **pure function**: it reads `InstallConfig`, appends steps to
+the plan, and does nothing else. That's what makes an install testable without
+touching a disk:
+
+```rust
+let t = plan_text(&build_plan(&app));
+assert!(t.contains("groupadd -f log"));
+```
+
+**Step order matters** (fstab before the bootloader, accounts before services)
+and the compiler won't check it — don't reorder the calls without a reason.
+
+## Types, not strings
+
+`InstallConfig` doesn't store the user's choices as strings. `boot_mode` is a
+`BootMode`, not `"uefi"`; `bootloader` is a `Bootloader`; `gpu` is a
+`Vec<GpuDriver>`, not CSV. This isn't style:
+
+- add a variant to an `enum` and the compiler **forces** you to handle it in
+  every `match` — including the picker on screen;
+- knowledge about dependencies lives **on the type**, not scattered across
+  files: `SeatProvider::user_launcher()` knows elogind pairs with `userspawn`
+  and seatd with `turnstiled`.
+
+Don't add new string fields where the set of values is finite.
 
 ## Making a typical change
 
@@ -61,9 +108,54 @@ live ISO is enabled via the `live-session.services:` list in `profile.yaml`
 
 ## Building & checks
 
+Everything CI does runs locally too — and should, before you commit:
+
 ```sh
-cd installer && cargo build --release        # rustc ≥ 1.90
-# translation parity:
+cd installer
+cargo fmt --check                          # one style
+cargo build --release                      # rustc >= 1.90
+cargo clippy --release -- -D warnings      # what the compiler lets through
+cargo test --release                       # regression tests (see below)
+```
+
+**The tests are bugs that already happened.** Every `#[test]` in
+`system/install/mod.rs` pins down a failure that reached a real user: the key
+stick that got formatted; the `log` group without which logs were unreadable;
+`useradd` before `groupadd`; the AUR check that lied about `-git` packages. The
+plan is pure data, so an install can be inspected without touching a disk:
+
+```rust
+let t = plan_text(&build_plan(&app));
+assert!(t.contains("groupadd -f log"));
+```
+
+Found a bug? **Write the test first**, then fix it — otherwise the next
+refactor brings it back.
+
+**Three levels of tests, each catching something the others can't:**
+
+| Where | What it checks | A bug it caught |
+|---|---|---|
+| `system/install/mod.rs` | the **install plan** — pure data, no disk needed | the key stick got formatted; `useradd` ran before `groupadd` |
+| `screens/mod.rs` | **rendering**, via `TestBackend` (draws to memory) | a panic in `draw()`; a cursor past the end of a list; a raw i18n key on screen |
+| `event.rs` | **keys** — `handle_global` called directly | `q` killed the installer from a password field |
+
+`TestBackend` is ratatui's built-in backend that renders into an in-memory
+buffer instead of a terminal, so any screen can be drawn in a unit test:
+
+```rust
+let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+term.draw(|f| draw(f, &mut app, f.area())).unwrap();
+let text = term.backend().to_string();   // the whole screen as text
+```
+
+Why this matters here specifically: the installer runs on a **physical console
+from a live ISO**. A panic in `draw()` isn't a stack trace in a log — it's a
+dead machine mid-install, with no way back. So every screen is checked at three
+sizes (80x24 being the promised minimum) and in both languages.
+
+```sh
+# translation parity (CI runs the same):
 python3 - <<'EOF'
 import tomllib
 def f(d,p=""):

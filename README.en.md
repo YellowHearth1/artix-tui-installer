@@ -6,6 +6,7 @@
 
 ### A bilingual Artix Linux TUI installer — dinit, LUKS, btrfs rollback, Wayland. systemd-free.
 
+<a href="https://github.com/YellowHearth1/artix-tui-installer/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YellowHearth1/artix-tui-installer/actions/workflows/ci.yml/badge.svg"></a>
 <img alt="Rust" src="https://img.shields.io/badge/Rust-1.90+-B7410E?style=for-the-badge&logo=rust&logoColor=white">
 <img alt="ratatui" src="https://img.shields.io/badge/TUI-ratatui-1D9BF0?style=for-the-badge">
 <img alt="Artix Linux" src="https://img.shields.io/badge/Artix-Linux-10A0CC?style=for-the-badge&logo=artixlinux&logoColor=white">
@@ -59,6 +60,8 @@ segmented toggles, and a live scrollable install log.
 > and the Artix/dinit-specific decisions belong to the project's author.
 
 ---
+
+📋 **[Changelog](CHANGELOG.md)** — what changed in each version.
 
 ## ✨ Features
 

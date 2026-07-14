@@ -4,7 +4,7 @@
 //!   3) swap: enabled toggle + GiB amount (default 4).
 //! The actual partition plan is built later by system::disk::build_plan.
 
-use crate::app::App;
+use crate::app::{App, BootMode};
 use crate::i18n::t;
 use crate::screens::widgets;
 use crate::system::disk::{self, Disk};
@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     //    with its own title and a short description, so the choice reads like a
     //    proper either/or instead of two small pills. The selected card gets
     //    the accent border + a ● mark; focus brightens everything.
-    let bm_is_bios = app.config.boot_mode == "bios";
+    let bm_is_bios = app.config.boot_mode == BootMode::Bios;
     let bm_focused = app.disk_focus == 0;
     let halves = Layout::default()
         .direction(Direction::Horizontal)
@@ -70,7 +70,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     // 2) Disk list.
-    let d = disks();
+    let d = disks_selectable(app);
     let disk_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -306,9 +306,33 @@ fn is_too_small(d: &Disk) -> bool {
 /// boot-mode choice. Each entry is a fully-formed, localized sentence. Order:
 /// most destructive first (live medium), then space, then firmware mismatch.
 /// None of these block installation — they inform the user before they commit.
+/// The disks the user may actually install onto.
+///
+/// Excludes the stick chosen as the LUKS USB key. Two reasons, and the second
+/// is the dangerous one:
+///
+///   * it's contradictory — you can't hold the unlock key on the very disk the
+///     key is supposed to unlock;
+///   * `app.config.disk` is assigned from the cursor position on EVERY draw
+///     pass, so merely scrolling PAST the stick would silently make it the
+///     install target. The install would then wipe the key stick — and with a
+///     key-only setup, that's an unbootable system.
+///
+/// The options screen already refuses to offer the install disk as a key
+/// (`d.removable && d.path != app.config.disk`); this is the same guard from
+/// the other side, for when the user walks Back into the disk screen after
+/// picking a key.
+fn disks_selectable(app: &App) -> Vec<Disk> {
+    disks()
+        .iter()
+        .filter(|x| app.config.usb_key_device.is_empty() || x.path != app.config.usb_key_device)
+        .cloned()
+        .collect()
+}
+
 fn preflight_warnings(app: &App) -> Vec<String> {
     let mut out = Vec::new();
-    let d = disks();
+    let d = disks_selectable(app);
     if let Some(sel) = d.get(app.disk_cursor.min(d.len().saturating_sub(1))) {
         if sel.is_live {
             out.push(t(app.lang, "disk.warnmodal_live"));
@@ -320,7 +344,7 @@ fn preflight_warnings(app: &App) -> Vec<String> {
     // UEFI/BIOS vs actual firmware. /sys/firmware/efi exists only when booted in
     // UEFI mode; a mismatch produces an unbootable system, so warn either way.
     let firmware_is_uefi = std::path::Path::new("/sys/firmware/efi").exists();
-    let chose_uefi = app.config.boot_mode != "bios";
+    let chose_uefi = app.config.boot_mode.is_uefi();
     if firmware_is_uefi && !chose_uefi {
         out.push(t(app.lang, "disk.warnmodal_bios_on_uefi"));
     } else if !firmware_is_uefi && chose_uefi {
@@ -777,14 +801,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             // picks UEFI (left) and Right picks BIOS (right); Space toggles.
             // Up leaves to the previous page (global handler, this is the top
             // row); Down moves on to the disk list, like every other area.
-            KeyCode::Left => app.config.boot_mode = "uefi".into(),
-            KeyCode::Right => app.config.boot_mode = "bios".into(),
+            KeyCode::Left => app.config.boot_mode = BootMode::Uefi,
+            KeyCode::Right => app.config.boot_mode = BootMode::Bios,
             KeyCode::Char(' ') => {
-                app.config.boot_mode = if app.config.boot_mode == "bios" {
-                    "uefi".into()
-                } else {
-                    "bios".into()
-                };
+                app.config.boot_mode = app.config.boot_mode.toggled();
             }
             KeyCode::Down | KeyCode::Enter => app.disk_focus = 1,
             _ => {}

@@ -206,6 +206,16 @@ pub(crate) fn extra_disks_plan(c: &InstallConfig) -> Vec<Action> {
         if !d.format || d.mountpoint.is_empty() {
             continue;
         }
+        // Never touch the USB key stick, whatever the config claims. The UI
+        // hides it from the disk lists and retracts stale entries when a key is
+        // picked — but this list is what actually drives mkfs, so it gets the
+        // same guard. Formatting the key carrier would leave a key-only install
+        // permanently unopenable.
+        if !c.usb_key_device.is_empty()
+            && (d.disk == c.usb_key_device || d.disk.starts_with(&c.usb_key_device))
+        {
+            continue;
+        }
         // The LUKS / mkfs target: a whole disk gets a fresh GPT + one partition;
         // an existing partition being reformatted is mkfs'd IN PLACE (no wipefs,
         // no repartition — the partition table is left intact, only this

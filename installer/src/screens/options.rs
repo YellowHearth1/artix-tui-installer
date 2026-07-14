@@ -3,7 +3,7 @@
 //! EFI bootloader entry name. Up/Down moves between rows; Left/Right (or Space)
 //! toggles a choice row; text rows accept typing.
 
-use crate::app::{App, Screen};
+use crate::app::{App, Bootloader, Screen};
 use crate::i18n::t;
 use crate::screens::widgets;
 use crate::theme;
@@ -50,7 +50,7 @@ fn rows_for(app: &App) -> Vec<Row> {
     // come after the encryption block.
     let mut v = vec![Row::Bootloader, Row::Encrypt];
     if app.config.encrypt_disk {
-        if app.config.bootloader == "grub" {
+        if app.config.bootloader == Bootloader::Grub {
             v.push(Row::EncScope);
         }
         // A USB key auto-unlocks ROOT from the initramfs. Full-disk encryption
@@ -73,7 +73,7 @@ fn rows_for(app: &App) -> Vec<Row> {
             v.push(Row::EncPass);
         }
     }
-    if app.config.bootloader == "grub" {
+    if app.config.bootloader == Bootloader::Grub {
         v.push(Row::OsProber);
     }
     v.push(Row::BootId);
@@ -81,7 +81,7 @@ fn rows_for(app: &App) -> Vec<Row> {
     // where signing is clean (just the kernel via sbctl, no rebuilds, no shim,
     // no systemd). GRUB/rEFInd/Limine Secure Boot is far more fragile on Artix
     // and deliberately not offered here.
-    if app.config.bootloader == "efistub" {
+    if app.config.bootloader == Bootloader::Efistub {
         v.push(Row::SecureBoot);
     }
     v
@@ -433,21 +433,16 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
             Row::Bootloader => {
-                let val = match app.config.bootloader.as_str() {
-                    "refind" => "rEFInd",
-                    "limine" => "Limine",
-                    "efistub" => "EFISTUB",
-                    _ => "GRUB",
-                };
+                let val = app.config.bootloader.display_name();
                 // Warn only about the one incompatibility the bootloader choice
                 // can hit: an encrypted /boot needs GRUB. EFISTUB is fine with
                 // snapshot rollback, so no extra warning there.
                 let hint_key = if app.config.encrypt_disk
                     && app.config.encrypt_scope == "full"
-                    && app.config.bootloader != "grub"
+                    && app.config.bootloader != Bootloader::Grub
                 {
                     "opt.bootloader_warn"
-                } else if app.config.bootloader == "efistub" {
+                } else if app.config.bootloader == Bootloader::Efistub {
                     "opt.bootloader_efistub_hint"
                 } else {
                     "opt.bootloader_hint"
@@ -507,7 +502,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         || (app.config.usb_key_only && !app.config.usb_key_device.is_empty());
     let boot_ok = !(app.config.encrypt_disk
         && app.config.encrypt_scope == "full"
-        && app.config.bootloader != "grub");
+        && app.config.bootloader != Bootloader::Grub);
     app.can_advance = enc_ok && boot_ok;
     let actions_area = rows[rows.len() - 1];
     widgets::action_row(
@@ -636,7 +631,7 @@ fn advance(app: &mut App) {
     // Block the incompatible combo: encrypted /boot needs GRUB.
     if app.config.encrypt_disk
         && app.config.encrypt_scope == "full"
-        && app.config.bootloader != "grub"
+        && app.config.bootloader != Bootloader::Grub
     {
         return;
     }
@@ -673,6 +668,19 @@ fn toggle(app: &mut App, row: Row, forward: bool) {
                 (i + cycle.len() - 1) % cycle.len()
             };
             app.config.usb_key_device = cycle[n].clone();
+            // Picking a stick as the key retracts any plan to use it as an
+            // ordinary extra disk. The Additional-disks screen hides the key
+            // stick, but a mountpoint chosen BEFORE the key was picked would
+            // still be sitting in extra_disks — and build_plan reads that list
+            // directly, so it would format the stick out from under the key.
+            // Drop the entry (and anything on its partitions) here, where the
+            // decision is actually made.
+            if !app.config.usb_key_device.is_empty() {
+                let key = app.config.usb_key_device.clone();
+                app.config
+                    .extra_disks
+                    .retain(|d| d.disk != key && !d.disk.starts_with(&key));
+            }
             // The USB key unlocks ROOT in the initramfs; GRUB's own prompt
             // for an encrypted /boot would defeat it, so force root-only.
             if !app.config.usb_key_device.is_empty() {
@@ -692,7 +700,7 @@ fn toggle(app: &mut App, row: Row, forward: bool) {
         Row::EncScope => {
             // "full" (encrypted /boot) only works with GRUB. With another
             // bootloader, lock the scope to root-only.
-            if app.config.bootloader == "grub" {
+            if app.config.bootloader == Bootloader::Grub {
                 app.config.encrypt_scope = if app.config.encrypt_scope == "full" {
                     "root".into()
                 } else {
@@ -721,7 +729,15 @@ fn toggle(app: &mut App, row: Row, forward: bool) {
             // initramfs and cmdline stay separate files, so we register extra
             // UEFI entries for the rescue pair (rollback + rescue), mirroring
             // the GRUB/rEFInd/Limine flow.
-            const ORDER: [&str; 4] = ["grub", "refind", "limine", "efistub"];
+            // The cycle order shown on this screen. Typed, so adding a variant
+            // to Bootloader without adding it here is a compile error rather
+            // than a bootloader silently missing from the picker.
+            const ORDER: [Bootloader; 4] = [
+                Bootloader::Grub,
+                Bootloader::Refind,
+                Bootloader::Limine,
+                Bootloader::Efistub,
+            ];
             let i = ORDER
                 .iter()
                 .position(|b| *b == app.config.bootloader)
@@ -731,15 +747,15 @@ fn toggle(app: &mut App, row: Row, forward: bool) {
             } else {
                 (i + ORDER.len() - 1) % ORDER.len()
             };
-            app.config.bootloader = ORDER[n].into();
+            app.config.bootloader = ORDER[n];
             // If we moved away from GRUB, an encrypted /boot is no longer
             // possible, so force the scope back to root-only.
-            if app.config.bootloader != "grub" && app.config.encrypt_scope == "full" {
+            if app.config.bootloader != Bootloader::Grub && app.config.encrypt_scope == "full" {
                 app.config.encrypt_scope = "root".into();
             }
             // Secure Boot prep is EFISTUB-only; if we moved off EFISTUB, drop it
             // so a hidden flag can't linger from a previous choice.
-            if app.config.bootloader != "efistub" {
+            if app.config.bootloader != Bootloader::Efistub {
                 app.config.prepare_secureboot = false;
             }
         }
