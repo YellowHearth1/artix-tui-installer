@@ -205,17 +205,8 @@ pub fn build_plan(app: &App) -> Vec<Action> {
 
     // 1) Disk: partition, format, mount.
     plan.extend(disk::build_plan(
-        &c.disk,
-        uefi,
-        c.swap_gib,
-        &c.root_fs,
-        c.encrypt_disk,
+        c,
         luks_pass,
-        &c.encrypt_scope,
-        c.btrfs_subvolumes,
-        c.btrfs_compress,
-        c.btrfs_discard,
-        c.mount_noatime,
         c.extra_disks.iter().any(|d| d.mountpoint == "/home"),
     ));
     // Additional whole disks the user chose to format (e.g. a separate /home or
@@ -2673,7 +2664,7 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::BootMode;
+    use crate::app::{BootMode, ExtraDisk};
 
     fn plan_text(plan: &[Action]) -> String {
         plan.iter()
@@ -2684,8 +2675,10 @@ mod tests {
 
     #[test]
     fn resolve_mp_expands_tilde_home() {
-        let mut c = InstallConfig::default();
-        c.username = "alice".into();
+        let c = InstallConfig {
+            username: "alice".into(),
+            ..Default::default()
+        };
         assert_eq!(resolve_mp(&c, "~/games"), "/home/alice/games");
         assert_eq!(resolve_mp(&c, "/mnt/data"), "/mnt/data");
         assert_eq!(resolve_mp(&c, "/home/x"), "/home/x");
@@ -2835,23 +2828,59 @@ mod tests {
     }
 
     /// The seat backend and its per-user launcher must match: userspawn belongs
-    /// to elogind, turnstiled to seatd. Mixing them breaks graphical logins.
+    /// to elogind, turnstiled to seatd. Enabling both gives two rival session
+    /// managers, /run/user/<uid> never appears, and the user gets a black screen.
+    ///
+    /// NOTE ON HOW THIS IS CHECKED. The first version of this test asserted that
+    /// the word "turnstiled" was absent from an elogind plan — and failed,
+    /// because the plan mentions it in the SKIP list precisely to make sure it
+    /// is NOT auto-enabled. The word being present was the code doing the right
+    /// thing. So the assertion is about the enable command specifically, not
+    /// about whether a string appears anywhere in a 600-line shell script.
     #[test]
     fn seat_backend_and_launcher_agree() {
+        // The services actually switched on are the ones listed in the
+        // symlink-into-boot.d loop.
+        fn enabled_services(plan: &[Action]) -> String {
+            plan_text(plan)
+                .lines()
+                .find(|l| l.contains("for s in") && l.contains("boot.d"))
+                .unwrap_or_default()
+                .to_string()
+        }
+
         let mut a = install_app();
 
         a.config.seat_provider = SeatProvider::Elogind;
-        let e = plan_text(&build_plan(&a));
-        assert!(e.contains("userspawn"), "elogind pairs with userspawn");
+        let e = enabled_services(&build_plan(&a));
         assert!(
-            !e.contains("turnstiled"),
-            "elogind must not enable turnstiled"
+            e.contains("elogind"),
+            "elogind must be enabled when it's the chosen backend"
+        );
+        assert!(
+            !e.contains("seatd"),
+            "seatd must not be enabled alongside elogind — rival session managers"
         );
 
         a.config.seat_provider = SeatProvider::Seatd;
-        let s = plan_text(&build_plan(&a));
-        assert!(s.contains("turnstiled"), "seatd pairs with turnstiled");
-        assert!(!s.contains("userspawn"), "seatd must not enable userspawn");
+        let s = enabled_services(&build_plan(&a));
+        assert!(s.contains("seatd"), "seatd must be enabled when chosen");
+        assert!(
+            !s.contains("elogind"),
+            "elogind must not be enabled alongside seatd"
+        );
+
+        // And the losing backend's user launcher is explicitly skipped by the
+        // service autoscan, so a package pulling it in can't quietly enable it.
+        let elo = plan_text(&build_plan(&{
+            let mut b = install_app();
+            b.config.seat_provider = SeatProvider::Elogind;
+            b
+        }));
+        assert!(
+            elo.contains("SKIP=\" seatd turnstiled turnstile \""),
+            "an elogind install must skip seatd's services in the autoscan"
+        );
     }
 
     /// Failed AUR builds must be REPORTED. They're non-fatal by design (one bad
@@ -2983,9 +3012,12 @@ mod tests {
 
     #[test]
     fn rootflags_part_pins_subvol_at_for_btrfs_subvolumes() {
-        let mut c = InstallConfig::default();
-        c.root_fs = "btrfs".into();
-        c.btrfs_subvolumes = true;
+        // `mut` because btrfs_snapshots is flipped below to test both paths.
+        let mut c = InstallConfig {
+            root_fs: "btrfs".into(),
+            btrfs_subvolumes: true,
+            ..Default::default()
+        };
 
         // Pin @ by name in both cases — boot follows the @ subvolume, which the
         // rollback swaps, so a rollback reliably changes what boots.

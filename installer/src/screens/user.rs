@@ -103,9 +103,9 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         rows[0],
     );
 
-    // Subsequent rows: render each field in order.
-    let mut ri = 1usize;
-    for fld in flds.iter().skip(1) {
+    // Subsequent rows: render each field in order. enumerate() gives the row
+    // index; offset by 1 because row 0 is the account-mode picker above.
+    for (ri, fld) in flds.iter().enumerate().skip(1) {
         let focused = *fld == cur;
         match fld {
             Field::Hostname => widgets::input(
@@ -158,7 +158,6 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Field::Mode => {}
         }
-        ri += 1;
     }
 
     // Status line.
@@ -294,10 +293,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 // Hostnames are limited to letters, digits and hyphens (RFC
                 // 1123). For other fields accept any character.
                 if cur == Field::Hostname {
-                    if c.is_ascii_alphanumeric() || c == '-' {
-                        if s.chars().count() < 63 {
-                            s.push(c.to_ascii_lowercase());
-                        }
+                    if (c.is_ascii_alphanumeric() || c == '-') && s.chars().count() < 63 {
+                        s.push(c.to_ascii_lowercase());
                     }
                 } else {
                     s.push(c);

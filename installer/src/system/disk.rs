@@ -7,6 +7,7 @@
 //! through `runner::spawn` so every step streams into the log and a failure
 //! halts the sequence and lets the user go back and fix things.
 
+use crate::app::InstallConfig;
 use serde::Deserialize;
 use std::sync::OnceLock;
 
@@ -180,7 +181,7 @@ pub fn list_partitions() -> Result<Vec<Partition>, String> {
                 continue;
             }
             let fstype = ch.fstype.clone().unwrap_or_default();
-            if fstype.is_empty() || skip.contains(&fstype.as_str()) {
+            if fstype.is_empty() || skip.iter().any(|s| *s == fstype) {
                 continue;
             }
             out.push(Partition {
@@ -250,20 +251,31 @@ fn act(program: &str, args: &[&str]) -> Action {
 /// /boot uses LUKS1 because GRUB's LUKS2 support is limited/fragile.
 ///
 /// `swap_gib == 0` means no swap partition.
-pub fn build_plan(
-    disk: &str,
-    uefi: bool,
-    swap_gib: u32,
-    root_fs: &str,
-    encrypt: bool,
-    passphrase: &str,
-    scope: &str,
-    btrfs_subvolumes: bool,
-    btrfs_compress: bool,
-    btrfs_discard: bool,
-    mount_noatime: bool,
-    home_external: bool,
-) -> Vec<Action> {
+/// Takes the config rather than a dozen loose arguments.
+///
+/// It used to take twelve — SIX OF THEM CONSECUTIVE BOOLS:
+///
+///     encrypt, btrfs_subvolumes, btrfs_compress, btrfs_discard,
+///     mount_noatime, home_external
+///
+/// Swap any two of those at a call site and the compiler says nothing. In a
+/// function that PARTITIONS A DISK, that mistake encrypts the wrong volume or
+/// wipes the wrong partition — and it would type-check perfectly. The config is
+/// already at hand at the only call site; passing it means the field names do
+/// the disambiguating, and the compiler checks them.
+pub fn build_plan(c: &InstallConfig, luks_pass: &str, home_external: bool) -> Vec<Action> {
+    let disk = c.disk.as_str();
+    let uefi = c.boot_mode.is_uefi();
+    let swap_gib = c.swap_gib;
+    let root_fs = c.root_fs.as_str();
+    let encrypt = c.encrypt_disk;
+    let passphrase = luks_pass;
+    let scope = c.encrypt_scope.as_str();
+    let btrfs_subvolumes = c.btrfs_subvolumes;
+    let btrfs_compress = c.btrfs_compress;
+    let btrfs_discard = c.btrfs_discard;
+    let mount_noatime = c.mount_noatime;
+
     let mut plan = Vec::new();
     let swap = swap_gib > 0;
     // A real separate encrypted /boot only applies to UEFI full-disk encryption.

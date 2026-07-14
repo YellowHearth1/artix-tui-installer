@@ -2,6 +2,7 @@
 //!   1) boot mode segmented toggle: BIOS (VM testing) | UEFI (recommended),
 //!   2) disk selection list (lsblk),
 //!   3) swap: enabled toggle + GiB amount (default 4).
+//!
 //! The actual partition plan is built later by system::disk::build_plan.
 
 use crate::app::{App, BootMode};
@@ -110,8 +111,9 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect();
         widgets::select_list(f, inner, &items, app.disk_cursor);
-        app.config.disk = d[app.disk_cursor.min(d.len() - 1)].path.clone();
         app.can_advance = true;
+        // NOT `app.config.disk = d[cursor]` — see commit_disk(). Painting must
+        // not decide which disk gets wiped.
     }
 
     // 3) Swap — bordered, titled box with the ON/OFF pill + size stepper.
@@ -311,12 +313,11 @@ fn is_too_small(d: &Disk) -> bool {
 /// Excludes the stick chosen as the LUKS USB key. Two reasons, and the second
 /// is the dangerous one:
 ///
-///   * it's contradictory — you can't hold the unlock key on the very disk the
-///     key is supposed to unlock;
-///   * `app.config.disk` is assigned from the cursor position on EVERY draw
-///     pass, so merely scrolling PAST the stick would silently make it the
-///     install target. The install would then wipe the key stick — and with a
-///     key-only setup, that's an unbootable system.
+/// * it's contradictory — you can't hold the unlock key on the very disk the
+///   key is supposed to unlock;
+/// * the install target follows the cursor, so merely scrolling PAST the stick
+///   would make it the disk to be wiped. With a key-only setup, wiping the key
+///   stick leaves an unbootable system and nothing left to unlock it with.
 ///
 /// The options screen already refuses to offer the install disk as a key
 /// (`d.removable && d.path != app.config.disk`); this is the same guard from
@@ -734,6 +735,21 @@ pub fn footer_hint(app: &App) -> String {
     t(app.lang, key)
 }
 
+/// Record the highlighted disk as the install target.
+///
+/// Lives in the key handler, not in draw(). It used to be inside draw(), which
+/// meant the install target was re-derived from the cursor on EVERY FRAME — so
+/// a repaint could silently retarget the install. That is not a cosmetic bug on
+/// this screen: the chosen disk is the one that gets wiped.
+///
+/// Rendering shows state. It must never decide it.
+fn commit_disk(app: &mut App) {
+    let d = disks();
+    if let Some(sel) = d.get(app.disk_cursor) {
+        app.config.disk = sel.path.clone();
+    }
+}
+
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // The pre-flight warnings modal captures all keys while it's open. It's
     // advisory: w/s scroll, Enter/Esc close. Closing never changes any choice.
@@ -777,10 +793,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 app.fs_opt_desc_scroll = app.fs_opt_desc_scroll.saturating_add(1)
             }
-            KeyCode::Char(' ') => {
-                if let Some((id, _)) = opts.get(app.fs_opt_cursor) {
-                    toggle_feature(app, &fs, id);
-                }
+            // The option under the cursor, if the list isn't empty. Pulled out
+            // of the match arm so the arm is a single expression — clippy reads
+            // a lone `if let` inside a match arm as a match that should have
+            // been folded into the outer one.
+            KeyCode::Char(' ') if opts.get(app.fs_opt_cursor).is_some() => {
+                let (id, _) = &opts[app.fs_opt_cursor];
+                toggle_feature(app, &fs, id);
             }
             KeyCode::Enter | KeyCode::Esc => app.fs_opts_modal_open = false,
             _ => {}
@@ -828,11 +847,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Enter => app.disk_focus = 2,
             // 'w' opens the pre-flight warnings modal for the selected disk,
             // but only when there's actually something to warn about.
-            KeyCode::Char('w') | KeyCode::Char('W') => {
-                if !preflight_warnings(app).is_empty() {
-                    app.disk_warn_scroll = 0;
-                    app.disk_warn_modal_open = true;
-                }
+            KeyCode::Char('w') | KeyCode::Char('W') if !preflight_warnings(app).is_empty() => {
+                app.disk_warn_scroll = 0;
+                app.disk_warn_modal_open = true;
             }
             _ => {}
         },
@@ -886,9 +903,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.fs_opts_modal_open = true;
                 }
             }
-            KeyCode::Enter if app.can_advance => app.goto_next(),
+            KeyCode::Enter if app.can_advance => {
+                // Commit BEFORE leaving — this is the last frame on which the
+                // cursor still means anything.
+                commit_disk(app);
+                app.goto_next();
+                return;
+            }
             _ => {}
         },
         _ => {}
     }
+    // Any key may have moved the cursor; keep the config in step with what's
+    // highlighted. One call, at the one exit — no path can forget it.
+    commit_disk(app);
 }

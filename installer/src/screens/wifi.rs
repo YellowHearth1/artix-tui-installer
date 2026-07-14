@@ -304,21 +304,22 @@ pub fn tick(app: &mut App) {
             }
         }
         // Worker is still running — keep waiting, but not forever.
-        Some(Err(crossbeam_channel::TryRecvError::Empty)) => {
-            if let Some(started) = app.wifi_connect_started {
-                // nmcli has no reliable timeout of its own here: a hung
-                // supplicant, or a DHCP server that never answers, would
-                // otherwise leave the user staring at "connecting…" for a
-                // minute with no way to retry. 25s is well past a normal
-                // association (a second or two) but short of NetworkManager's
-                // own DHCP give-up.
-                if started.elapsed() > std::time::Duration::from_secs(25) {
-                    app.wifi_connect_rx = None;
-                    app.wifi_connect_started = None;
-                    set_status(app, "wifi.err_timeout", true);
-                }
-            }
+        // nmcli has no reliable timeout of its own here: a hung supplicant, or a
+        // DHCP server that never answers, would otherwise leave the user staring
+        // at "connecting…" for a minute with no way to retry. 25s is well past a
+        // normal association (a second or two) but short of NetworkManager's own
+        // DHCP give-up.
+        Some(Err(crossbeam_channel::TryRecvError::Empty))
+            if app
+                .wifi_connect_started
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(25)) =>
+        {
+            app.wifi_connect_rx = None;
+            app.wifi_connect_started = None;
+            set_status(app, "wifi.err_timeout", true);
         }
+        // Worker still running, still within the timeout — keep waiting.
+        Some(Err(crossbeam_channel::TryRecvError::Empty)) => {}
         // The worker thread died without sending anything (panicked, or was
         // killed). Never leave the user in silence — say so and let them retry.
         Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {

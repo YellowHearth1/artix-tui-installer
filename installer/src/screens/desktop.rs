@@ -54,7 +54,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             let selected = if *d == Desktop::None {
                 app.config.desktops.is_empty()
             } else {
-                app.config.desktops.iter().any(|x| *x == dname)
+                app.config.desktops.contains(&dname)
             };
             let (mark, mark_style) = if selected {
                 ("[✓] ", theme::ok())

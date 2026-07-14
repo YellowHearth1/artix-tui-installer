@@ -101,8 +101,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let qr = donate_qr(app.lang);
     let show_qr = (v[0].height as usize) >= qr.len() + 10;
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![Line::from("")];
     lines.push(Line::from(Span::styled("[ OK ]", theme::ok())));
     lines.push(Line::from(Span::styled(
         t(app.lang, "fin.title"),
@@ -166,11 +165,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         t(app.lang, "fin.poweroff"),
         format!("{}  [{}]", t(app.lang, "fin.enter_user"), user),
     ];
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         t(app.lang, "fin.choose"),
         theme::heading(),
-    )));
+    ))];
     for (i, o) in opts.iter().enumerate() {
         let sel = i == app.finish_cursor;
         let prefix = if sel { "▸ " } else { "  " };

@@ -22,5 +22,25 @@ bin18*
 artix-installer-bin
 /versions
 
-# Note: Cargo.lock IS committed — this is a binary application, so a pinned
-# lockfile gives reproducible builds.
+# Cargo.lock is NOT committed.
+#
+# It was, once. But the Pinnacle config we ship is itself a cargo project that
+# gets built ON THE USER'S MACHINE, at first login — and a lockfile frozen at
+# packaging time pinned dependency versions that no longer resolved, so
+# `cargo build --locked` failed and the session never started. The installer
+# now ships no lockfile and passes no --locked; cargo resolves fresh.
+Cargo.lock
+installer/Cargo.lock
+
+# Container / toolchain cruft that lives beside the source tree in the dev
+# environment. None of it belongs in the repository.
+.cache/
+.config/
+.local/
+.npm/
+.npm-global/
+.npmrc
+.wget-hsts
+uploaded/
+prev_backup/
+mockbin/

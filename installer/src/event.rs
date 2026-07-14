@@ -236,13 +236,6 @@ mod tests {
         a.gpu_cursor = 2;
         assert!(!at_top(&a));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::App;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn plain(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)

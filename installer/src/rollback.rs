@@ -156,7 +156,7 @@ fn read_snapshots(dir: &str) -> Vec<Snapshot> {
             });
         }
     }
-    out.sort_by(|a, b| b.num.cmp(&a.num)); // newest at the top
+    out.sort_by_key(|s| std::cmp::Reverse(s.num)); // newest at the top
     out
 }
 
@@ -532,11 +532,7 @@ fn ui_loop(
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => move_sel(&mut state, snaps, -1),
                 KeyCode::Down | KeyCode::Char('j') => move_sel(&mut state, snaps, 1),
-                KeyCode::Enter => {
-                    if !snaps.is_empty() {
-                        mode = Mode::Confirm;
-                    }
-                }
+                KeyCode::Enter if !snaps.is_empty() => mode = Mode::Confirm,
                 _ => {}
             },
             Mode::Confirm => match key {
@@ -921,8 +917,7 @@ fn draw_confirm(f: &mut Frame, uk: bool, snaps: &[Snapshot], state: &mut ListSta
         None => return,
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
+    let mut lines: Vec<Line> = vec![Line::from(vec![
         Span::styled(
             if uk {
                 "Відкотитися до знімка "
@@ -933,7 +928,7 @@ fn draw_confirm(f: &mut Frame, uk: bool, snaps: &[Snapshot], state: &mut ListSta
         ),
         Span::styled(format!("#{}", s.num), theme::accent()),
         Span::styled(" ?", theme::normal()),
-    ]));
+    ])];
     if !s.desc.is_empty() {
         // Truncate the (sometimes very long) package-list description to one line
         // so it can't wrap and push the [y]/[n] prompt out of the modal.
