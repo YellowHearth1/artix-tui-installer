@@ -27,6 +27,27 @@ pub enum Phase {
     Succeeded,
 }
 
+/// One-line rendering of the GPU selection for the summary table. The selection
+/// is a SET (hybrid graphics needs two stacks), so join the labels rather than
+/// showing a single value.
+fn gpu_summary(gpus: &[crate::app::GpuDriver]) -> String {
+    use crate::app::GpuDriver;
+    if gpus.is_empty() || gpus == [GpuDriver::None] {
+        return "None".into();
+    }
+    gpus.iter()
+        .map(|g| match g {
+            GpuDriver::None => "None",
+            GpuDriver::Nvidia => "NVIDIA",
+            GpuDriver::Nvidia580xx => "NVIDIA 580xx",
+            GpuDriver::Nouveau => "nouveau",
+            GpuDriver::Amd => "AMD",
+            GpuDriver::Intel => "Intel",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     match app.install_phase {
         // Before install: full-width review of every choice + confirm prompt.
@@ -248,7 +269,7 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
         kv("Timezone", &c.timezone),
         kv("Keymap", &c.keymap),
         kv("Layouts", &c.xkb_layouts.join(", ")),
-        kv("Kernel", &c.kernel),
+        kv("Kernel", c.kernel.label()),
         kv("Desktop", &de_disp),
         kv("Session", &session_disp),
         kv(
@@ -256,7 +277,7 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
             // configuration (X11, Wayland, even no DE), so always show what the
             // user picked in the modal — never "—".
             "Seat",
-            c.seat_provider.as_str(),
+            c.seat_provider.label(),
         ),
         kv(
             "Login",
@@ -272,9 +293,9 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
                 "key + passphrase"
             },
         ),
-        kv("GPU", &c.gpu),
+        kv("GPU", &gpu_summary(&c.gpu)),
         kv("Disk", &c.disk),
-        kv("Boot", &c.boot_mode.to_uppercase()),
+        kv("Boot", c.boot_mode.label()),
         kv("Swap", &swap),
         kv("Filesystem", &c.root_fs),
         kv(
@@ -303,13 +324,8 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
             "Bootloader",
             &format!(
                 "{}{}",
-                match c.bootloader.as_str() {
-                    "refind" => "rEFInd",
-                    "limine" => "Limine",
-                    "efistub" => "EFISTUB",
-                    _ => "GRUB",
-                },
-                if c.boot_mode == "uefi" {
+                c.bootloader.display_name(),
+                if c.boot_mode.is_uefi() {
                     format!(" ({})", c.bootloader_id)
                 } else {
                     String::new()
@@ -326,12 +342,7 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
 /// Human description of the chosen account mode for the review screen.
 fn account_summary(app: &App) -> String {
     use crate::app::AccountMode;
-    let m = match app.config.account_mode.as_str() {
-        "UserSameRoot" => AccountMode::UserSameRoot,
-        "UserSudoOnly" => AccountMode::UserSudoOnly,
-        "RootOnly" => AccountMode::RootOnly,
-        _ => AccountMode::UserSeparateRoot,
-    };
+    let m = app.config.account_mode;
     match m {
         AccountMode::UserSeparateRoot => format!("{} + root", app.config.username),
         AccountMode::UserSameRoot => format!("{} (+root same pw)", app.config.username),

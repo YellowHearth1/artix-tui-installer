@@ -30,7 +30,13 @@ pub fn handle(app: &mut App) -> Result<()> {
 }
 
 /// Returns true if the key was consumed globally.
-fn handle_global(app: &mut App, key: KeyEvent) -> bool {
+/// The global key layer, applied before the active screen sees a key.
+///
+/// `pub(crate)` rather than private so it can be tested directly: `handle()`
+/// above reads from the terminal, which a unit test has no way to feed. Keeping
+/// the DECISION separate from the READING is what makes the 'q' rule testable
+/// at all.
+pub(crate) fn handle_global(app: &mut App, key: KeyEvent) -> bool {
     match (key.code, key.modifiers) {
         // q quits — but NEVER while a screen is capturing text (package/AUR
         // search, user fields, timezone/keyboard filters, the Wi-Fi password,
@@ -229,5 +235,91 @@ mod tests {
         assert!(at_top(&a));
         a.gpu_cursor = 2;
         assert!(!at_top(&a));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn plain(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// Regression: 'q' used to quit from ANY screen, including text fields.
+    /// Typing a LUKS passphrase with a "q" in it — or a username like
+    /// "quentin" — destroyed every choice made so far, with no confirmation.
+    /// Screens that take text input must treat 'q' as input.
+    #[test]
+    fn q_does_not_quit_from_a_screen_with_a_text_field() {
+        for screen in [
+            Screen::Summary,
+            Screen::Packages,
+            Screen::Aur,
+            Screen::User,
+            Screen::Timezone,
+            Screen::Keyboard,
+            Screen::Wifi,
+            Screen::Options,
+        ] {
+            let mut app = App::new();
+            app.screen = screen;
+            handle_global(&mut app, plain('q'));
+            assert!(
+                !app.should_quit,
+                "{screen:?} has a text field — 'q' there is a letter, not a command"
+            );
+        }
+    }
+
+    /// On screens with no text input, 'q' is still the quick way out.
+    #[test]
+    fn q_still_quits_from_a_screen_without_text_input() {
+        let mut app = App::new();
+        app.screen = Screen::Language;
+        handle_global(&mut app, plain('q'));
+        assert!(
+            app.should_quit,
+            "'q' must still work where nothing is typed"
+        );
+    }
+
+    /// Ctrl+C is the universal escape hatch and works everywhere — including
+    /// the screens that swallow 'q'. Without it, a text screen would have no
+    /// way out at all.
+    #[test]
+    fn ctrl_c_quits_from_everywhere() {
+        for screen in Screen::ALL {
+            let mut app = App::new();
+            app.screen = screen;
+            handle_global(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            );
+            assert!(
+                app.should_quit,
+                "{screen:?}: Ctrl+C must always quit — it's the last resort"
+            );
+        }
+    }
+
+    /// Esc closes an open modal instead of leaving the screen. Otherwise a
+    /// modal becomes a trap: the only way to dismiss it also throws away the
+    /// screen behind it.
+    #[test]
+    fn esc_closes_a_modal_rather_than_leaving_the_screen() {
+        let mut app = App::new();
+        app.screen = Screen::Desktop;
+        app.seat_modal_open = true;
+
+        handle_global(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.screen,
+            Screen::Desktop,
+            "Esc with a modal open must not walk back a screen"
+        );
     }
 }

@@ -55,11 +55,19 @@ struct Cand {
     fs_fixed: String, // detected fs for existing partitions
 }
 
-/// Build the candidate rows, excluding the system disk, the live ISO medium and
-/// pseudo devices. Empty disks become format rows; disks that already carry
-/// filesystems contribute their (non-ISO) partitions as mount rows.
+/// Build the candidate rows, excluding the system disk, the USB key stick, the
+/// live ISO medium and pseudo devices. Empty disks become format rows; disks
+/// that already carry filesystems contribute their (non-ISO) partitions as
+/// mount rows.
 fn candidates(app: &App) -> Vec<Cand> {
     let sys = app.config.disk.clone();
+    // The stick chosen as the LUKS key must never show up here either. It gets
+    // wiped and rewritten by the install (FAT32, label ARTIXKEY) as the key
+    // carrier — offering it as an extra disk to format and mount would let the
+    // user schedule a SECOND, conflicting format of the very device that holds
+    // the only thing able to unlock the system. The disk screen hides it for
+    // the same reason; this is the other place a device list is drawn.
+    let key = app.config.usb_key_device.clone();
     let parts = parts_cached();
     // Disks that hold the live ISO (iso9660) are the boot medium — never offer.
     let live: Vec<String> = parts
@@ -70,7 +78,11 @@ fn candidates(app: &App) -> Vec<Cand> {
     let mut out = Vec::new();
     for d in disk::disks_list() {
         let name = d.path.trim_start_matches("/dev/");
-        if d.path == sys || is_pseudo(name) || live.contains(&d.path) {
+        if d.path == sys
+            || (!key.is_empty() && d.path == key)
+            || is_pseudo(name)
+            || live.contains(&d.path)
+        {
             continue;
         }
         let pof: Vec<&Partition> = parts
@@ -86,7 +98,11 @@ fn candidates(app: &App) -> Vec<Cand> {
                 } else {
                     d.model.clone()
                 },
-                format: true,
+                // Default to NOT formatting. The old default (format: true) was
+                // harmless in effect — nothing happens without a mountpoint —
+                // but it SHOWED "Format: ext4" next to the user's data disk, and
+                // a cautious person reads that as a countdown, not a suggestion.
+                format: false,
                 whole_disk: true,
                 fs_fixed: String::new(),
             });
@@ -162,9 +178,24 @@ fn rows_list(app: &App, cands: &[Cand]) -> Vec<(usize, Row)> {
 /// "keep data" slot (mount as-is) before the reformat choices.
 fn fs_pills(app: &App, c: &Cand) -> (Vec<String>, usize) {
     if c.whole_disk {
-        let opts: Vec<String> = FS_OPTS.iter().map(|s| s.to_string()).collect();
-        let cur = cur_fs(app, c);
-        let sel = FS_OPTS.iter().position(|f| *f == cur).unwrap_or(0);
+        // Slot 0 is "leave it alone", exactly as for existing partitions. An
+        // empty disk showing only "Format: ‹ ext4 ›" reads as a THREAT to a
+        // cautious user — nothing on screen says the disk can be left untouched,
+        // so people quit the installer rather than risk their data. The option
+        // was always there implicitly (no mountpoint ⇒ no action), but implicit
+        // safety is worthless if it isn't visible. Now it's the DEFAULT.
+        let mut opts = vec![t(app.lang, "storage.no_format")];
+        opts.extend(FS_OPTS.iter().map(|s| s.to_string()));
+        let sel = if !will_format(app, c) {
+            0
+        } else {
+            let cur = cur_fs(app, c);
+            FS_OPTS
+                .iter()
+                .position(|f| *f == cur)
+                .map(|p| p + 1)
+                .unwrap_or(1)
+        };
         (opts, sel)
     } else {
         let mut opts = vec![t(app.lang, "storage.keep")];
@@ -257,7 +288,10 @@ fn sync_mountpoint(e: &mut ExtraDisk) {
 /// before a mountpoint is chosen.
 fn entry_mut<'a>(app: &'a mut App, c: &Cand) -> &'a mut ExtraDisk {
     if !app.config.extra_disks.iter().any(|e| e.disk == c.dev) {
-        let fs = if c.format {
+        // A whole (empty) disk starts on "don't format", but still needs a
+        // filesystem parked in `fs` — that's what the pills cycle back to when
+        // the user moves off slot 0. An existing partition keeps its detected fs.
+        let fs = if c.whole_disk {
             "ext4".to_string()
         } else {
             c.fs_fixed.clone()
@@ -284,14 +318,49 @@ fn entry_mut<'a>(app: &'a mut App, c: &Cand) -> &'a mut ExtraDisk {
 }
 
 fn cycle_base(app: &mut App, c: &Cand, dir: i32) {
-    let cur = cur_base(app, &c.dev);
-    let mut i = BASES.iter().position(|b| *b == cur).unwrap_or(0) as i32;
-    let n = BASES.len() as i32;
-    i = (i + dir + n) % n;
-    let base = BASES[i as usize].to_string();
     let e = entry_mut(app, c);
-    e.mount_base = base;
+    step_base(e, dir);
+}
+
+/// Advance the mountpoint picker by one slot. Pure: it touches only the entry,
+/// so it can be tested without an App or a disk probe.
+///
+/// `format` is deliberately NOT derived from the mountpoint here.
+///
+/// It used to be: `e.format = !e.mountpoint.is_empty()`. That reads as
+/// reasonable — an empty disk with nowhere to mount has no reason to be
+/// formatted — but it silently destroyed choices the user had already made,
+/// because the mountpoint is EMPTY on intermediate steps of this very cycle:
+///
+///   "" → "home" → "homedisk"
+///          ↑
+///          mount_name is still blank here (no folder name typed yet), so
+///          sync_mountpoint() yields "" — and `format` flipped to false ON THE
+///          WAY PAST, taking `compress` with it. By the time "homedisk" set the
+///          mountpoint back to /home, the flag was already gone.
+///
+/// Cycling forward through one control must not destroy state that belongs to a
+/// DIFFERENT control. The filesystem strip decides `format`, explicitly and in
+/// one place; nothing else recomputes it behind the user's back.
+pub(crate) fn step_base(e: &mut ExtraDisk, dir: i32) {
+    let i = BASES.iter().position(|b| *b == e.mount_base).unwrap_or(0) as i32;
+    let n = BASES.len() as i32;
+    e.mount_base = BASES[(((i + dir) % n + n) % n) as usize].to_string();
     sync_mountpoint(e);
+    sync_compress(e);
+}
+
+/// Keep `compress` consistent with what the disk is actually going to be.
+///
+/// zstd compression is a btrfs mount option: it means nothing on ext4, and it
+/// means nothing on a disk that isn't being formatted at all. But it must NOT
+/// be dropped for any other reason — in particular not because some transient
+/// step of a UI cycle happened to pass through "no mountpoint" or "no format".
+/// One rule, one place, applied after every edit.
+pub(crate) fn sync_compress(e: &mut ExtraDisk) {
+    if !e.format || e.fs != "btrfs" {
+        e.compress = false;
+    }
 }
 
 /// Inline editing of the folder name (or full path for "custom"). Allowed:
@@ -319,15 +388,37 @@ fn name_pop(app: &mut App, c: &Cand) {
 
 fn cycle_fs(app: &mut App, c: &Cand, dir: i32) {
     if c.whole_disk {
-        // Empty disk: always formatted; cycle through the filesystem choices.
-        let cur = cur_fs(app, c);
-        let mut i = FS_OPTS.iter().position(|f| *f == cur).unwrap_or(0) as i32;
-        let n = FS_OPTS.len() as i32;
-        i = (i + dir + n) % n;
-        let fs = FS_OPTS[i as usize].to_string();
+        // Empty disk: [no-format, ext4, btrfs, …]. Slot 0 leaves the disk alone
+        // entirely — no partitioning, no mkfs, no mount. Clearing `format` also
+        // clears the mountpoint and the format-only options (encrypt/compress),
+        // so a disk parked on "don't touch" carries no half-set state that could
+        // resurrect a format later.
+        let cur_idx: i32 = if !will_format(app, c) {
+            0
+        } else {
+            let cur = cur_fs(app, c);
+            FS_OPTS
+                .iter()
+                .position(|f| *f == cur)
+                .map(|p| p as i32 + 1)
+                .unwrap_or(1)
+        };
+        let n = FS_OPTS.len() as i32 + 1; // +1 for the no-format slot
+        let new_idx = (cur_idx + dir + n) % n;
         let e = entry_mut(app, c);
-        e.fs = fs;
-        e.format = true;
+        if new_idx == 0 {
+            e.format = false;
+            // Clear mount_base too, not just mountpoint: the UI renders from
+            // mount_base, so leaving it set would show a mountpoint next to a
+            // disk that isn't being touched.
+            e.mount_base.clear();
+            e.mountpoint.clear();
+            e.encrypt = false;
+        } else {
+            e.format = true;
+            e.fs = FS_OPTS[(new_idx - 1) as usize].to_string();
+        }
+        sync_compress(e);
         return;
     }
     // Existing partition: cycle [keep-data, ext4, btrfs, xfs, f2fs, jfs, ext3,
@@ -351,11 +442,11 @@ fn cycle_fs(app: &mut App, c: &Cand, dir: i32) {
         e.format = false;
         e.fs = fs_fixed;
         e.encrypt = false;
-        e.compress = false;
     } else {
         e.format = true;
         e.fs = FS_OPTS[(new_idx - 1) as usize].to_string();
     }
+    sync_compress(e);
 }
 
 pub fn footer_hint(app: &App) -> String {
@@ -643,6 +734,10 @@ fn toggle_opt(app: &mut App, c: &Cand, id: &str) {
         "encrypt" => e.encrypt = !e.encrypt,
         _ => {}
     }
+    // The modal only offers `compress` on btrfs, but go through the same rule
+    // anyway rather than trusting the caller: one place decides, everywhere
+    // else defers to it.
+    sync_compress(e);
 }
 
 /// Centered modal of per-disk format options for the selected format candidate,

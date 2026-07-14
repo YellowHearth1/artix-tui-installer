@@ -21,12 +21,7 @@ use ratatui::{
 };
 
 pub fn mode(app: &App) -> AccountMode {
-    match app.config.account_mode.as_str() {
-        "UserSameRoot" => AccountMode::UserSameRoot,
-        "UserSudoOnly" => AccountMode::UserSudoOnly,
-        "RootOnly" => AccountMode::RootOnly,
-        _ => AccountMode::UserSeparateRoot,
-    }
+    app.config.account_mode
 }
 
 fn mode_label(app: &App, m: AccountMode) -> String {
@@ -278,7 +273,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Right => AccountMode::ALL[(idx + 1) % n],
             _ => return,
         };
-        app.config.account_mode = format!("{:?}", new);
+        app.config.account_mode = new;
         app.user_focus = 0;
         return;
     }

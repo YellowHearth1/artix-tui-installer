@@ -138,7 +138,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     // impossible to miss that it isn't finished — enabling it needs manual BIOS
     // steps on the running system (brick risk). Full steps are in the
     // ~/SECURE-BOOT.txt file the installer wrote to their home.
-    if app.config.prepare_secureboot && app.config.bootloader == "efistub" {
+    if app.config.prepare_secureboot && app.config.bootloader.supports_secureboot_prep() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             t(app.lang, "fin.sb_title"),

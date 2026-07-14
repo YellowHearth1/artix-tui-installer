@@ -30,9 +30,8 @@ const GPUS: [GpuDriver; 6] = [
 ];
 
 /// Is driver `g` in the comma-separated selection string?
-fn gpu_selected(sel: &str, g: GpuDriver) -> bool {
-    let name = format!("{:?}", g);
-    sel.split(',').any(|s| s.trim() == name)
+fn gpu_selected(sel: &[GpuDriver], g: GpuDriver) -> bool {
+    sel.contains(&g)
 }
 
 /// Toggle driver `g` in the comma-separated selection. Sane exclusions:
@@ -42,36 +41,27 @@ fn gpu_selected(sel: &str, g: GpuDriver) -> bool {
 ///    removes the other two.
 ///  • Intel and AMD freely combine with each other and with one NVIDIA stack —
 ///    that's the hybrid-graphics case (NVIDIA dGPU + Intel/AMD iGPU).
-fn toggle_gpu(sel: &mut String, g: GpuDriver) {
-    let name = format!("{:?}", g);
-    let mut parts: Vec<String> = sel
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if let Some(pos) = parts.iter().position(|p| *p == name) {
+fn toggle_gpu(sel: &mut Vec<GpuDriver>, g: GpuDriver) {
+    if let Some(pos) = sel.iter().position(|x| *x == g) {
         // Already selected → unselect. An empty selection falls back to None.
-        parts.remove(pos);
-        if parts.is_empty() {
-            parts.push("None".into());
+        sel.remove(pos);
+        if sel.is_empty() {
+            sel.push(GpuDriver::None);
         }
-    } else {
-        if name == "None" {
-            // None is exclusive: clears all drivers.
-            parts.clear();
-            parts.push("None".into());
-        } else {
-            // A real driver replaces None and conflicts within its family.
-            parts.retain(|p| p != "None");
-            let nvidia_family = ["Nvidia", "Nvidia580xx", "Nouveau"];
-            if nvidia_family.contains(&name.as_str()) {
-                parts.retain(|p| !nvidia_family.contains(&p.as_str()));
-            }
-            parts.push(name);
-        }
+        return;
     }
-    *sel = parts.join(",");
+    if g == GpuDriver::None {
+        // None is exclusive: clears all drivers.
+        sel.clear();
+        sel.push(GpuDriver::None);
+        return;
+    }
+    // A real driver replaces None and conflicts within its own family.
+    sel.retain(|x| *x != GpuDriver::None);
+    if g.is_nvidia_family() {
+        sel.retain(|x| !x.is_nvidia_family());
+    }
+    sel.push(g);
 }
 
 fn gpu_label(g: GpuDriver) -> &'static str {

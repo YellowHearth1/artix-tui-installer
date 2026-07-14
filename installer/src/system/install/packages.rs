@@ -101,59 +101,21 @@ pub(crate) fn effective_aur_packages(c: &InstallConfig) -> Vec<String> {
     out
 }
 
-pub(crate) fn gpu_from(s: &str) -> GpuDriver {
-    match s {
-        "Nvidia" => GpuDriver::Nvidia,
-        "Nvidia580xx" => GpuDriver::Nvidia580xx,
-        "Nouveau" => GpuDriver::Nouveau,
-        "Amd" => GpuDriver::Amd,
-        "Intel" => GpuDriver::Intel,
-        _ => GpuDriver::None,
-    }
-}
-
-/// Parse the (comma-separated) GPU selection into the list of drivers. The UI
-/// allows combining drivers for hybrid graphics (e.g. "Nvidia,Amd" on a laptop
-/// with an NVIDIA dGPU and AMD iGPU).
-pub(crate) fn gpus_from(s: &str) -> Vec<GpuDriver> {
-    let v: Vec<GpuDriver> = s
-        .split(',')
-        .map(|p| gpu_from(p.trim()))
-        .filter(|g| !matches!(g, GpuDriver::None))
-        .collect();
-    if v.is_empty() {
-        vec![GpuDriver::None]
-    } else {
-        v
-    }
-}
-
 /// True if any selected GPU driver is a proprietary NVIDIA stack (which needs
 /// nvidia-persistenced and a nouveau blacklist).
-pub(crate) fn any_proprietary_nvidia(s: &str) -> bool {
-    gpus_from(s)
-        .iter()
-        .any(|g| matches!(g, GpuDriver::Nvidia | GpuDriver::Nvidia580xx))
-}
-
-pub(crate) fn kernel_from(s: &str) -> Kernel {
-    match s {
-        "Zen" => Kernel::Zen,
-        "Hardened" => Kernel::Hardened,
-        "Lts" => Kernel::Lts,
-        _ => Kernel::Linux,
-    }
+pub(crate) fn any_proprietary_nvidia(gpus: &[GpuDriver]) -> bool {
+    gpus.iter().any(|g| g.is_proprietary_nvidia())
 }
 
 /// The /boot image file names for the chosen kernel: (vmlinuz, initramfs).
 /// Bootloaders with a static config (Limine) must point at the REAL files —
 /// hardcoding vmlinuz-linux breaks every non-default kernel choice.
-pub(crate) fn kernel_images(s: &str) -> (&'static str, &'static str) {
-    match kernel_from(s) {
-        Kernel::Linux => ("vmlinuz-linux", "initramfs-linux.img"),
+pub(crate) fn kernel_images(k: Kernel) -> (&'static str, &'static str) {
+    match k {
         Kernel::Zen => ("vmlinuz-linux-zen", "initramfs-linux-zen.img"),
         Kernel::Hardened => ("vmlinuz-linux-hardened", "initramfs-linux-hardened.img"),
         Kernel::Lts => ("vmlinuz-linux-lts", "initramfs-linux-lts.img"),
+        Kernel::Linux => ("vmlinuz-linux", "initramfs-linux.img"),
     }
 }
 
@@ -319,12 +281,7 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
     });
 
     // The kernel chosen by the user (linux / zen / hardened / lts) + headers.
-    p.extend(
-        kernel_from(&c.kernel)
-            .packages()
-            .iter()
-            .map(|s| s.to_string()),
-    );
+    p.extend(c.kernel.packages().iter().map(|s| s.to_string()));
     // CPU microcode. Both packages are installed (each is tiny); the kernel
     // only ever loads the one matching the actual CPU, and installing both
     // keeps the disk portable between AMD/Intel machines. grub-mkconfig picks
@@ -378,15 +335,17 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
     }
     // Bootloader package for the chosen bootloader (grub is already in the base
     // list above as the default/fallback). rEFInd and Limine are added on top.
-    match c.bootloader.as_str() {
-        "refind" => p.push("refind".into()),
-        "limine" => p.push("limine".into()),
-        _ => {}
+    match c.bootloader {
+        Bootloader::Refind => p.push("refind".into()),
+        Bootloader::Limine => p.push("limine".into()),
+        // GRUB is already in the base list; EFISTUB has no bootloader package
+        // (efibootmgr, which writes the firmware entry, comes with the base).
+        Bootloader::Grub | Bootloader::Efistub => {}
     }
     // Secure Boot prep (EFISTUB only): sbctl provides key generation, signing,
     // and a pacman hook that re-signs the kernel on every update. Installed here
     // so it's present for the user to finish enrollment on first boot.
-    if c.bootloader == "efistub" && c.prepare_secureboot {
+    if c.bootloader.supports_secureboot_prep() && c.prepare_secureboot {
         p.push("sbctl".into());
     }
 
@@ -431,7 +390,7 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
     //     experimental option, but the only one that works WITHOUT elogind (it
     //     has its own pam_turnstile.so and can manage the runtime dir itself).
     //     Wired with pam_turnstile + turnstiled.conf + the turnstiled service.
-    if c.seat_provider == "elogind" {
+    if c.seat_provider == SeatProvider::Elogind {
         p.push("userspawn".into());
         p.push("userspawn-dinit".into());
     } else {
@@ -536,7 +495,7 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     } // end: for de in &des — multi-desktop package union
       // Union the packages of ALL selected GPU drivers (hybrid graphics),
       // deduplicated (mesa/lib32-mesa overlap between Intel/AMD/nouveau).
-    for g in gpus_from(&c.gpu) {
+    for g in &c.gpu {
         for pkg in g.packages() {
             if !p.iter().any(|x| x == pkg) {
                 p.push(pkg.to_string());
@@ -602,16 +561,7 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     // skips the DE will install their own compositor/WM later, and it still
     // needs a seat manager (seatd or elogind) to acquire input/DRM; without one
     // there'd be no working graphical session. We honour the user's choice.
-    match c.seat_provider.as_str() {
-        "elogind" => {
-            p.push("elogind".into());
-            p.push("elogind-dinit".into());
-        }
-        _ => {
-            p.push("seatd".into());
-            p.push("seatd-dinit".into());
-        }
-    }
+    p.extend(c.seat_provider.packages().iter().map(|x| x.to_string()));
     p.sort();
     p.dedup();
     p

@@ -2,7 +2,7 @@
 //! in the stable Artix repositories, with the packages each one installs shown
 //! below the highlighted entry.
 
-use crate::app::{App, Desktop};
+use crate::app::{App, Desktop, SeatProvider};
 use crate::i18n::t;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -435,7 +435,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.config.desktops.push(format!("{:?}", cur));
                     apply_desktop_defaults(app, cur);
                 }
-                app.seat_modal_cursor = if app.config.seat_provider == "seatd" {
+                app.seat_modal_cursor = if app.config.seat_provider == SeatProvider::Seatd {
                     1
                 } else {
                     0
@@ -464,9 +464,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => app.seat_modal_cursor = 1,
         KeyCode::Enter => {
             app.config.seat_provider = if app.seat_modal_cursor == 1 {
-                "seatd".into()
+                SeatProvider::Seatd
             } else {
-                "elogind".into()
+                SeatProvider::Elogind
             };
             // Lock the choice: from now on apply_desktop_defaults() must not
             // revert it when the desktop set changes.
@@ -521,7 +521,7 @@ fn toggle_session(app: &mut App, d: Desktop, _forward: bool) {
         // when switching to X11 — but ONLY while the user hasn't confirmed a
         // seat yet. Once seat_chosen is set, the explicit pick is never touched.
         if app.config.session == "x11" && !app.seat_chosen {
-            app.config.seat_provider = "elogind".into();
+            app.config.seat_provider = SeatProvider::Elogind;
         }
     }
 }
@@ -553,9 +553,9 @@ fn apply_desktop_defaults(app: &mut App, d: Desktop) {
             .map(|s| desktop_from_cfg(s))
             .any(|x| x != Desktop::None && x.supports_x11());
         app.config.seat_provider = if any_x11 {
-            "elogind".into()
+            SeatProvider::Elogind
         } else {
-            "seatd".into()
+            SeatProvider::Seatd
         };
     }
     // Display-manager DEFAULT tracks whether ANY desktop is selected: desktops →

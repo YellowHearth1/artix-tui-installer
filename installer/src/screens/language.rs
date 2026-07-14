@@ -7,7 +7,7 @@ use crate::screens::widgets;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -22,6 +22,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(2), // hint
             Constraint::Min(0),    // list
             Constraint::Length(3), // actions
+            Constraint::Length(1), // build number
         ])
         .spacing(1)
         .split(area);
@@ -50,6 +51,28 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         &t(app.lang, "app.next"),
         true,
     );
+
+    // Build number, bottom-right of the first screen.
+    //
+    // This settles a question that costs a round trip every time it comes up:
+    // "is the binary I'm looking at the one with the fix in it?" We spent one
+    // debugging a bug that was already fixed — in a build that predated the fix.
+    //
+    // CARGO_PKG_VERSION is read from Cargo.toml at COMPILE time, so the number
+    // on screen cannot drift from the source that produced the binary. A
+    // hand-maintained constant could; this can't.
+    //
+    // It gets its own row in the layout rather than being painted over the
+    // bottom of the screen: overlapping the action row would eat its border.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("build {} ", env!("CARGO_PKG_VERSION")),
+            theme::mute(),
+        )))
+        .alignment(Alignment::Right),
+        rows[3],
+    );
+
     app.can_advance = true;
 }
 

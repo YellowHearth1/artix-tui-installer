@@ -99,7 +99,6 @@ pub fn popular() -> Vec<Pkg> {
         ),
         // ── Plain suggestions below ──────────────────────────────────
         ("firefox", "Fast, private web browser"),
-        ("ungoogled-chromium", "Chromium without Google dependency"),
         ("rustdesk", "Remote desktop (open-source)"),
         ("libreoffice-fresh", "Full office suite (latest features)"),
         ("libreoffice-still", "Full office suite (stable)"),
@@ -116,7 +115,6 @@ pub fn popular() -> Vec<Pkg> {
         ("keepassxc", "Password manager"),
         ("htop", "Interactive process viewer"),
         ("btop", "Modern resource monitor"),
-        ("neofetch", "System information tool"),
         ("git", "Distributed version control"),
         ("docker", "Container platform"),
         ("zed", "High-performance code editor"),
@@ -220,6 +218,15 @@ pub fn aur_popular() -> Vec<Pkg> {
             "Discord client with Vencord + better Linux screenshare",
         ),
         ("librewolf-bin", "Privacy-oriented Firefox fork (binary)"),
+        // Was in the repo catalogue until it left the official Arch/Artix
+        // repositories. Only the AUR carries it now: `ungoogled-chromium`
+        // builds Chromium from source (hours, and it regularly fails), so the
+        // prebuilt `-bin` is what actually installs. Chaotic-AUR ships it too,
+        // which is why it lands here rather than nowhere.
+        (
+            "ungoogled-chromium-bin",
+            "Chromium without Google dependency (binary)",
+        ),
         ("obsidian", "Markdown knowledge base / note-taking app"),
         (
             "heroic-games-launcher-bin",
@@ -396,4 +403,63 @@ fn json_string_value(s: &str) -> String {
         i += 1;
     }
     val
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two catalogues are not interchangeable: `popular()` is fed to
+    /// `pacman -S`, `aur_popular()` to `paru`. A package in the wrong one
+    /// doesn't fail loudly — pacman just can't find it, and the user is left
+    /// wondering why the browser they ticked never appeared.
+    ///
+    /// This has bitten twice. `ungoogled-chromium` sat in the repo catalogue
+    /// after it left the official Arch/Artix repos (it's AUR-only now, and the
+    /// buildable-in-reasonable-time variant is `-bin`). `neofetch` sat there
+    /// after upstream archived it in 2024 and Arch dropped it.
+    ///
+    /// A `-bin` or `-git` suffix is the AUR's fingerprint: those variants exist
+    /// precisely because the AUR builds from source by default. One in the repo
+    /// catalogue is almost certainly a package that moved and wasn't followed.
+    #[test]
+    fn the_repo_catalogue_holds_no_aur_packages() {
+        for pkg in popular() {
+            assert!(
+                !pkg.name.ends_with("-bin") && !pkg.name.ends_with("-git"),
+                "'{}' looks like an AUR package but sits in the repo \
+                 catalogue — pacman -S will not find it. Move it to \
+                 aur_popular().",
+                pkg.name
+            );
+        }
+    }
+
+    /// A package offered in both catalogues would be installed twice, once by
+    /// each path — and the AUR copy would shadow the repo one.
+    #[test]
+    fn no_package_is_in_both_catalogues() {
+        let repo: Vec<String> = popular().into_iter().map(|p| p.name).collect();
+        for pkg in aur_popular() {
+            assert!(
+                !repo.contains(&pkg.name),
+                "'{}' is offered from both the repos and the AUR — pick one",
+                pkg.name
+            );
+        }
+    }
+
+    /// Every entry needs a description: the packages screen renders it next to
+    /// the name, and an empty one leaves the user guessing what they're about
+    /// to install on a machine they can't yet google from.
+    #[test]
+    fn every_offered_package_explains_itself() {
+        for pkg in popular().into_iter().chain(aur_popular()) {
+            assert!(
+                !pkg.desc.trim().is_empty(),
+                "'{}' is offered with no description",
+                pkg.name
+            );
+        }
+    }
 }
