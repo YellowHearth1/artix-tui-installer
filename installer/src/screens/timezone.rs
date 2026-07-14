@@ -127,7 +127,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         widgets::select_list(f, rows[1], &items, app.cursor);
         app.can_advance = true;
-        app.config.timezone = list[app.cursor.min(list.len() - 1)].clone();
+        // NOT `app.config.timezone = list[cursor]` — see commit_choice().
+        // Painting a screen must not decide anything.
     }
 
     widgets::action_row(
@@ -137,6 +138,28 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         &t(app.lang, "app.next"),
         app.can_advance,
     );
+}
+
+/// Where a given zone sits in the unfiltered list — so the cursor can be parked
+/// on the zone the config already holds, instead of on whatever sorts first.
+pub fn index_of(zone: &str) -> Option<usize> {
+    filtered("").iter().position(|z| z == zone)
+}
+
+/// Write the highlighted zone into the config.
+///
+/// This belongs to the KEY HANDLER, not to draw(). It used to sit inside
+/// draw(), which meant every repaint re-derived the timezone from the cursor —
+/// and on a fresh screen the cursor is 0, so the very first frame overwrote the
+/// default (Europe/Kyiv) with whatever happens to sort first in the zone list
+/// (Africa/Abidjan). The user's zone was gone before they touched a key.
+///
+/// Rendering shows state. It must never decide it.
+fn commit_choice(app: &mut App) {
+    let list = filtered(&app.tz_query);
+    if let Some(zone) = list.get(app.cursor) {
+        app.config.timezone = zone.clone();
+    }
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -158,9 +181,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.tz_query.pop();
             app.cursor = 0;
         }
-        KeyCode::Enter if len > 0 => app.goto_next(),
+        KeyCode::Enter if len > 0 => {
+            // Commit BEFORE leaving: goto_next() is the last chance to record
+            // what the cursor was pointing at.
+            commit_choice(app);
+            app.goto_next();
+            return;
+        }
         _ => {}
     }
+    // Every movement and every edit of the filter re-commits, so the config
+    // always matches what's highlighted on screen.
+    commit_choice(app);
 }
 
 pub fn footer_hint(app: &App) -> String {

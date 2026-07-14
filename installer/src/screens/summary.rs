@@ -127,8 +127,7 @@ fn draw_confirm_format(f: &mut Frame, app: &App, area: Rect) {
 
     // Build the body as (text, style) pairs so we can both size it (from the
     // plain text) and render it, without reaching into Line internals.
-    let mut items: Vec<(String, Style)> = Vec::new();
-    items.push((t(app.lang, "sum.fmt_intro"), theme::warn()));
+    let mut items: Vec<(String, Style)> = vec![(t(app.lang, "sum.fmt_intro"), theme::warn())];
     items.push((String::new(), theme::normal()));
     items.push((format!("  {disk_line}"), theme::normal()));
     if !victims.is_empty() {

@@ -16,7 +16,7 @@ pub mod packages;
 mod recovery;
 pub(crate) mod storage;
 pub mod summary;
-mod timezone;
+pub(crate) mod timezone;
 mod user;
 pub mod wifi;
 mod wifitest;
@@ -210,12 +210,23 @@ mod tests {
         }
     }
 
-    /// Rendering must not mutate the config. draw() takes &mut App (screens
-    /// need it for scroll state), which makes it easy to accidentally *decide*
-    /// something while merely painting — and that lands in the install plan.
-    /// This is exactly how the disk screen once assigned app.config.disk from
-    /// the cursor position on every frame, which is what let a USB key stick be
-    /// picked as the install target.
+    /// Rendering must not mutate the config.
+    ///
+    /// draw() takes &mut App because screens need it for scroll state — which
+    /// makes it easy to *decide* something while merely painting. This test
+    /// found two live instances of that on its first run:
+    ///
+    ///   * the timezone screen assigned config.timezone from the cursor on
+    ///     EVERY FRAME. On a fresh screen the cursor is 0, so the very first
+    ///     repaint overwrote the default (Europe/Kyiv) with whatever sorts
+    ///     first alphabetically (Africa/Abidjan). The user's zone was gone
+    ///     before they pressed a key.
+    ///
+    ///   * the disk screen did the same with config.disk — the disk that gets
+    ///     WIPED, re-derived from a cursor on every repaint.
+    ///
+    /// Both now commit in the key handler, where a decision belongs. Rendering
+    /// shows state; it never decides it.
     #[test]
     fn drawing_a_screen_does_not_change_the_install_config() {
         for screen in Screen::ALL {

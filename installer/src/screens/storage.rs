@@ -1005,7 +1005,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Lang;
+    use crate::i18n::Lang;
 
     fn ext_disk() -> ExtraDisk {
         ExtraDisk {

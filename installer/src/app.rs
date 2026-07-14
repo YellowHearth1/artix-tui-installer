@@ -979,15 +979,17 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let mut config = InstallConfig::default();
         // Auto-detect the firmware mode the live system actually booted in:
         // /sys/firmware/efi exists only under UEFI. This makes the Disk step
         // default to the correct mode (so grub installs as x86_64-efi under
         // UEFI, i386-pc under BIOS) instead of relying on the user to toggle it.
-        config.boot_mode = if std::path::Path::new("/sys/firmware/efi").exists() {
-            BootMode::Uefi
-        } else {
-            BootMode::Bios
+        let config = InstallConfig {
+            boot_mode: if std::path::Path::new("/sys/firmware/efi").exists() {
+                BootMode::Uefi
+            } else {
+                BootMode::Bios
+            },
+            ..Default::default()
         };
         App {
             screen: Screen::Language,
@@ -1118,6 +1120,22 @@ impl App {
         // A modal left flagged open would render over the screen on arrival.
         self.seat_modal_open = false;
         self.storage_opts_modal_open = false;
+
+        // Point the cursor at the value the config ALREADY holds, so what's
+        // highlighted is what's actually going to be installed.
+        //
+        // The timezone screen defaults to Europe/Kyiv but its list is
+        // alphabetical, so a cursor parked at 0 highlights Africa/Abidjan.
+        // Screens used to paper over this by assigning config.timezone from
+        // the cursor while drawing — which meant the first repaint silently
+        // REPLACED the default. Now that drawing decides nothing, the cursor
+        // has to start in the right place instead.
+        if self.screen == Screen::Timezone {
+            self.tz_query.clear();
+            if let Some(i) = crate::screens::timezone::index_of(&self.config.timezone) {
+                self.cursor = i;
+            }
+        }
     }
 
     pub fn push_log<S: Into<String>>(&mut self, line: S) {

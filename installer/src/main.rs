@@ -451,15 +451,15 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         Screen::Mode | Screen::Recovery | Screen::WifiTest => usize::MAX,
         s => s as usize,
     };
-    let mut lines: Vec<Line> = Vec::new();
-
     // Brand. The rail is narrow (12 cols), so keep this short. "ARTIX" centered,
     // with a small mark above it. Plain ASCII/geometric chars only, so it
     // renders on a bare console font too.
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  ARTIX", theme::title())));
-    lines.push(Line::from(Span::styled("  ─────", theme::dim())));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled("  ARTIX", theme::title())),
+        Line::from(Span::styled("  ─────", theme::dim())),
+        Line::from(""),
+    ];
 
     let nums = [
         "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15",
