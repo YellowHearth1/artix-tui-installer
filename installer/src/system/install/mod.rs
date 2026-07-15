@@ -21,6 +21,7 @@ use crate::app::{
     App, Bootloader, Desktop, GpuDriver, InstallConfig, Kernel, SeatProvider, AUDIO_PACKAGES,
     DINIT_PACKAGES, DINIT_SERVICES,
 };
+use crate::i18n::{t, Lang};
 use crate::system::disk::{self, Action};
 
 mod helpers;
@@ -105,15 +106,19 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         // failed screen, so it's localized and says exactly what to do: go back
         // to the Wi-Fi step and connect. Multiple echoes keep the lines separate
         // (echo doesn't expand \n in plain sh).
-        let no_net = if c.lang == "uk" {
-            "echo '!!! Немає підключення до інтернету — для встановлення потрібно завантажувати пакунки.'; \
-             echo '!!! Натисніть Esc, щоб повернутися назад, відкрийте крок Wi-Fi (підключення до інтернету), під’єднайтеся, і запустіть встановлення знову.'; \
-             echo '!!! Нічого не змінено — ваш диск недоторканий.'"
-        } else {
-            "echo '!!! No internet connection — an install must download packages.'; \
-             echo '!!! Press Esc to go back, open the Wi-Fi (internet) step, connect, then start the install again.'; \
-             echo '!!! Nothing has been changed — your disk is untouched.'"
-        };
+        // The three lines come from the TOMLs like every other user-facing
+        // string. They're SHELL here, not UI — but that's a detail of how
+        // they're delivered, not a reason for the text itself to live in the
+        // source. Single quotes inside the message would end the shell string,
+        // so they're escaped the POSIX way ('\'').
+        let lang = if c.lang == "uk" { Lang::Uk } else { Lang::En };
+        let sh_quote = |key: &str| t(lang, key).replace('\'', "'\\''");
+        let no_net = format!(
+            "echo '!!! {}'; echo '!!! {}'; echo '!!! {}'",
+            sh_quote("net.none_detected"),
+            sh_quote("net.go_back_and_connect"),
+            sh_quote("net.disk_untouched"),
+        );
         let preflight = format!(
             "echo '>>> Pre-flight checks...'; \
              FAIL=0; \

@@ -164,15 +164,13 @@ fn commit_choice(app: &mut App) {
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     let len = filtered(&app.tz_query).len();
+    // Movement is the shared nav component; a move re-commits, so the config
+    // always matches what's highlighted on screen.
+    if super::nav::move_cursor(key.code, &mut app.cursor, len) {
+        commit_choice(app);
+        return;
+    }
     match key.code {
-        KeyCode::Up => app.cursor = app.cursor.saturating_sub(1),
-        KeyCode::Down => app.cursor = (app.cursor + 1).min(len.saturating_sub(1)),
-        // PageUp/PageDown jump ~a screenful; Home/End snap to the edges — the
-        // 600+ zone list stays usable even before the text filter kicks in.
-        KeyCode::PageDown => app.cursor = (app.cursor + 10).min(len.saturating_sub(1)),
-        KeyCode::PageUp => app.cursor = app.cursor.saturating_sub(10),
-        KeyCode::End => app.cursor = len.saturating_sub(1),
-        KeyCode::Home => app.cursor = 0,
         KeyCode::Char(c) => {
             app.tz_query.push(c);
             app.cursor = 0;

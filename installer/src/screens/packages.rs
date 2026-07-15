@@ -318,9 +318,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.pkg_focus == FOCUS_GPU {
+        if super::nav::move_cursor(key.code, &mut app.gpu_cursor, GPUS.len()) {
+            return;
+        }
         match key.code {
-            KeyCode::Up => app.gpu_cursor = app.gpu_cursor.saturating_sub(1),
-            KeyCode::Down => app.gpu_cursor = (app.gpu_cursor + 1).min(GPUS.len() - 1),
             // Space toggles the highlighted driver. Multiple drivers can be
             // combined (hybrid graphics: NVIDIA dGPU + Intel/AMD iGPU), with
             // sane exclusions handled in toggle_gpu.
@@ -348,14 +349,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     } else {
         app.pkg_popular.len()
     };
+    if super::nav::move_cursor(key.code, &mut app.cursor, active_len) {
+        return;
+    }
     match key.code {
-        KeyCode::Up => app.cursor = app.cursor.saturating_sub(1),
-        KeyCode::Down => app.cursor = (app.cursor + 1).min(active_len.saturating_sub(1)),
-        // Page jumps and edge snaps for the package list.
-        KeyCode::PageDown => app.cursor = (app.cursor + 10).min(active_len.saturating_sub(1)),
-        KeyCode::PageUp => app.cursor = app.cursor.saturating_sub(10),
-        KeyCode::End => app.cursor = active_len.saturating_sub(1),
-        KeyCode::Home => app.cursor = 0,
         KeyCode::Char(' ') => {
             let picked = if typing {
                 app.pkg_results.get(app.cursor).map(|p| p.name.clone())

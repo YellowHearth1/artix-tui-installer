@@ -95,8 +95,11 @@ use it via `t(app.lang, "section.key")`. Parity check below.
 `src/system/install/scripts.rs`. Scripts are POSIX sh: check with `dash -n`.
 
 **Add a screen** → a new `src/screens/file.rs` (copy the simplest one as a
-template), a variant in `enum Screen` (`app.rs`), branches in `event.rs` and
-the draw router. Modals — don't forget `any_modal_open()`.
+template), a variant in `enum Screen` (`app.rs`), one row in the `step()`
+table (`screens/mod.rs`) — that row is everything: draw, keys, tick, footer
+hint. The match has no catch-all, so an unregistered screen is a compile
+error, not a silent gap. Modals — don't forget `any_modal_open()` in
+`event.rs`.
 
 **Add a bootloader** → `ORDER` in `src/screens/options.rs`, a branch in
 `match c.bootloader` in `install/mod.rs`, an i18n hint, README.

@@ -11,6 +11,7 @@ mod kernel;
 mod keyboard;
 mod language;
 mod mode;
+pub(crate) mod nav;
 pub mod options;
 pub mod packages;
 mod recovery;
@@ -26,82 +27,150 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
-    match app.screen {
-        Screen::Language => language::draw(f, app, area),
-        Screen::Timezone => timezone::draw(f, app, area),
-        Screen::Wifi => wifi::draw(f, app, area),
-        Screen::Keyboard => keyboard::draw(f, app, area),
-        Screen::Kernel => kernel::draw(f, app, area),
-        Screen::Desktop => desktop::draw(f, app, area),
-        Screen::Packages => packages::draw(f, app, area),
-        Screen::Aur => aur::draw(f, app, area),
-        Screen::Disk => disk::draw(f, app, area),
-        Screen::Storage => storage::draw(f, app, area),
-        Screen::User => user::draw(f, app, area),
-        Screen::Security => options::draw(f, app, area),
-        Screen::Options => options::draw(f, app, area),
-        Screen::Summary => summary::draw(f, app, area),
-        Screen::Finish => finish::draw(f, app, area),
-        Screen::Mode => mode::draw(f, app, area),
-        Screen::Recovery => recovery::draw(f, app, area),
-        Screen::WifiTest => wifitest::draw(f, app, area),
+/// One wizard step's wiring: how it draws, how it takes keys, what runs on the
+/// background tick, and what it contributes to the footer.
+///
+/// Dispatch used to be four parallel `match app.screen` blocks — draw, keys,
+/// tick, footer hint. Adding a screen meant the same edit in four places, and
+/// two of those matches had catch-all arms, so forgetting one didn't even fail
+/// to compile: the screen just silently had no tick, or no hint. A step is now
+/// ONE row, and the match in `step()` has no catch-all — a new `Screen` variant
+/// that isn't wired up is a compile error in exactly one place.
+struct Step {
+    draw: fn(&mut Frame, &mut App, Rect),
+    key: fn(&mut App, KeyEvent),
+    tick: fn(&mut App),
+    hint: fn(&App) -> Option<String>,
+}
+
+/// No background work — the default for screens that don't poll anything.
+fn no_tick(_: &mut App) {}
+
+fn step(screen: Screen) -> Step {
+    match screen {
+        Screen::Language => Step {
+            draw: language::draw,
+            key: language::handle_key,
+            tick: no_tick,
+            hint: |_| None,
+        },
+        Screen::Timezone => Step {
+            draw: timezone::draw,
+            key: timezone::handle_key,
+            tick: no_tick,
+            hint: |a| Some(timezone::footer_hint(a)),
+        },
+        Screen::Wifi => Step {
+            draw: wifi::draw,
+            key: wifi::handle_key,
+            tick: wifi::tick,
+            hint: |a| Some(wifi::footer_hint(a)),
+        },
+        Screen::Keyboard => Step {
+            draw: keyboard::draw,
+            key: keyboard::handle_key,
+            tick: no_tick,
+            hint: |a| Some(keyboard::footer_hint(a)),
+        },
+        Screen::Kernel => Step {
+            draw: kernel::draw,
+            key: kernel::handle_key,
+            tick: no_tick,
+            hint: |a| Some(kernel::footer_hint(a)),
+        },
+        Screen::Desktop => Step {
+            draw: desktop::draw,
+            key: desktop::handle_key,
+            tick: no_tick,
+            hint: |a| Some(desktop::footer_hint(a)),
+        },
+        Screen::Packages => Step {
+            draw: packages::draw,
+            key: packages::handle_key,
+            tick: packages::tick,
+            hint: |a| Some(packages::footer_hint(a)),
+        },
+        Screen::Aur => Step {
+            draw: aur::draw,
+            key: aur::handle_key,
+            tick: aur::tick,
+            hint: |a| Some(aur::footer_hint(a)),
+        },
+        Screen::Disk => Step {
+            draw: disk::draw,
+            key: disk::handle_key,
+            tick: no_tick,
+            hint: |a| Some(disk::footer_hint(a)),
+        },
+        Screen::Storage => Step {
+            draw: storage::draw,
+            key: storage::handle_key,
+            tick: no_tick,
+            hint: |a| Some(storage::footer_hint(a)),
+        },
+        Screen::User => Step {
+            draw: user::draw,
+            key: user::handle_key,
+            tick: no_tick,
+            hint: |a| Some(user::footer_hint(a)),
+        },
+        // Security and Options are two wizard positions served by one module:
+        // the same screen, reached from two places in the flow.
+        Screen::Security | Screen::Options => Step {
+            draw: options::draw,
+            key: options::handle_key,
+            tick: no_tick,
+            hint: |a| Some(options::footer_hint(a)),
+        },
+        Screen::Summary => Step {
+            draw: summary::draw,
+            key: summary::handle_key,
+            tick: summary::tick,
+            hint: |a| Some(summary::footer_hint(a)),
+        },
+        Screen::Finish => Step {
+            draw: finish::draw,
+            key: finish::handle_key,
+            tick: no_tick,
+            hint: |_| None,
+        },
+        Screen::Mode => Step {
+            draw: mode::draw,
+            key: mode::handle_key,
+            tick: no_tick,
+            hint: |_| None,
+        },
+        Screen::Recovery => Step {
+            draw: recovery::draw,
+            key: recovery::handle_key,
+            tick: no_tick,
+            hint: |a| Some(recovery::footer_hint(a)),
+        },
+        Screen::WifiTest => Step {
+            draw: wifitest::draw,
+            key: wifitest::handle_key,
+            tick: no_tick,
+            hint: |a| Some(wifitest::footer_hint(a)),
+        },
     }
+}
+
+pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
+    (step(app.screen).draw)(f, app, area);
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
-    match app.screen {
-        Screen::Language => language::handle_key(app, key),
-        Screen::Timezone => timezone::handle_key(app, key),
-        Screen::Wifi => wifi::handle_key(app, key),
-        Screen::Keyboard => keyboard::handle_key(app, key),
-        Screen::Kernel => kernel::handle_key(app, key),
-        Screen::Desktop => desktop::handle_key(app, key),
-        Screen::Packages => packages::handle_key(app, key),
-        Screen::Aur => aur::handle_key(app, key),
-        Screen::Disk => disk::handle_key(app, key),
-        Screen::Storage => storage::handle_key(app, key),
-        Screen::User => user::handle_key(app, key),
-        Screen::Security => options::handle_key(app, key),
-        Screen::Options => options::handle_key(app, key),
-        Screen::Summary => summary::handle_key(app, key),
-        Screen::Finish => finish::handle_key(app, key),
-        Screen::Mode => mode::handle_key(app, key),
-        Screen::Recovery => recovery::handle_key(app, key),
-        Screen::WifiTest => wifitest::handle_key(app, key),
-    }
+    (step(app.screen).key)(app, key);
 }
 
 pub fn tick(app: &mut App) {
-    match app.screen {
-        Screen::Summary => summary::tick(app),
-        Screen::Wifi => wifi::tick(app),
-        Screen::Packages => packages::tick(app),
-        Screen::Aur => aur::tick(app),
-        _ => {}
-    }
+    (step(app.screen).tick)(app);
 }
 
-/// Optional per-screen footer hint override.
+/// Optional per-screen footer hint override; the shell falls back to the
+/// generic navigation hint when a screen has nothing specific to say.
 pub fn footer_hint(app: &App) -> Option<String> {
-    match app.screen {
-        Screen::Wifi => Some(wifi::footer_hint(app)),
-        Screen::Keyboard => Some(keyboard::footer_hint(app)),
-        Screen::Kernel => Some(kernel::footer_hint(app)),
-        Screen::Desktop => Some(desktop::footer_hint(app)),
-        Screen::Disk => Some(disk::footer_hint(app)),
-        Screen::Storage => Some(storage::footer_hint(app)),
-        Screen::Packages => Some(packages::footer_hint(app)),
-        Screen::Aur => Some(aur::footer_hint(app)),
-        Screen::Timezone => Some(timezone::footer_hint(app)),
-        Screen::Summary => Some(summary::footer_hint(app)),
-        Screen::User => Some(user::footer_hint(app)),
-        Screen::Security => Some(options::footer_hint(app)),
-        Screen::Options => Some(options::footer_hint(app)),
-        Screen::Recovery => Some(recovery::footer_hint(app)),
-        Screen::WifiTest => Some(wifitest::footer_hint(app)),
-        _ => None,
-    }
+    (step(app.screen).hint)(app)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

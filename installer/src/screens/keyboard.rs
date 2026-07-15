@@ -218,14 +218,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     let list = filtered(&app.kb_query);
+    if super::nav::move_cursor(key.code, &mut app.cursor, list.len()) {
+        return;
+    }
     match key.code {
-        KeyCode::Up => app.cursor = app.cursor.saturating_sub(1),
-        KeyCode::Down => app.cursor = (app.cursor + 1).min(list.len().saturating_sub(1)),
-        // Page jumps and edge snaps, same as the other long lists.
-        KeyCode::PageDown => app.cursor = (app.cursor + 10).min(list.len().saturating_sub(1)),
-        KeyCode::PageUp => app.cursor = app.cursor.saturating_sub(10),
-        KeyCode::End => app.cursor = list.len().saturating_sub(1),
-        KeyCode::Home => app.cursor = 0,
         KeyCode::Char(' ') => {
             if let Some(k) = list.get(app.cursor) {
                 if let Some(pos) = app.config.xkb_layouts.iter().position(|x| x == k) {
