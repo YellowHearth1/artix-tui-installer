@@ -41,6 +41,7 @@ use std::io::{self, Stdout};
 use std::path::Path;
 use std::process::Command;
 
+use crate::i18n::{t, Lang};
 use crate::theme;
 
 /// Where the snapper "root" config keeps its snapshots on a running system.
@@ -70,7 +71,7 @@ enum Mode {
 /// Run the rollback tool. Returns once the user quits, a reboot is issued, or
 /// (in early boot) the boot should continue.
 pub fn run() -> Result<()> {
-    let uk = is_uk();
+    let lang = Lang::from_env();
 
     // Self-contained panic hook so a panic never leaves the terminal in raw mode.
     let default_hook = std::panic::take_hook();
@@ -93,30 +94,23 @@ pub fn run() -> Result<()> {
         // fall back to a plain line-based picker so recovery still works.
         return match setup() {
             Ok(mut term) => {
-                let res = ui_loop(&mut term, uk, &snaps, true, Some(top.as_str()));
+                let res = ui_loop(&mut term, lang, &snaps, true, Some(top.as_str()));
                 let _ = restore();
                 res
             }
-            Err(_) => run_linebased(uk, &top, &snaps),
+            Err(_) => run_linebased(lang, &top, &snaps),
         };
     }
 
     // Running-system context. Swapping subvolumes / set-default / reboot need root.
     if !is_root() {
-        eprintln!(
-            "{}",
-            if uk {
-                "Відкат потребує прав root. Запустіть: sudo artix-rollback"
-            } else {
-                "Rollback needs root privileges. Run: sudo artix-rollback"
-            }
-        );
+        eprintln!("{}", t(lang, "rb.rollback_needs_root_privileges_run"));
         std::process::exit(1);
     }
 
     let snaps = read_snapshots(SNAP_DIR);
     let mut term = setup()?;
-    let res = ui_loop(&mut term, uk, &snaps, false, None);
+    let res = ui_loop(&mut term, lang, &snaps, false, None);
     restore()?;
     res
 }
@@ -190,14 +184,6 @@ fn is_root() -> bool {
     capture("id", &["-u"])
         .map(|s| s.trim() == "0")
         .unwrap_or(false)
-}
-
-fn is_uk() -> bool {
-    let v = std::env::var("LANG")
-        .or_else(|_| std::env::var("LC_MESSAGES"))
-        .or_else(|_| std::env::var("LC_ALL"))
-        .unwrap_or_default();
-    v.to_lowercase().starts_with("uk")
 }
 
 /// Find a free `@.rollback-…` name to move the live root aside to. This must
@@ -355,32 +341,16 @@ fn reboot_now() {
 
 /// A dependency-light picker used in early boot when the console can't provide
 /// a raw terminal for the ratatui UI. Reads a number from stdin; no raw mode.
-fn run_linebased(uk: bool, top: &str, snaps: &[Snapshot]) -> Result<()> {
+fn run_linebased(lang: Lang, top: &str, snaps: &[Snapshot]) -> Result<()> {
     use std::io::Write;
     let mut out = io::stdout();
 
     if snaps.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n{}",
-            if uk {
-                "Знімків для відкату немає. Завантажтесь із live-USB і відновіть систему звідти."
-            } else {
-                "No snapshots to roll back to. Boot from a live-USB and recover from there."
-            }
-        );
+        let _ = writeln!(out, "\n{}", t(lang, "rb.no_snapshots_to_roll_back"));
         return Ok(());
     }
 
-    let _ = writeln!(
-        out,
-        "\n{}",
-        if uk {
-            "Знімки для відкату:"
-        } else {
-            "Snapshots to roll back to:"
-        }
-    );
+    let _ = writeln!(out, "\n{}", t(lang, "rb.snapshots_to_roll_back_to"));
     for s in snaps {
         let date = if s.date.len() >= 16 {
             &s.date[..16]
@@ -394,15 +364,7 @@ fn run_linebased(uk: bool, top: &str, snaps: &[Snapshot]) -> Result<()> {
         };
         let _ = writeln!(out, "  {:>4}  {:<16}  {}", s.num, date, desc);
     }
-    let _ = write!(
-        out,
-        "\n{}",
-        if uk {
-            "Введіть номер знімка (Enter — пропустити й продовжити завантаження): "
-        } else {
-            "Enter a snapshot number (Enter to skip and continue booting): "
-        }
-    );
+    let _ = write!(out, "\n{}", t(lang, "rb.enter_a_snapshot_number_enter"));
     let _ = out.flush();
 
     let mut line = String::new();
@@ -414,42 +376,18 @@ fn run_linebased(uk: bool, top: &str, snaps: &[Snapshot]) -> Result<()> {
     let num: u32 = match line.parse() {
         Ok(n) => n,
         Err(_) => {
-            let _ = writeln!(
-                out,
-                "{}",
-                if uk {
-                    "Не число."
-                } else {
-                    "Not a number."
-                }
-            );
+            let _ = writeln!(out, "{}", t(lang, "rb.not_a_number"));
             return Ok(());
         }
     };
     if !snaps.iter().any(|s| s.num == num) {
-        let _ = writeln!(
-            out,
-            "{}",
-            if uk {
-                "Немає такого знімка."
-            } else {
-                "No such snapshot."
-            }
-        );
+        let _ = writeln!(out, "{}", t(lang, "rb.no_such_snapshot"));
         return Ok(());
     }
 
     match core_swap(top, num) {
         Ok(()) => {
-            let _ = writeln!(
-                out,
-                "{}",
-                if uk {
-                    "Відкат виконано — перезавантаження у відновлену систему…"
-                } else {
-                    "Rolled back — rebooting into the restored system…"
-                }
-            );
+            let _ = writeln!(out, "{}", t(lang, "rb.rolled_back_rebooting_into_the"));
             let _ = out.flush();
             std::thread::sleep(std::time::Duration::from_millis(1000));
             // Reboot so the NEXT fresh boot mounts the new @ (continuing this
@@ -460,17 +398,9 @@ fn run_linebased(uk: bool, top: &str, snaps: &[Snapshot]) -> Result<()> {
             let _ = writeln!(
                 out,
                 "{} {}\n{}",
-                if uk {
-                    "Помилка відкату:"
-                } else {
-                    "Rollback failed:"
-                },
+                t(lang, "rb.rollback_failed"),
                 e,
-                if uk {
-                    "Завантажтесь із live-USB і відновіть систему звідти."
-                } else {
-                    "Boot from a live-USB and recover from there."
-                }
+                t(lang, "rb.boot_from_a_live_usb")
             );
         }
     }
@@ -497,7 +427,7 @@ fn restore() -> Result<()> {
 
 fn ui_loop(
     term: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    uk: bool,
+    lang: Lang,
     snaps: &[Snapshot],
     initramfs: bool,
     top: Option<&str>,
@@ -509,7 +439,7 @@ fn ui_loop(
     let mut mode = Mode::List;
 
     loop {
-        term.draw(|f| draw(f, uk, snaps, &mut state, &mode, initramfs))?;
+        term.draw(|f| draw(f, lang, snaps, &mut state, &mode, initramfs))?;
 
         let ev = event::read()?;
         let key = match ev {
@@ -539,7 +469,7 @@ fn ui_loop(
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     // Paint "Working…" before we block on the swap.
                     mode = Mode::Working;
-                    term.draw(|f| draw(f, uk, snaps, &mut state, &mode, initramfs))?;
+                    term.draw(|f| draw(f, lang, snaps, &mut state, &mode, initramfs))?;
                     let num = state.selected().and_then(|i| snaps.get(i)).map(|s| s.num);
                     mode = match num {
                         Some(n) => {
@@ -559,7 +489,7 @@ fn ui_loop(
                                         // the boot continue (old behaviour).
                                         let done = Mode::Done;
                                         let _ = term.draw(|f| {
-                                            draw(f, uk, snaps, &mut state, &done, initramfs)
+                                            draw(f, lang, snaps, &mut state, &done, initramfs)
                                         });
                                         std::thread::sleep(std::time::Duration::from_millis(1300));
                                         reboot_now();
@@ -617,7 +547,7 @@ fn move_sel(state: &mut ListState, snaps: &[Snapshot], delta: i32) {
 
 fn draw(
     f: &mut Frame,
-    uk: bool,
+    lang: Lang,
     snaps: &[Snapshot],
     state: &mut ListState,
     mode: &Mode,
@@ -630,13 +560,9 @@ fn draw(
 
     let area = f.area();
     if area.width < 56 || area.height < 14 {
-        let p = Paragraph::new(if uk {
-            "Замале вікно"
-        } else {
-            "Window too small"
-        })
-        .style(theme::warn())
-        .alignment(Alignment::Center);
+        let p = Paragraph::new(t(lang, "rb.window_too_small"))
+            .style(theme::warn())
+            .alignment(Alignment::Center);
         f.render_widget(
             p,
             area.inner(Margin {
@@ -656,32 +582,28 @@ fn draw(
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(root);
 
-    draw_panel(f, uk, snaps, state, initramfs, rows[0]);
-    draw_footer(f, uk, mode, snaps.is_empty(), initramfs, rows[1]);
+    draw_panel(f, lang, snaps, state, initramfs, rows[0]);
+    draw_footer(f, lang, mode, snaps.is_empty(), initramfs, rows[1]);
 
     match mode {
-        Mode::Confirm => draw_confirm(f, uk, snaps, state, area),
-        Mode::Working => draw_working(f, uk, area),
-        Mode::Done => draw_done(f, uk, initramfs, area),
-        Mode::Error(e) => draw_error(f, uk, e, initramfs, area),
+        Mode::Confirm => draw_confirm(f, lang, snaps, state, area),
+        Mode::Working => draw_working(f, lang, area),
+        Mode::Done => draw_done(f, lang, initramfs, area),
+        Mode::Error(e) => draw_error(f, lang, e, initramfs, area),
         Mode::List => {}
     }
 }
 
 fn draw_panel(
     f: &mut Frame,
-    uk: bool,
+    lang: Lang,
     snaps: &[Snapshot],
     state: &mut ListState,
     initramfs: bool,
     area: Rect,
 ) {
-    let title = if uk {
-        "Відкат системи"
-    } else {
-        "System Rollback"
-    };
-    let block = theme::panel(title);
+    let title = t(lang, "rb.system_rollback");
+    let block = theme::panel(&title);
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -690,15 +612,9 @@ fn draw_panel(
 
     if snaps.is_empty() {
         let msg = if initramfs {
-            if uk {
-                "Знімків для відкату немає.\n\nЗавантажтесь із live-USB і відновіть систему звідти."
-            } else {
-                "No snapshots to roll back to.\n\nBoot from a live-USB and recover from there."
-            }
-        } else if uk {
-            "Знімків ще немає.\n\nЗнімки з'являються після транзакцій pacman у вже завантаженій системі (snap-pac), а також як базовий знімок першого завантаження."
+            t(lang, "rb.no_snapshots_to_roll_back_2")
         } else {
-            "No snapshots yet.\n\nSnapshots appear after pacman transactions on the running system (snap-pac), plus the first-boot baseline."
+            t(lang, "rb.no_snapshots_yet_n_nsnapshots")
         };
         f.render_widget(
             Paragraph::new(msg)
@@ -715,15 +631,9 @@ fn draw_panel(
         .split(inner);
 
     let intro = if initramfs {
-        if uk {
-            "Оберіть знімок — систему буде відновлено й завантажено в його стан."
-        } else {
-            "Pick a snapshot — the system is restored to it and boots into that state."
-        }
-    } else if uk {
-        "Оберіть знімок для відкату:"
+        t(lang, "rb.pick_a_snapshot_the_system")
     } else {
-        "Pick a snapshot to roll back to:"
+        t(lang, "rb.pick_a_snapshot_to_roll")
     };
     f.render_widget(
         Paragraph::new(intro)
@@ -746,13 +656,9 @@ fn draw_panel(
                 s.date.get(0..16).unwrap_or(s.date.as_str())
             };
             let desc = if s.desc.is_empty() {
-                if uk {
-                    "(без опису)"
-                } else {
-                    "(no description)"
-                }
+                t(lang, "rb.no_description")
             } else {
-                s.desc.as_str()
+                s.desc.clone()
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("#{:<4}", s.num), theme::accent()),
@@ -792,7 +698,7 @@ fn draw_panel(
     }
 }
 
-fn draw_footer(f: &mut Frame, uk: bool, mode: &Mode, empty: bool, initramfs: bool, area: Rect) {
+fn draw_footer(f: &mut Frame, lang: Lang, mode: &Mode, empty: bool, initramfs: bool, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -806,51 +712,21 @@ fn draw_footer(f: &mut Frame, uk: bool, mode: &Mode, empty: bool, initramfs: boo
     let hint = match mode {
         Mode::List => {
             if empty {
-                if uk {
-                    "q вихід"
-                } else {
-                    "q quit"
-                }
-            } else if uk {
-                "↑/↓ вибір · Enter відкотити · q вихід"
+                t(lang, "rb.q_quit")
             } else {
-                "↑/↓ select · Enter roll back · q quit"
+                t(lang, "rb.select_enter_roll_back_q")
             }
         }
-        Mode::Confirm => {
-            if uk {
-                "y підтвердити · n скасувати"
-            } else {
-                "y confirm · n cancel"
-            }
-        }
+        Mode::Confirm => t(lang, "rb.y_confirm_n_cancel"),
         Mode::Done => {
             if initramfs {
-                if uk {
-                    "перезавантаження…"
-                } else {
-                    "rebooting…"
-                }
-            } else if uk {
-                "r перезавантажити · q вийти"
+                t(lang, "rb.rebooting")
             } else {
-                "r reboot · q quit"
+                t(lang, "rb.r_reboot_q_quit")
             }
         }
-        Mode::Error(_) => {
-            if uk {
-                "Enter повернутися"
-            } else {
-                "Enter back"
-            }
-        }
-        Mode::Working => {
-            if uk {
-                "зачекайте…"
-            } else {
-                "working…"
-            }
-        }
+        Mode::Error(_) => t(lang, "rb.enter_back"),
+        Mode::Working => t(lang, "rb.working"),
     };
 
     let mut spans: Vec<Span> = Vec::new();
@@ -911,21 +787,14 @@ fn modal(
     inner
 }
 
-fn draw_confirm(f: &mut Frame, uk: bool, snaps: &[Snapshot], state: &mut ListState, area: Rect) {
+fn draw_confirm(f: &mut Frame, lang: Lang, snaps: &[Snapshot], state: &mut ListState, area: Rect) {
     let s = match state.selected().and_then(|i| snaps.get(i)) {
         Some(s) => s,
         None => return,
     };
 
     let mut lines: Vec<Line> = vec![Line::from(vec![
-        Span::styled(
-            if uk {
-                "Відкотитися до знімка "
-            } else {
-                "Roll back to snapshot "
-            },
-            theme::normal(),
-        ),
+        Span::styled(t(lang, "rb.roll_back_to_snapshot"), theme::normal()),
         Span::styled(format!("#{}", s.num), theme::accent()),
         Span::styled(" ?", theme::normal()),
     ])];
@@ -942,26 +811,15 @@ fn draw_confirm(f: &mut Frame, uk: bool, snaps: &[Snapshot], state: &mut ListSta
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        if uk {
-            "Поточний корінь буде збережено як @.rollback-…"
-        } else {
-            "Your current root is kept as @.rollback-…"
-        },
+        t(lang, "rb.your_current_root_is_kept"),
         theme::dim(),
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("[y] ", theme::accent()),
-        Span::styled(
-            if uk {
-                "так, відкотити     "
-            } else {
-                "yes, roll back     "
-            },
-            theme::normal(),
-        ),
+        Span::styled(t(lang, "rb.yes_roll_back"), theme::normal()),
         Span::styled("[n] ", theme::accent()),
-        Span::styled(if uk { "скасувати" } else { "cancel" }, theme::normal()),
+        Span::styled(t(lang, "rb.cancel"), theme::normal()),
     ]));
 
     let h = lines.len() as u16 + 5;
@@ -970,101 +828,60 @@ fn draw_confirm(f: &mut Frame, uk: bool, snaps: &[Snapshot], state: &mut ListSta
         area,
         64,
         h,
-        if uk {
-            "Підтвердження"
-        } else {
-            "Confirm"
-        },
+        &t(lang, "rb.confirm"),
         theme::border(),
         theme::title(),
     );
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_working(f: &mut Frame, uk: bool, area: Rect) {
+fn draw_working(f: &mut Frame, lang: Lang, area: Rect) {
     let inner = modal(
         f,
         area,
         34,
         5,
-        if uk { "Працюю" } else { "Working" },
+        &t(lang, "rb.working_2"),
         theme::border(),
         theme::title(),
     );
     f.render_widget(
-        Paragraph::new(if uk {
-            "Виконую відкат…"
-        } else {
-            "Rolling back…"
-        })
-        .style(theme::normal())
-        .alignment(Alignment::Center),
+        Paragraph::new(t(lang, "rb.rolling_back"))
+            .style(theme::normal())
+            .alignment(Alignment::Center),
         inner,
     );
 }
 
-fn draw_done(f: &mut Frame, uk: bool, initramfs: bool, area: Rect) {
+fn draw_done(f: &mut Frame, lang: Lang, initramfs: bool, area: Rect) {
     let lines = if initramfs {
         vec![
-            Line::from(Span::styled(
-                if uk {
-                    "Відкат виконано."
-                } else {
-                    "Rollback complete."
-                },
-                theme::ok(),
-            )),
+            Line::from(Span::styled(t(lang, "rb.rollback_complete"), theme::ok())),
             Line::from(""),
             Line::from(Span::styled(
-                if uk {
-                    "Перезавантаження у відновлену систему…"
-                } else {
-                    "Rebooting into the restored system…"
-                },
+                t(lang, "rb.rebooting_into_the_restored_system"),
                 theme::dim(),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                if uk {
-                    "(якщо не перезавантажилось — натисніть Enter)"
-                } else {
-                    "(if it doesn't reboot, press Enter)"
-                },
+                t(lang, "rb.if_it_doesn_t_reboot"),
                 theme::mute(),
             )),
         ]
     } else {
         vec![
-            Line::from(Span::styled(
-                if uk {
-                    "Відкат виконано."
-                } else {
-                    "Rollback complete."
-                },
-                theme::ok(),
-            )),
+            Line::from(Span::styled(t(lang, "rb.rollback_complete_2"), theme::ok())),
             Line::from(""),
             Line::from(Span::styled(
-                if uk {
-                    "Перезавантажте, щоб увійти у відновлений стан."
-                } else {
-                    "Reboot to enter the restored state."
-                },
+                t(lang, "rb.reboot_to_enter_the_restored"),
                 theme::dim(),
             )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("[r] ", theme::accent()),
-                Span::styled(
-                    if uk {
-                        "перезавантажити     "
-                    } else {
-                        "reboot now     "
-                    },
-                    theme::normal(),
-                ),
+                Span::styled(t(lang, "rb.reboot_now"), theme::normal()),
                 Span::styled("[q] ", theme::accent()),
-                Span::styled(if uk { "вийти" } else { "quit" }, theme::normal()),
+                Span::styled(t(lang, "rb.quit"), theme::normal()),
             ]),
         ]
     };
@@ -1074,43 +891,28 @@ fn draw_done(f: &mut Frame, uk: bool, initramfs: bool, area: Rect) {
         area,
         56,
         h,
-        if uk { "Готово" } else { "Done" },
+        &t(lang, "rb.done"),
         theme::border(),
         theme::title(),
     );
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_error(f: &mut Frame, uk: bool, e: &str, initramfs: bool, area: Rect) {
+fn draw_error(f: &mut Frame, lang: Lang, e: &str, initramfs: bool, area: Rect) {
     let mut lines = vec![
-        Line::from(Span::styled(
-            if uk {
-                "Не вдалося виконати відкат:"
-            } else {
-                "Rollback failed:"
-            },
-            theme::warn(),
-        )),
+        Line::from(Span::styled(t(lang, "rb.rollback_failed_2"), theme::warn())),
         Line::from(""),
         Line::from(Span::styled(e.to_string(), theme::dim())),
         Line::from(""),
     ];
     if initramfs {
         lines.push(Line::from(Span::styled(
-            if uk {
-                "Завантажтесь із live-USB і відновіть систему звідти. Enter — назад."
-            } else {
-                "Boot from a live-USB and recover from there. Enter — back."
-            },
+            t(lang, "rb.boot_from_a_live_usb_2"),
             theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            if uk {
-                "Систему не змінено. Enter — повернутися."
-            } else {
-                "The system was not changed. Enter — back."
-            },
+            t(lang, "rb.the_system_was_not_changed"),
             theme::dim(),
         )));
     }
@@ -1120,7 +922,7 @@ fn draw_error(f: &mut Frame, uk: bool, e: &str, initramfs: bool, area: Rect) {
         area,
         66,
         h,
-        if uk { "Помилка" } else { "Error" },
+        &t(lang, "rb.error"),
         theme::warn(),
         theme::warn(),
     );

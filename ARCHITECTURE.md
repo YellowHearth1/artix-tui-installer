@@ -94,8 +94,10 @@ assert!(t.contains("groupadd -f log"));
 `src/system/install/scripts.rs`. Скрипти — POSIX sh: перевір `dash -n`.
 
 **Додати екран** → новий `src/screens/файл.rs` (скопіюй найпростіший за
-зразок), варіант у `enum Screen` (`app.rs`), гілки в `event.rs` та роутері
-draw. Модалки — не забудь `any_modal_open()`.
+зразок), варіант у `enum Screen` (`app.rs`), один запис у таблиці `step()`
+(`screens/mod.rs`) — там усе: draw, клавіші, tick, підказка. Match без
+catch-all, тож незареєстрований екран — помилка компіляції, а не мовчазна
+діра. Модалки — не забудь `any_modal_open()` у `event.rs`.
 
 **Додати завантажувач** → `ORDER` у `src/screens/options.rs`, гілка в
 `match c.bootloader` у `install/mod.rs`, i18n-підказка, README.

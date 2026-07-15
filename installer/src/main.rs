@@ -26,7 +26,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use i18n::t;
+use i18n::{t, Lang};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::Style,
@@ -244,11 +244,7 @@ fn run_interactive_step(
             let _ = writeln!(
                 out,
                 "\n>> {}",
-                if uk {
-                    "Виходжу. Відмонтовую встановлену систему…"
-                } else {
-                    "Leaving. Unmounting the installed system…"
-                }
+                t(app.lang, "ui.leaving_unmounting_the_installed_system")
             );
             let _ = out.flush();
         }
@@ -271,13 +267,7 @@ fn run_interactive_step(
                 let _ = write!(
                     out,
                     "\r{}",
-                    if uk {
-                        format!(
-                            "Перезавантаження через {n} с — будь-яка клавіша, щоб скасувати…   "
-                        )
-                    } else {
-                        format!("Rebooting in {n} s — press any key to cancel…   ")
-                    }
+                    t(app.lang, "ui.reboot_countdown").replace("{n}", &n.to_string())
                 );
                 let _ = out.flush();
             }
@@ -296,11 +286,7 @@ fn run_interactive_step(
             let _ = writeln!(
                 out,
                 ">> {}",
-                if uk {
-                    "Скасовано — повертаюся в меню."
-                } else {
-                    "Cancelled — returning to the menu."
-                }
+                t(app.lang, "ui.cancelled_returning_to_the_menu")
             );
             let _ = out.flush();
             // Back to the TUI (mode chooser).
@@ -309,15 +295,7 @@ fn run_interactive_step(
             terminal.clear()?;
             return Ok(());
         }
-        let _ = writeln!(
-            out,
-            ">> {}",
-            if uk {
-                "Перезавантаження…"
-            } else {
-                "Rebooting…"
-            }
-        );
+        let _ = writeln!(out, ">> {}", t(app.lang, "ui.rebooting"));
         let _ = out.flush();
         let _ = Command::new("reboot").status();
         app.should_quit = true;
@@ -410,24 +388,41 @@ fn draw(f: &mut Frame, app: &mut App) {
 /// dependency-free (the language may not be chosen yet, and on a tiny screen
 /// showing both is friendlier). Vertically centered; the background is already
 /// painted by the caller.
+/// Deliberately shows BOTH languages at once.
+///
+/// This is the one screen that can appear before the user has chosen a
+/// language — and it appears precisely when the terminal is too small to render
+/// the language picker. Guessing wrong here would leave someone staring at a
+/// message they can't read, with no way to reach the screen that would let them
+/// change it. So it doesn't guess: both lines are drawn, every time. The strings
+/// still live in the TOMLs, so a third language means editing translations, not
+/// this function.
 fn draw_too_small(f: &mut Frame, area: Rect) {
     let pad = area.height.saturating_sub(6) / 2;
     let mut lines: Vec<Line> = (0..pad).map(|_| Line::from("")).collect();
     lines.push(Line::from(Span::styled(
-        "⚠  Замале вікно · Terminal too small",
+        format!(
+            "⚠  {} · {}",
+            t(Lang::Uk, "ui.too_small"),
+            t(Lang::En, "ui.too_small")
+        ),
         theme::warn(),
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!(
-            "{}×{}  →  потрібно ≥ {}×{}",
-            area.width, area.height, MIN_COLS, MIN_ROWS
+            "{}×{}  →  {} {}×{}",
+            area.width,
+            area.height,
+            t(Lang::Uk, "ui.need_at_least"),
+            MIN_COLS,
+            MIN_ROWS
         ),
         theme::dim(),
     )));
     lines.push(Line::from(""));
-    lines.push(Line::from("Збільшіть вікно або зменшіть шрифт"));
-    lines.push(Line::from("Enlarge the window or reduce the font size"));
+    lines.push(Line::from(t(Lang::Uk, "ui.enlarge_window")));
+    lines.push(Line::from(t(Lang::En, "ui.enlarge_window")));
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
@@ -577,4 +572,92 @@ fn screen_title(app: &App) -> String {
         app.screen.step_number(),
         t(app.lang, key)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// No user-facing string may be hardcoded in Rust.
+    ///
+    /// The project has a full i18n layer — and it used to have a SECOND,
+    /// parallel one living in the source: `if uk { "…" } else { "…" }`, 45 of
+    /// them. Two mechanisms for one job. A third language would have meant
+    /// editing the TOMLs *and* hunting every `if uk` in the code; the CI parity
+    /// check only ever saw the TOMLs, so the two could drift apart silently.
+    ///
+    /// This test is the guard that keeps the debt from growing back. It scans
+    /// the source for Cyrillic text outside the translation files — a
+    /// hardcoded Ukrainian string is the fingerprint of a translation that
+    /// skipped the i18n layer.
+    ///
+    /// The exceptions are deliberate and few:
+    ///   * `system/install/scripts.rs` — shell scripts that run on the INSTALLED
+    ///     system, outside this binary. They carry their own `msg "en" "uk"`
+    ///     helper; Rust's i18n isn't reachable from a POSIX shell.
+    ///   * comments and doc comments — those are for whoever reads the code.
+    #[test]
+    fn no_ui_string_is_hardcoded_outside_the_translation_files() {
+        fn cyrillic_run(line: &str) -> bool {
+            // Four Cyrillic letters in a row is a WORD. Fewer than that catches
+            // box-drawing characters and arrows, which are not translations.
+            let mut run = 0;
+            for c in line.chars() {
+                if ('\u{0400}'..='\u{04FF}').contains(&c) {
+                    run += 1;
+                    if run >= 4 {
+                        return true;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            false
+        }
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let p = path.to_string_lossy().replace('\\', "/");
+                // The shell scripts translate themselves — see above.
+                if p.ends_with("system/install/scripts.rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in src.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    // Comments are for the reader of the code, not the user.
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    // Only string literals matter.
+                    if !line.contains('"') {
+                        continue;
+                    }
+                    if cyrillic_run(line) {
+                        offenders.push(format!("{p}:{}: {}", n + 1, trimmed.trim()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "hardcoded UI strings — these belong in i18n/*.toml, reached with \
+             t(lang, \"key\"):\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 }

@@ -66,6 +66,26 @@ fn uk() -> &'static HashMap<String, String> {
     UK.get_or_init(|| table("uk").unwrap_or_default())
 }
 
+impl Lang {
+    /// The language the surrounding system is set to.
+    ///
+    /// Used by the rollback tool, which runs on the INSTALLED system (from a
+    /// terminal, or from an initramfs hook during early boot) rather than
+    /// inside the installer, so there's no App to carry the choice — the
+    /// environment is all there is.
+    pub fn from_env() -> Self {
+        let v = std::env::var("LANG")
+            .or_else(|_| std::env::var("LC_MESSAGES"))
+            .or_else(|_| std::env::var("LC_ALL"))
+            .unwrap_or_default();
+        if v.to_lowercase().starts_with("uk") {
+            Lang::Uk
+        } else {
+            Lang::En
+        }
+    }
+}
+
 /// Translate `key` for `lang`. Falls back en -> key.
 pub fn t(lang: Lang, key: &str) -> String {
     let primary = match lang {
@@ -79,4 +99,63 @@ pub fn t(lang: Lang, key: &str) -> String {
         return v.clone();
     }
     key.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn keys(lang: Lang) -> HashSet<String> {
+        match lang {
+            Lang::En => en(),
+            Lang::Uk => uk(),
+        }
+        .keys()
+        .cloned()
+        .collect()
+    }
+
+    /// Both translations define exactly the same keys. A key in one and not the
+    /// other renders as the raw identifier on screen — in the language whoever
+    /// wrote it probably doesn't read.
+    #[test]
+    fn the_two_translations_define_the_same_keys() {
+        let (u, e) = (keys(Lang::Uk), keys(Lang::En));
+
+        let missing_en: Vec<_> = u.difference(&e).collect();
+        assert!(
+            missing_en.is_empty(),
+            "keys present in uk.toml but missing from en.toml: {missing_en:?}"
+        );
+
+        let missing_uk: Vec<_> = e.difference(&u).collect();
+        assert!(
+            missing_uk.is_empty(),
+            "keys present in en.toml but missing from uk.toml: {missing_uk:?}"
+        );
+    }
+
+    /// No translation is left as an empty string — an empty value renders as a
+    /// blank label, which reads as a broken screen rather than a missing string.
+    #[test]
+    fn no_translation_is_empty() {
+        for lang in [Lang::Uk, Lang::En] {
+            let table = match lang {
+                Lang::En => en(),
+                Lang::Uk => uk(),
+            };
+            for (k, v) in table {
+                assert!(!v.trim().is_empty(), "{lang:?}: '{k}' is empty");
+            }
+        }
+    }
+
+    /// A missing key falls back to the key itself rather than panicking — but
+    /// that fallback must stay a LAST resort, not a habit. See the
+    /// no_hardcoded_ui_strings test in main.rs.
+    #[test]
+    fn a_missing_key_falls_back_to_the_key() {
+        assert_eq!(t(Lang::Uk, "no.such.key"), "no.such.key");
+    }
 }

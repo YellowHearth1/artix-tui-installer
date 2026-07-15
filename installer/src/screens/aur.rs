@@ -201,16 +201,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     } else {
         app.aur_popular.len()
     };
+    if super::nav::move_cursor(key.code, &mut app.aur_cursor, active_len) {
+        return;
+    }
     match key.code {
-        KeyCode::Up => app.aur_cursor = app.aur_cursor.saturating_sub(1),
-        KeyCode::Down => app.aur_cursor = (app.aur_cursor + 1).min(active_len.saturating_sub(1)),
-        // Page jumps and edge snaps for the AUR list.
-        KeyCode::PageDown => {
-            app.aur_cursor = (app.aur_cursor + 10).min(active_len.saturating_sub(1))
-        }
-        KeyCode::PageUp => app.aur_cursor = app.aur_cursor.saturating_sub(10),
-        KeyCode::End => app.aur_cursor = active_len.saturating_sub(1),
-        KeyCode::Home => app.aur_cursor = 0,
         // Space toggles the highlighted AUR package in/out of the selection.
         KeyCode::Char(' ') => {
             let picked = if typing {
