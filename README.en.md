@@ -152,6 +152,16 @@ segmented toggles, and a live scrollable install log.
   partitions** will be destroyed, and requires an explicit Enter. Formatting never
   begins without this second confirmation, making it much harder to wipe the wrong
   disk by accident.
+- **🚫 Excluded mirrors never reach your system** — they are deleted from the
+  lists **entirely and unconditionally**: never probed, never ranked, not even
+  left commented out, and absent from the backup copy of the list. This is not
+  an option and does not depend on the optimisation toggle below — the Artix
+  list is cleaned before `basestrap`, and the Arch, Chaotic-AUR and
+  already-installed system's lists are cleaned inside the chroot, so no package
+  can come from an excluded source during the install or after it. Exclusion is
+  decided both by the country section a server is filed under and by the
+  hostname itself, since some of these mirrors sit on domains that give nothing
+  away.
 - **🪞 Fast, resilient mirrors** — right before packages are installed the
   installer health-checks **every** mirror in each list (Artix, Arch and
   Chaotic-AUR), active and commented-out alike: 12 probes in parallel, 6 s cap

@@ -239,21 +239,32 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     //      • cryptsetup  — LUKS open/format/addkey (only when encrypting)
     //    --needed makes this a no-op on this distro's own ISO (already there);
     //    -Sy refreshes first so a stale live db doesn't cause "target not found".
-    // 0a) Optionally rebuild the pacman mirrorlists BEFORE anything downloads:
-    //     the optimizer probes EVERY mirror in the list (12 in parallel, 6s cap
-    //     each), writes the reachable ones fastest-first and comments the dead
-    //     or crawling ones out. Doing it up front means host-tools, basestrap
-    //     and every later pacman call only ever see mirrors that answered
-    //     seconds ago — a server that degraded since the ISO was built can no
-    //     longer stall the install. Best-effort throughout (see the script).
-    if c.optimize_mirrors {
+    // 0a) Rewrite the pacman mirrorlist BEFORE anything downloads. Two halves:
+    //
+    //     PURGE — excluded mirrors are deleted from the list. This runs
+    //     ALWAYS, even when the user declined mirror optimization: the stock
+    //     Artix list ships excluded mirrors *active* (not commented), so
+    //     gating this behind the checkbox meant basestrap could pull packages
+    //     straight from one. Not a preference — no network needed, no opt-out.
+    //
+    //     RANK (`optimize_mirrors`) — probe EVERY remaining mirror (12 in
+    //     parallel, 6s cap each), write the reachable ones fastest-first and
+    //     comment the dead or crawling ones out. Doing it up front means
+    //     host-tools, basestrap and every later pacman call only ever see
+    //     mirrors that answered seconds ago — a server that degraded since the
+    //     ISO was built can no longer stall the install. Best-effort.
+    {
         // Quoted heredoc keeps the script's $@/$1/`cmd`/$() literal on write.
         let write_cmd = format!(
             "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF",
             MIRROR_OPTIMIZE_SCRIPT
         );
         plan.push(act("sh", &["-c", &write_cmd]));
-        plan.push(act("sh", &["/tmp/optmirrors.sh"]));
+        let mut args = vec!["/tmp/optmirrors.sh"];
+        if !c.optimize_mirrors {
+            args.push("--no-rank");
+        }
+        plan.push(act("sh", &args));
     }
 
     let mut host_tools: Vec<&str> =
@@ -686,33 +697,42 @@ pub fn build_plan(app: &App) -> Vec<Action> {
              fi; \
              true",
         ));
-        // Apply the same mirror treatment to the chaotic-mirrorlist (full
-        // health check, fastest-first), inside the chroot where it lives.
+        // Apply the same treatment to the chaotic-mirrorlist inside the chroot
+        // where it lives: purge always, rank when asked. Chaotic's list has no
+        // country sections, so the purge leans on the hostname net there.
         //
         // IMPORTANT: artix-chroot (like arch-chroot) runs each invocation in its
         // own unshare namespace with a FRESH tmpfs on /tmp, so a file written by
         // one chroot call is GONE in the next. We therefore WRITE the script and
         // RUN it in a SINGLE chroot call, so both see the same /tmp. Best-effort.
-        if c.optimize_mirrors {
+        {
+            let flag = if c.optimize_mirrors { "" } else { " --no-rank" };
             let combined = format!(
                 "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-                 sh /tmp/optmirrors.sh --chaotic",
-                MIRROR_OPTIMIZE_SCRIPT
+                 sh /tmp/optmirrors.sh --chaotic{}",
+                MIRROR_OPTIMIZE_SCRIPT, flag
             );
             plan.push(chroot(&combined));
         }
     }
 
-    // Optimize the Arch mirrorlist (extra/multilib) the same way — full
-    // health check, fastest-first — in the chroot, where
-    // /etc/pacman.d/mirrorlist-arch exists (it's absent on the live ISO, so it
-    // can't be ranked earlier). Single chroot call (each gets a fresh /tmp).
-    // Runs before Phase 2 so those package downloads use the better mirrors.
-    if c.optimize_mirrors {
+    // Same treatment for the Arch mirrorlist (extra/multilib) in the chroot,
+    // where /etc/pacman.d/mirrorlist-arch exists (it's absent on the live ISO,
+    // so it can't be handled earlier). Single chroot call (each gets a fresh
+    // /tmp). Runs before Phase 2 so those package downloads use good mirrors.
+    //
+    // The TARGET's own Artix list gets a purge-only pass in the same call.
+    // basestrap copies the (already purged) live list across, but installing
+    // artix-mirrorlist can drop a fresh stock list — carrying excluded mirrors
+    // — into the new system, where it would outlive the install. Purge-only:
+    // no re-probing, so it costs nothing when the list is already clean.
+    {
+        let flag = if c.optimize_mirrors { "" } else { " --no-rank" };
         let combined = format!(
             "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-             sh /tmp/optmirrors.sh --arch",
-            MIRROR_OPTIMIZE_SCRIPT
+             sh /tmp/optmirrors.sh --arch{}\n\
+             sh /tmp/optmirrors.sh --no-rank",
+            MIRROR_OPTIMIZE_SCRIPT, flag
         );
         plan.push(chroot(&combined));
     }
@@ -4743,6 +4763,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The mirror script is valid POSIX sh in every mode. It runs on the live
+    /// ISO and in the chroot as an inline string, so shellcheck never sees it.
+    #[test]
+    fn mirror_script_is_valid_posix_sh() {
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", MIRROR_OPTIMIZE_SCRIPT])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "mirror script is not valid sh:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// No excluded mirror may survive into the candidate list — not active, not
+    /// commented out, not as a backup file.
+    ///
+    /// The fixture mirrors how the real lists are actually written, because
+    /// that is where a hostname-only filter failed: Arch groups servers under
+    /// `## Country`, Artix under `# Country` beneath a `## Continent`, and 10
+    /// of the 27 servers in the Arch list's excluded section sit on hostnames
+    /// that give nothing away (`.gay`, `.lol`, `.me`, `.su`). The candidate
+    /// scan harvests commented-out servers on purpose, so those would have been
+    /// promoted into the *active* list. Artix ships two of them uncommented.
+    #[test]
+    fn no_excluded_mirror_survives_the_purge() {
+        let list = "\
+## Arch-style list
+## Germany
+#Server = https://mirror.example.de/archlinux/$repo/os/$arch
+Server = https://active.example.de/archlinux/$repo/os/$arch
+## Russia
+#Server = http://archlinux.gay/archlinux/$repo/os/$arch
+#Server = https://mirror.murmellow.lol/archlinux/$repo/os/$arch
+#Server = http://repository.su/archlinux/$repo/os/$arch
+#Server = https://ru.mirrors.cicku.me/archlinux/$repo/os/$arch
+#Server = http://vlst.su/archlinux/$repo/os/$arch
+#Server = https://mirror.kpfu.ru/archlinux/$repo/os/$arch
+Server = https://active-under-header.example/archlinux/$repo/os/$arch
+## Serbia
+#Server = https://mirror.example.rs/archlinux/$repo/os/$arch
+## Kazakhstan
+#Server = http://mirror.linxhost.ru/$repo/os/$arch
+## Europe
+# Russia
+Server = https://mirror.infirium.ru/artixlinux/$repo/os/$arch
+Server = https://mirrors.yuruyuri.fun/artix-linux/repos/$repo/os/$arch
+# Singapore
+Server = https://mirror.freedif.org/artix/$repo/os/$arch
+# Chaotic-style, no country sections at all
+Server = https://ru-mirror.chaotic.cx/$repo/$arch
+Server = https://ru2-mirror.chaotic.cx/$repo/$arch
+Server = https://cdn-mirror.chaotic.cx/$repo/$arch
+Server = https://host.example.ru:8443/$repo/os/$arch
+Server = https://host.example.ru
+";
+        // Run the real filter out of the shipped script, not a copy of it.
+        let body = MIRROR_OPTIMIZE_SCRIPT
+            .split_once("strip_excluded() {")
+            .expect("script defines strip_excluded")
+            .1;
+        let body = body.split_once("\n}\n").expect("function is closed").0;
+        let prog = format!("strip_excluded() {{{body}\n}}\nstrip_excluded");
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &prog])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(list.as_bytes())
+                .expect("feed the list");
+        }
+        let out = child.wait_with_output().expect("collect output");
+        let kept = String::from_utf8_lossy(&out.stdout);
+
+        for host in [
+            "archlinux.gay",
+            "mirror.murmellow.lol",
+            "repository.su",
+            "ru.mirrors.cicku.me",
+            "vlst.su",
+            "mirror.kpfu.ru",
+            "active-under-header.example",
+            "mirror.linxhost.ru",
+            "mirror.infirium.ru",
+            "mirrors.yuruyuri.fun",
+            "ru-mirror.chaotic.cx",
+            "ru2-mirror.chaotic.cx",
+            "host.example.ru",
+            "Russia",
+        ] {
+            assert!(!kept.contains(host), "{host} survived the purge:\n{kept}");
+        }
+        // ...and the rest of the world is untouched.
+        for host in [
+            "mirror.example.de",
+            "active.example.de",
+            "mirror.example.rs",
+            "mirror.freedif.org",
+            "cdn-mirror.chaotic.cx",
+        ] {
+            assert!(kept.contains(host), "{host} was wrongly dropped:\n{kept}");
+        }
+    }
+
     /// Every wipe method emits shell a POSIX sh accepts. These run on the live
     /// ISO, where a syntax slip means the disk is silently NOT erased — and the
     /// scripts are inline strings, so shellcheck never sees them.
@@ -5511,6 +5644,28 @@ mod tests {
             m < b,
             "mirrors must be ranked BEFORE packages are downloaded"
         );
+    }
+
+    /// Declining mirror optimization declines the *ranking*, never the purge.
+    /// The stock lists ship excluded mirrors active, so when this was one
+    /// checkbox, unticking it left basestrap free to download from one — and
+    /// left the list that way in the installed system.
+    #[test]
+    fn the_purge_is_not_optional() {
+        let mut a = install_app();
+        a.config.optimize_mirrors = false;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("optmirrors"),
+            "the mirror script must run even when ranking is declined"
+        );
+        assert!(
+            t.contains("--no-rank"),
+            "declining optimization must skip the probes, not the purge"
+        );
+        let m = t.find("optmirrors").expect("script is planned");
+        let b = t.find("basestrap").expect("basestrap is planned");
+        assert!(m < b, "the purge must happen BEFORE anything downloads");
     }
 
     /// basestrap retries: a single stalled mirror used to abort the whole
