@@ -152,13 +152,16 @@ segmented toggles, and a live scrollable install log.
   partitions** will be destroyed, and requires an explicit Enter. Formatting never
   begins without this second confirmation, making it much harder to wipe the wrong
   disk by accident.
-- **🪞 Fast, resilient mirrors** — the 5 nearest countries (by your time zone)
-  are ranked by **real connection speed** and placed on top; **every other mirror
-  in the world stays active** below, nearer-first — none commented out, none
-  dropped. So if a fast mirror dies mid-download, pacman simply walks to the next
-  one (down to the main Artix mirror) instead of aborting the install. Russian
-  mirrors are excluded entirely. Plus an optional Chaotic-AUR repository with
-  prebuilt AUR binaries.
+- **🪞 Fast, resilient mirrors** — right before packages are installed the
+  installer health-checks **every** mirror in each list (Artix, Arch and
+  Chaotic-AUR), active and commented-out alike: 12 probes in parallel, 6 s cap
+  each. Live ones are rewritten **fastest response first**, dead or crawling
+  ones are commented out with a reason. No geographic or time-zone guessing —
+  the ranking comes from a real measurement. A mirror that dies mid-download can
+  no longer kill the whole transaction at 95 %: it simply isn't in the active
+  list. The original list is kept beside it as `*.bak-installer`, and if the
+  network is down and nothing answers, the list is left untouched. Plus an
+  optional Chaotic-AUR repository with prebuilt AUR binaries.
 - **📊 Live progress** — a streaming install log with scrollback (PgUp/PgDn,
   Home/End); after a failure, retry without losing any of your choices.
 - **🏁 Three ways to finish** — reboot, power off, or chroot straight into the new

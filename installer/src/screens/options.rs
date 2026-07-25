@@ -86,7 +86,7 @@ fn rows_for(app: &App) -> Vec<Row> {
         // Key-only USB mode needs NO passphrase from the user: a throwaway
         // secret is minted internally for setup and removed afterwards, so
         // the row disappears instead of demanding meaningless input.
-        if !(app.config.usb_key_only && !app.config.usb_key_device.is_empty()) {
+        if !app.config.usb_key_only || app.config.usb_key_device.is_empty() {
             v.push(Row::EncPass);
         }
     }

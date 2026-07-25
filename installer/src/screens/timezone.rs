@@ -1,5 +1,5 @@
 //! Step 2 — time zone. Full IANA list from chrono-tz with a live type-to-filter
-//! search box. Russian zones are excluded per spec.
+//! search box, minus the excluded zones.
 
 use crate::app::App;
 use crate::i18n::t;
@@ -15,17 +15,17 @@ use ratatui::{
 };
 use std::sync::OnceLock;
 
-/// Zones to drop entirely: the Russian Federation + Moscow, plus deprecated
-/// IANA aliases for Ukrainian zones. IANA keeps the old "Kiev" (Russian
-/// transliteration) and the collapsed "Uzhgorod"/"Zaporozhye" zones as aliases
-/// of Europe/Kyiv — we hide all of them and keep only the correct Europe/Kyiv.
+/// Zones to drop entirely, plus the deprecated IANA aliases for Ukrainian
+/// zones. IANA still keeps the old "Kiev" spelling and the collapsed
+/// "Uzhgorod"/"Zaporozhye" zones as aliases of Europe/Kyiv — we hide all of
+/// them and keep only the correct Europe/Kyiv.
 fn is_excluded(name: &str) -> bool {
     const BLOCKED: &[&str] = &[
         // Deprecated Ukrainian aliases — keep only Europe/Kyiv.
         "Europe/Kiev",
         "Europe/Uzhgorod",
         "Europe/Zaporozhye",
-        // Russian Federation.
+        // Excluded zones.
         "Europe/Moscow",
         "Europe/Kaliningrad",
         "Europe/Samara",

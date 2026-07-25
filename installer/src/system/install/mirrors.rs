@@ -43,9 +43,9 @@ command -v curl >/dev/null 2>&1 || {
   exit 0
 }
 
-# Project stance: excluded mirrors are removed entirely - section headers,
-# server lines, and the chaotic ru-mirror hostnames. Nothing tested, nothing
-# kept, nothing mentioned.
+# Excluded mirrors are removed entirely before anything is probed - section
+# headers, server lines, and the matching chaotic hostnames. Nothing tested,
+# nothing kept, nothing mentioned.
 strip_excluded() {
   awk '
     /[Rr]ussia/ { next }

@@ -65,7 +65,7 @@ fn note_key(app: &App) -> &'static str {
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let uefi = app.config.boot_mode.is_uefi();
-    app.can_advance = !(needs_uefi(app.cursor) && !uefi);
+    app.can_advance = !needs_uefi(app.cursor) || uefi;
 
     let mark = |sel: bool| if sel { "(\u{2022}) " } else { "( ) " };
     let style = |sel: bool| {

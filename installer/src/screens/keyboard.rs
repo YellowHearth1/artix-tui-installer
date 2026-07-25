@@ -1,6 +1,6 @@
 //! Step 4 — keyboard layouts. Multi-select from the console keymaps available
-//! on the live system (`localectl list-keymaps`), excluding Russian layouts and
-//! any whose code/description references Russia. First checked = primary.
+//! on the live system (`localectl list-keymaps`), minus the excluded codes.
+//! First checked = primary.
 
 use crate::app::App;
 use crate::i18n::t;
@@ -15,9 +15,10 @@ use ratatui::{
 };
 use std::sync::OnceLock;
 
-fn is_russian(code: &str) -> bool {
+/// Layout codes we never offer. Matches the console keymap spellings
+/// (`ru`, `ru-*`, `ruwin_*`, …) and the xkb short code.
+fn is_excluded_layout(code: &str) -> bool {
     let c = code.to_lowercase();
-    // console keymap codes like "ru", "ruwin_*", "russian"; xkb "ru"
     c == "ru"
         || c.starts_with("ru-")
         || c.starts_with("ru_")
@@ -61,7 +62,7 @@ fn keymaps() -> &'static Vec<String> {
         let available: Vec<String> = raw
             .lines()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && !is_russian(s))
+            .filter(|s| !s.is_empty() && !is_excluded_layout(s))
             .collect();
         let exists = |code: &str| -> bool {
             // If localectl gave us nothing (off-target), assume the curated code
@@ -70,16 +71,16 @@ fn keymaps() -> &'static Vec<String> {
         };
 
         let mut v: Vec<String> = Vec::new();
-        // 1) pinned, in order, skipping Russian and missing ones.
+        // 1) pinned, in order, skipping excluded and missing ones.
         for code in pinned {
-            if !is_russian(code) && exists(code) {
+            if !is_excluded_layout(code) && exists(code) {
                 v.push(code.to_string());
             }
         }
         // 2) common curated layouts, in the order listed (NOT alphabetized so the
         //    pinned ones stay on top), de-duplicated against pinned.
         for code in common {
-            if !is_russian(code) && exists(code) && !v.iter().any(|x| x == code) {
+            if !is_excluded_layout(code) && exists(code) && !v.iter().any(|x| x == code) {
                 v.push(code.to_string());
             }
         }
