@@ -55,6 +55,15 @@ struct Cand {
     fs_fixed: String, // detected fs for existing partitions
 }
 
+/// Is there anything for the extra-disks step to offer?
+///
+/// Nothing to show means nothing to decide, so the wizard walks past it rather
+/// than presenting an empty screen — which reads as a broken step, not an
+/// absent one. Common in manual mode once every drive has been given a role.
+pub(crate) fn has_candidates(app: &App) -> bool {
+    !candidates(app).is_empty()
+}
+
 /// Build the candidate rows, excluding the system disk, the USB key stick, the
 /// live ISO medium and pseudo devices. Empty disks become format rows; disks
 /// that already carry filesystems contribute their (non-ISO) partitions as
@@ -89,6 +98,13 @@ fn candidates(app: &App) -> Vec<Cand> {
             .iter()
             .filter(|p| p.parent == d.path && !p.fstype.eq_ignore_ascii_case("iso9660"))
             .collect();
+        // A blank disk the manual editor is carving is NOT spare storage. It has
+        // no partitions in the scan yet, so it would otherwise be offered here
+        // as a whole disk to wipe and mount — while the editor is planning to
+        // partition the very same drive.
+        if pof.is_empty() && manual_targets_disk(app, &d.path) {
+            continue;
+        }
         if pof.is_empty() {
             out.push(Cand {
                 dev: d.path.clone(),
@@ -108,6 +124,15 @@ fn candidates(app: &App) -> Vec<Cand> {
             });
         } else {
             for p in pof {
+                // A partition the manual editor already spoke for is NOT an
+                // extra disk. Without this, the root partition assigned in the
+                // editor turned up here as a candidate to format and mount
+                // somewhere else — two conflicting plans for one device, and
+                // whichever ran last would win. Same for one queued for
+                // deletion: the plan would delete it and then mount it.
+                if claimed_by_manual(app, &p.path) {
+                    continue;
+                }
                 let info = if p.label.is_empty() {
                     p.fstype.clone()
                 } else {
@@ -125,6 +150,54 @@ fn candidates(app: &App) -> Vec<Cand> {
         }
     }
     out
+}
+
+/// Is the manual partition editor going to put something on this DISK?
+///
+/// True when a new partition is planned there, or when one of its existing
+/// partitions already holds a role. Used to keep a drive the editor is working
+/// on out of the spare-storage list entirely.
+fn manual_targets_disk(app: &App, disk: &str) -> bool {
+    let c = &app.config;
+    if !c.partition_mode.is_manual_family() {
+        return false;
+    }
+    let planned_here = [
+        &c.manual_esp_disk,
+        &c.manual_root_disk,
+        &c.manual_swap_disk,
+        &c.manual_home_disk,
+        &c.manual_bios_disk,
+    ]
+    .into_iter()
+    .any(|d| !d.is_empty() && d == disk)
+        || c.manual_data_new.iter().any(|dp| dp.disk == disk);
+    planned_here
+        || parts_cached()
+            .iter()
+            .any(|p| p.parent == disk && claimed_by_manual(app, &p.path))
+}
+
+/// Has the manual partition editor already claimed this device?
+///
+/// A partition holding a role there (ESP, root, swap, /home, BIOS boot), or one
+/// queued for deletion, must not also be offered here as spare storage — the
+/// plan would otherwise be told to do two different things to it.
+fn claimed_by_manual(app: &App, dev: &str) -> bool {
+    let c = &app.config;
+    if !c.partition_mode.is_manual_family() {
+        return false;
+    }
+    [
+        &c.manual_esp,
+        &c.manual_root,
+        &c.manual_swap,
+        &c.manual_home,
+        &c.manual_bios,
+    ]
+    .into_iter()
+    .any(|claimed| !claimed.is_empty() && claimed == dev)
+        || c.manual_deleted.iter().any(|p| p.path == dev)
 }
 
 fn entry<'a>(app: &'a App, dev: &str) -> Option<&'a ExtraDisk> {
@@ -217,10 +290,29 @@ fn fs_pills(app: &App, c: &Cand) -> (Vec<String>, usize) {
 /// The mount-destination strip for a disk: skip, the user's home, /mnt, or a
 /// full custom path. The folder name is typed in the input line beneath the
 /// strip when a base needs one.
+/// The mount bases actually on offer for `dev`.
+///
+/// "The whole /home" disappears once /home is already spoken for — by the
+/// manual partition editor, or by another extra disk. There can only be one
+/// /home; offering a second just let the later mount quietly shadow the first.
+fn bases_for(app: &App, dev: &str) -> Vec<&'static str> {
+    let c = &app.config;
+    let home_taken = (c.partition_mode.is_manual_family() && !c.manual_home.is_empty())
+        || c.extra_disks
+            .iter()
+            .any(|e| e.disk != dev && e.mountpoint == "/home");
+    BASES
+        .iter()
+        .copied()
+        .filter(|b| *b != "homedisk" || !home_taken)
+        .collect()
+}
+
 fn base_pills(app: &App, c: &Cand) -> (Vec<String>, usize) {
-    let opts: Vec<String> = BASES.iter().map(|b| base_label(app, b)).collect();
+    let bases = bases_for(app, &c.dev);
+    let opts: Vec<String> = bases.iter().map(|b| base_label(app, b)).collect();
     let cur = cur_base(app, &c.dev);
-    let sel = BASES.iter().position(|b| *b == cur).unwrap_or(0);
+    let sel = bases.iter().position(|b| *b == cur).unwrap_or(0);
     (opts, sel)
 }
 fn base_label(app: &App, base: &str) -> String {
@@ -244,7 +336,23 @@ fn base_needs_name(base: &str) -> bool {
 /// Render a horizontal strip of choices, bracketing the selected one. The
 /// focused strip highlights its selection in bold; an unfocused strip still
 /// shows its selection (so every disk's current choice is visible at a glance).
-fn pill_line(options: &[String], selected: usize, focused: bool) -> Vec<Span<'static>> {
+fn pill_line(
+    options: &[String],
+    selected: usize,
+    focused: bool,
+    compact: bool,
+) -> Vec<Span<'static>> {
+    // Narrow panel: show ONLY the selected value (bracketed) — the full strip
+    // of 5–8 options would run off the edge. ←/→ still cycle it.
+    if compact {
+        let st = if focused {
+            theme::gold()
+        } else {
+            theme::accent()
+        };
+        let val = options.get(selected).cloned().unwrap_or_default();
+        return vec![Span::styled(format!("\u{2039} {val} \u{203a}"), st)];
+    }
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, opt) in options.iter().enumerate() {
         if i == selected {
@@ -318,8 +426,17 @@ fn entry_mut<'a>(app: &'a mut App, c: &Cand) -> &'a mut ExtraDisk {
 }
 
 fn cycle_base(app: &mut App, c: &Cand, dir: i32) {
+    // Step past any base that isn't on offer — otherwise ←/→ would still land
+    // on "the whole /home" even when /home is already spoken for, and the row
+    // would show a choice the picker no longer lists.
+    let allowed = bases_for(app, &c.dev);
     let e = entry_mut(app, c);
-    step_base(e, dir);
+    for _ in 0..BASES.len() {
+        step_base(e, dir);
+        if allowed.iter().any(|b| *b == e.mount_base) {
+            return;
+        }
+    }
 }
 
 /// Advance the mountpoint picker by one slot. Pure: it touches only the entry,
@@ -459,6 +576,10 @@ pub fn footer_hint(app: &App) -> String {
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let cands = candidates(app);
     app.can_advance = true; // additional storage is always optional
+                            // Narrow panel (an 80x24 console → ~59 cols): the 8-option filesystem strip
+                            // and the 5-option mount strip don't fit, so collapse them to the selected
+                            // value only. ←/→ still cycle (per the footer hint), and the value updates.
+    let compact = area.width < 74;
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -542,7 +663,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Span::styled(format!("{}  ", fs_label), theme::dim()),
             ];
-            fs_spans.extend(pill_line(&fs_opts, fs_sel, fs_here));
+            fs_spans.extend(pill_line(&fs_opts, fs_sel, fs_here, compact));
             if !fmt_opts(app, c).is_empty() {
                 fs_spans.push(Span::styled(
                     format!("  [o] {}", t(app.lang, "storage.btn_opts")),
@@ -567,7 +688,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::dim(),
                 ),
             ];
-            mp_spans.extend(pill_line(&base_opts, base_sel, mp_here));
+            mp_spans.extend(pill_line(&base_opts, base_sel, mp_here, compact));
             lines.push(Line::from(mp_spans));
 
             // Name input line — shown only when the chosen base needs a folder

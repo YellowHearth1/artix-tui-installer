@@ -266,6 +266,28 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 /// the UI can stay alive while nmcli does its thing, and gives up after a
 /// timeout instead of hanging forever.
 pub fn tick(app: &mut App) {
+    // A finished scan lands here. Empty result keeps the old list visible and
+    // says "retry" — better than blanking what the user was already reading.
+    if let Some(rx) = &app.wifi_scan_rx {
+        match rx.try_recv() {
+            Ok(nets) => {
+                app.wifi_scan_rx = None;
+                if nets.is_empty() {
+                    set_status(app, "wifi.retry_networks", true);
+                } else {
+                    app.wifi_networks = nets;
+                    app.cursor = app.cursor.min(app.wifi_networks.len() - 1);
+                    set_status(app, "", false);
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                app.wifi_scan_rx = None;
+                set_status(app, "wifi.retry_networks", true);
+            }
+        }
+    }
+
     // Nothing in flight → nothing to do.
     if app.wifi_connect_rx.is_none() {
         return;
@@ -452,28 +474,39 @@ fn nmcli_unescape(s: &str) -> String {
 /// screen stuck on "scanning…" forever. Deduplicates by SSID while keeping
 /// nmcli's signal-strength order (one network broadcast by several APs shows
 /// up once).
+/// Kick off a network scan in a worker thread; `tick()` collects the result.
+///
+/// `nmcli … --rescan yes` blocks for 5–15 seconds while the radio walks the
+/// channels. An earlier version ran it synchronously from the key handler and
+/// the whole TUI froze for the duration — spinner dead, keys dead, "looks
+/// crashed". Same architecture as `start_connect`: thread + channel + tick.
 fn scan(app: &mut App) {
-    let mut args = vec!["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", "yes"];
-    if !app.wifi_adapter.is_empty() {
-        args.push("ifname");
-        args.push(&app.wifi_adapter);
+    if app.wifi_scan_rx.is_some() {
+        return; // one scan at a time; Enter while scanning shouldn't stack them
     }
-    if let Ok(out) = crate::system::runner::capture("nmcli", &args) {
-        let mut seen = std::collections::HashSet::new();
-        let nets: Vec<String> = out
-            .lines()
-            .map(|s| nmcli_unescape(s.trim()))
-            .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-            .collect();
-        if nets.is_empty() {
-            set_status(app, "wifi.retry_networks", true);
-        } else {
-            set_status(app, "", false);
+    let adapter = app.wifi_adapter.clone();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    app.wifi_scan_rx = Some(rx);
+    set_status(app, "wifi.scanning", false);
+
+    std::thread::spawn(move || {
+        let mut args = vec!["-t", "-f", "SSID", "dev", "wifi", "list", "--rescan", "yes"];
+        if !adapter.is_empty() {
+            args.push("ifname");
+            args.push(&adapter);
         }
-        app.wifi_networks = nets;
-    } else {
-        set_status(app, "wifi.retry_networks", true);
-    }
+        let nets = match crate::system::runner::capture("nmcli", &args) {
+            Ok(out) => {
+                let mut seen = std::collections::HashSet::new();
+                out.lines()
+                    .map(|s| nmcli_unescape(s.trim()))
+                    .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        let _ = tx.send(nets);
+    });
 }
 
 /// Start a connection attempt in a background thread.
@@ -642,4 +675,69 @@ fn start_prereqs(app: &mut App) {
 
 pub fn footer_hint(app: &App) -> String {
     t(app.lang, "wifi.footer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    /// The scan must not run on the UI thread.
+    ///
+    /// `nmcli --rescan yes` blocks for 5–15 s; an earlier version called it
+    /// straight from the key handler and the whole TUI froze — dead spinner,
+    /// dead keys, "looks crashed". The contract now: starting a scan returns
+    /// immediately, leaves a receiver for `tick()` to poll, and shows the
+    /// "scanning…" status so the pause reads as work, not death.
+    #[test]
+    fn starting_a_scan_does_not_block_the_ui_thread() {
+        let mut app = App::new();
+        app.wifi_adapter = "wlan-test-0".into();
+
+        let t0 = std::time::Instant::now();
+        scan(&mut app);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "scan() must hand off to a worker, not wait for nmcli"
+        );
+        assert!(
+            app.wifi_scan_rx.is_some(),
+            "a receiver must be left for tick()"
+        );
+    }
+
+    /// A second Enter while a scan is in flight must not stack another one.
+    #[test]
+    fn a_running_scan_is_not_stacked() {
+        let mut app = App::new();
+        scan(&mut app);
+        let first = app.wifi_scan_rx.clone();
+        scan(&mut app);
+        assert!(
+            first
+                .as_ref()
+                .zip(app.wifi_scan_rx.as_ref())
+                .is_some_and(|(a, b)| a.same_channel(b)),
+            "the in-flight scan must be kept, not replaced"
+        );
+    }
+
+    /// tick() with a finished-but-empty scan keeps the old list on screen.
+    /// Blanking a list the user is reading, because a rescan came back empty,
+    /// trades information for nothing.
+    #[test]
+    fn an_empty_rescan_does_not_blank_the_visible_list() {
+        let mut app = App::new();
+        app.wifi_networks = vec!["OldNet".into()];
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        app.wifi_scan_rx = Some(rx);
+        tx.send(Vec::new()).unwrap();
+
+        tick(&mut app);
+        assert_eq!(app.wifi_networks, vec!["OldNet".to_string()]);
+        assert!(
+            app.wifi_scan_rx.is_none(),
+            "the finished scan must be reaped"
+        );
+    }
 }

@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Phase {
     Review,
     Installing,
@@ -60,24 +60,49 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Full-screen review: a tidy two-column list of choices and a confirm bar.
-fn draw_review(f: &mut Frame, app: &App, area: Rect) {
+fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .spacing(1)
         .split(area);
 
+    // The review list is ~25 lines; the panel on an 80x24 console fits ~11. This
+    // is the LAST screen before an irreversible install, so the rest must be
+    // reachable rather than silently cut off — ↑/↓ scroll, and the title grows
+    // arrows only when there is actually more to see.
+    let lines = summary_lines(app);
+    let total = lines.len() as u16;
+    let inner_h = rows[0].height.saturating_sub(2); // inside the borders
+    let max_scroll = total.saturating_sub(inner_h);
+    let scroll = app.summary_scroll.min(max_scroll);
+    app.summary_scroll = scroll; // clamp the stored offset so ↑/↓ never go dead
+
+    let title = if max_scroll > 0 {
+        let arrows = if scroll == 0 {
+            "\u{25bc}"
+        } else if scroll >= max_scroll {
+            "\u{25b2}"
+        } else {
+            "\u{25b2}\u{25bc}"
+        };
+        format!(" {}  {arrows} ", t(app.lang, "sum.review"))
+    } else {
+        format!(" {} ", t(app.lang, "sum.review"))
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border())
-        .title(format!(" {} ", t(app.lang, "sum.review")))
+        .title(title)
         .title_style(theme::title());
     let inner = block.inner(rows[0]);
     f.render_widget(block, rows[0]);
 
     f.render_widget(
-        Paragraph::new(summary_lines(app)).wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0)),
         inner,
     );
 
@@ -102,37 +127,211 @@ fn draw_review(f: &mut Frame, app: &App, area: Rect) {
 fn draw_confirm_format(f: &mut Frame, app: &App, area: Rect) {
     use ratatui::widgets::{Clear, Wrap};
 
-    let target = &app.config.disk;
-    // Details of the target disk for the human-readable summary.
-    let disk_line = crate::screens::disk::disks()
-        .iter()
-        .find(|d| &d.path == target)
-        .map(|d| format!("{}   {}   {}", d.path, d.size, d.model))
-        .unwrap_or_else(|| target.clone());
-
-    // Existing partitions on the target that will be erased (best-effort).
-    let victims: Vec<String> = crate::system::disk::list_partitions()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.parent == *target)
-        .map(|p| {
-            let label = if p.label.is_empty() {
-                String::new()
+    let manual = app.config.partition_mode.is_manual_family();
+    // Two different promises need two different confirmations. Auto: "this
+    // whole disk dies" — path, model, and every existing partition on it.
+    // Manual: "ONLY these partitions are touched" — each assignment with its
+    // fate spelled out, a reused ESP explicitly marked as kept.
+    let (disk_line, victims) = if manual {
+        let c = &app.config;
+        let will = t(app.lang, "sum.fmt_will");
+        // A partition the editor will CREATE gets a "(new)" tag, so a dual-boot
+        // user sees at a glance which entries are carved from free space versus
+        // which existing volumes are formatted or reused.
+        let newtag = |mib: u32| -> String {
+            if mib > 0 {
+                format!(" [{}]", t(app.lang, "parts.new_mark"))
             } else {
-                format!(" \"{}\"", p.label)
+                String::new()
+            }
+        };
+        // How big a created partition will be. Existing ones keep their size, so
+        // they say nothing here; a new one is the installer's decision and the
+        // user is about to authorise it, so it has to be on screen.
+        // `disk` is the drive the slot is carved from, so a rest-of-disk slot
+        // can be resolved to the bytes it will really receive. "Rest of the
+        // disk" in the LAST confirmation before an irreversible write tells the
+        // user nothing about how much they are about to commit.
+        let size = |mib: u32, on: &str| -> String {
+            match mib {
+                0 => String::new(), // existing partition — unchanged size
+                m if m == crate::app::MANUAL_REST => {
+                    let b = crate::screens::parts::rest_bytes(app, on);
+                    if b > 0 {
+                        format!("  {}", crate::system::disk::human_size(b))
+                    } else {
+                        format!("  {}", t(app.lang, "parts.size_rest"))
+                    }
+                }
+                m => format!(
+                    "  {}",
+                    crate::system::disk::human_size(m as u64 * 1024 * 1024)
+                ),
+            }
+        };
+        let fs = if c.manual_root_fs.is_empty() {
+            "ext4"
+        } else {
+            c.manual_root_fs.as_str()
+        };
+        let mut v = vec![format!(
+            "  {}{}{}  (/, {})  — {}",
+            c.manual_root,
+            newtag(c.manual_root_new_mib),
+            size(c.manual_root_new_mib, &c.manual_root_disk),
+            fs,
+            will
+        )];
+        if !c.manual_home.is_empty() {
+            let hfs = if c.manual_home_fs.is_empty() {
+                "ext4"
+            } else {
+                c.manual_home_fs.as_str()
             };
-            format!("  {}  {}  {}{}", p.path, p.size, p.fstype, label)
-        })
-        .collect();
+            v.push(format!(
+                "  {}{}{}  (/home, {})  — {}",
+                c.manual_home,
+                newtag(c.manual_home_new_mib),
+                size(c.manual_home_new_mib, &c.manual_home_disk),
+                hfs,
+                will
+            ));
+        }
+        if !c.manual_swap.is_empty() {
+            v.push(format!(
+                "  {}{}{}  (swap)  — {}",
+                c.manual_swap,
+                newtag(c.manual_swap_new_mib),
+                size(c.manual_swap_new_mib, &c.manual_swap_disk),
+                will
+            ));
+        }
+        // The ESP only exists under UEFI. Printing it unconditionally showed a
+        // phantom "(ESP)" line with no device on a legacy install.
+        if !c.manual_esp.is_empty() {
+            let esp_note = if c.manual_esp_format {
+                will.clone()
+            } else {
+                t(app.lang, "sum.fmt_keep")
+            };
+            v.push(format!(
+                "  {}{}{}  (ESP)  — {}",
+                c.manual_esp,
+                newtag(c.manual_esp_new_mib),
+                size(c.manual_esp_new_mib, &c.manual_esp_disk),
+                esp_note
+            ));
+        }
+        // The BIOS-boot partition was missing from this list entirely: a legacy
+        // install carved a partition the final confirmation never mentioned.
+        if !c.manual_bios.is_empty() {
+            v.push(format!(
+                "  {}{}{}  ({})  — {}",
+                c.manual_bios,
+                newtag(c.manual_bios_new_mib),
+                size(c.manual_bios_new_mib, &c.manual_bios_disk),
+                t(app.lang, "parts.biosboot"),
+                will
+            ));
+        }
+        // Extra-disk entries that will be FORMATTED — including the data
+        // partitions the editor creates (their mount config rides here). Each
+        // one is a device losing its contents, so the last confirmation before
+        // the irreversible write must name it; the mount-as-is entries preserve
+        // data and are left out to keep this list about what gets destroyed.
+        for e in c
+            .extra_disks
+            .iter()
+            .filter(|e| e.format && !e.mountpoint.is_empty())
+        {
+            // A planned data partition carries its size in `manual_data_new`;
+            // show it like every other partition being created — the user is
+            // authorising exactly this much space to be written.
+            let (newtag_e, size_e) = match c.manual_data_new.iter().find(|dp| dp.path == e.disk) {
+                Some(dp) => (
+                    format!(" [{}]", t(app.lang, "parts.new_mark")),
+                    size(dp.mib, &dp.disk),
+                ),
+                None => (String::new(), String::new()),
+            };
+            v.push(format!(
+                "  {}{}{}  ({}, {})  — {}",
+                e.disk, newtag_e, size_e, e.mountpoint, e.fs, will
+            ));
+        }
+        // Deletions go LAST and are named as such. They are the only entries
+        // here that destroy a partition outright rather than reformatting one,
+        // so the final confirmation must not let them hide among the mounts.
+        for dev in &c.manual_deleted {
+            v.push(format!(
+                "  {}  — {}",
+                dev.path,
+                t(app.lang, "parts.will_delete")
+            ));
+        }
+        // A full-disk WIPE erases the ENTIRE drive, not one partition — the most
+        // destructive act here. List it FIRST so it cannot be missed. (A disk
+        // erased "now" is already gone and left no mark, so only pending "later"
+        // wipes appear.)
+        let wlines: Vec<String> = c
+            .manual_wipe
+            .iter()
+            .filter(|w| crate::system::disk::wipe_applies(c, &w.disk))
+            .map(|w| {
+                format!(
+                    "  {}  — {} ({})",
+                    w.disk,
+                    t(app.lang, "parts.wipe_badge"),
+                    t(app.lang, &format!("parts.wipe_{}", w.method.id()))
+                )
+            })
+            .collect();
+        if !wlines.is_empty() {
+            v.splice(0..0, wlines);
+        }
+        (t(app.lang, "sum.pm_manual"), v)
+    } else {
+        let target = &app.config.disk;
+        // Details of the target disk for the human-readable summary.
+        let disk_line = crate::screens::disk::disks()
+            .iter()
+            .find(|d| &d.path == target)
+            .map(|d| format!("{}   {}   {}", d.path, d.size, d.model))
+            .unwrap_or_else(|| target.clone());
+
+        // Existing partitions on the target that will be erased (best-effort).
+        let victims: Vec<String> = crate::system::disk::list_partitions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.parent == *target)
+            .map(|p| {
+                let label = if p.label.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \"{}\"", p.label)
+                };
+                format!("  {}  {}  {}{}", p.path, p.size, p.fstype, label)
+            })
+            .collect();
+        (disk_line, victims)
+    };
 
     // Build the body as (text, style) pairs so we can both size it (from the
     // plain text) and render it, without reaching into Line internals.
-    let mut items: Vec<(String, Style)> = vec![(t(app.lang, "sum.fmt_intro"), theme::warn())];
+    let intro = if manual {
+        "sum.fmt_intro_manual"
+    } else {
+        "sum.fmt_intro"
+    };
+    let mut items: Vec<(String, Style)> = vec![(t(app.lang, intro), theme::warn())];
     items.push((String::new(), theme::normal()));
     items.push((format!("  {disk_line}"), theme::normal()));
     if !victims.is_empty() {
         items.push((String::new(), theme::normal()));
-        items.push((t(app.lang, "sum.fmt_partitions"), theme::dim()));
+        if !manual {
+            // The manual header line above already introduces the list.
+            items.push((t(app.lang, "sum.fmt_partitions"), theme::dim()));
+        }
         for v in &victims {
             items.push((v.clone(), theme::warn()));
         }
@@ -219,7 +418,14 @@ fn kv(k: &str, v: &str) -> Line<'static> {
 /// The set of summary lines, shared by review and the install-side panel.
 fn summary_lines(app: &App) -> Vec<Line<'static>> {
     let c = &app.config;
-    let swap = if c.swap_gib > 0 {
+    let swap = if c.partition_mode.is_manual_family() {
+        // Manual swap is a partition, not a size.
+        if c.manual_swap.is_empty() {
+            t(app.lang, "parts.none")
+        } else {
+            c.manual_swap.clone()
+        }
+    } else if c.swap_gib > 0 {
         format!("{} GiB", c.swap_gib)
     } else {
         "—".into()
@@ -293,10 +499,22 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
             },
         ),
         kv("GPU", &gpu_summary(&c.gpu)),
-        kv("Disk", &c.disk),
+        kv("Disk", &disk_review_value(app)),
         kv("Boot", c.boot_mode.label()),
         kv("Swap", &swap),
-        kv("Filesystem", &c.root_fs),
+        kv("Filesystem", {
+            // Manual keeps its fs choice in manual_root_fs; root_fs would show
+            // the stale default here.
+            if c.partition_mode.is_manual_family() {
+                if c.manual_root_fs.is_empty() {
+                    "ext4"
+                } else {
+                    c.manual_root_fs.as_str()
+                }
+            } else {
+                c.root_fs.as_str()
+            }
+        }),
         kv(
             "Encryption",
             &if c.encrypt_disk {
@@ -331,6 +549,21 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
                 },
             ),
         ),
+        // Dual boot: whether the installer will add the neighbouring OS to the
+        // boot menu. os-prober does it for GRUB; rEFInd detects it natively;
+        // Limine/EFISTUB can't, so say so plainly instead of implying it works.
+        kv("Dual boot", {
+            use crate::app::Bootloader;
+            if c.os_prober {
+                match c.bootloader {
+                    Bootloader::Grub => "detect other OS (os-prober)",
+                    Bootloader::Refind => "detect other OS (rEFInd auto)",
+                    _ => "other OS NOT auto-added (use GRUB/rEFInd)",
+                }
+            } else {
+                "—"
+            }
+        }),
         kv("Hostname", &c.hostname),
         kv("Accounts", &account),
         kv("Packages", &pkgs),
@@ -537,6 +770,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     // confirmation first. Formatting only begins after Enter there.
                     KeyCode::Enter => app.confirm_format_open = true,
                     KeyCode::Esc => app.goto_prev(),
+                    // Scroll the review list: on a short console it is taller
+                    // than the panel, and this is the last chance to read it.
+                    // (Over-scrolling is clamped to the real bottom at render.)
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.summary_scroll = app.summary_scroll.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.summary_scroll = app.summary_scroll.saturating_add(1)
+                    }
+                    KeyCode::PageUp => app.summary_scroll = app.summary_scroll.saturating_sub(10),
+                    KeyCode::PageDown => app.summary_scroll = app.summary_scroll.saturating_add(10),
                     _ => {}
                 }
             }
@@ -668,8 +912,14 @@ fn start_install(app: &mut App) {
     app.install_plan = install::build_plan(app);
     app.install_step = 0;
     app.install_phase = Phase::Installing;
+    app.install_auto_retries = 0;
+    app.install_retry_at = None;
     app.log.clear();
     app.log_follow = true;
+    // Time the run so every line in the LOG FILE carries how far into the
+    // install it happened. Set on a retry too — the clock should measure the
+    // attempt the log is recording, not the one that already failed.
+    app.install_started = Some(std::time::Instant::now());
     spawn_current(app);
 }
 
@@ -688,6 +938,8 @@ pub fn reset_for_retry(app: &mut App) {
     app.prompt_input.clear();
     app.prompt_text.clear();
     app.prompt_opened_at = None;
+    app.install_auto_retries = 0;
+    app.install_retry_at = None;
     app.log.clear();
     app.log_follow = true;
 }
@@ -762,28 +1014,94 @@ pub fn resume_after_interactive(app: &mut App) {
     spawn_current(app);
 }
 
-/// Called by the main loop when an interactive step failed. Halts the install.
+/// Called by the main loop when an interactive step failed. Routed through the
+/// same handler as a streamed failure so it, too, auto-retries a mirror storm.
 pub fn fail_after_interactive(app: &mut App, msg: String) {
+    handle_step_failure(app, msg);
+}
+
+/// How many times a single step may auto-retry a mirror/network failure before
+/// the install gives up and hands control back to the user. Per-step (reset on
+/// every success), so a long install that hits several separate blips keeps
+/// going, while a genuinely dead mirror set still stops instead of looping.
+const MAX_AUTO_RETRIES: u32 = 5;
+
+/// Whether a step's output looks like a transient DOWNLOAD failure — the only
+/// kind worth retrying unattended. A real error (a package conflict, a full
+/// disk, a bad checksum) must NOT match: retrying it just loops, and the user
+/// needs to see it. So this matches pacman/curl retrieval signatures only, and
+/// deliberately NOT "conflicting files" or "no space left".
+fn is_mirror_failure(lines: &[String]) -> bool {
+    lines.iter().any(|l| {
+        l.contains("failed to retrieve")
+            || l.contains("failed retrieving file")
+            || l.contains("too many errors from")
+            || l.contains("The requested URL returned error")
+            || l.contains("Could not resolve host")
+            || l.contains("Failed to connect")
+            || l.contains("Connection timed out")
+            || l.contains("Temporary failure in name resolution")
+    })
+}
+
+/// Escalating backoff before re-running a failed step: 15s, 30s, 45s, … The
+/// classic 404 storm is a sync DB gone stale against a moved-on pool; the retry
+/// re-runs the step, which re-runs its own `pacman -Syu` refresh, so a short
+/// wait is usually enough — but the wait grows so a slower mirror recovery
+/// still gets time without a fixed long stall.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(15 * attempt as u64)
+}
+
+/// The single failure handler for both streamed and interactive steps. Either
+/// schedules an unattended retry of THIS step (never the whole install — that
+/// would re-wipe the disk) or halts for the user.
+fn handle_step_failure(app: &mut App, msg: String) {
     app.push_log(format!("!! {msg}"));
-    app.install_phase = Phase::Failed;
     app.install_rx = None;
+    app.pty_writer = None;
+    app.prompt_active = false;
+
+    let this_step = app.log.get(app.install_step_log_start..).unwrap_or(&[]);
+    if is_mirror_failure(this_step) && app.install_auto_retries < MAX_AUTO_RETRIES {
+        app.install_auto_retries += 1;
+        let wait = retry_backoff(app.install_auto_retries);
+        app.install_retry_at = Some(std::time::Instant::now() + wait);
+        app.push_log(format!(
+            ">>> mirror/network failure — auto-retrying this step in {}s ({}/{}); no action needed",
+            wait.as_secs(),
+            app.install_auto_retries,
+            MAX_AUTO_RETRIES
+        ));
+        // Stay in Installing so `tick` keeps running and the backoff timer fires.
+        app.log_follow = true;
+        return;
+    }
+    if app.install_auto_retries >= MAX_AUTO_RETRIES {
+        app.push_log(format!(
+            "!! still failing after {MAX_AUTO_RETRIES} automatic retries — stopping. \
+             The mirrors may be down; check the network and press Enter to try again."
+        ));
+    }
+    app.install_phase = Phase::Failed;
 }
 
 fn spawn_current(app: &mut App) {
-    if let Some(Action {
-        program,
-        args,
-        interactive,
-    }) = app.install_plan.get(app.install_step).cloned()
-    {
-        // Echo the command into the log so the user sees what's running.
-        let shown = if args.len() > 4 && program == "artix-chroot" {
-            // artix-chroot /mnt sh -c '<script>' — show the script for clarity.
-            format!("$ chroot: {}", args.last().cloned().unwrap_or_default())
-        } else {
-            format!("$ {} {}", program, args.join(" "))
-        };
-        app.push_log(shown);
+    if let Some(action) = app.install_plan.get(app.install_step).cloned() {
+        let Action {
+            program,
+            args,
+            interactive,
+            ..
+        } = action.clone();
+        // Mark where this step's output begins, so a later failure is classified
+        // from THIS step's lines only — not an earlier step's 404 that was
+        // already retried past.
+        app.install_step_log_start = app.log.len();
+        // Echo the command into the log so the user sees what's running — via
+        // `log_line`, which is the ONLY place a plan step is turned into log
+        // text and therefore the only place a secret could escape into it.
+        app.push_log(action.log_line());
         if interactive {
             // Interactive: run under a PTY so pacman shows provider prompts. We
             // stay inside the TUI; output streams to the log, and when pacman
@@ -808,6 +1126,17 @@ fn spawn_current(app: &mut App) {
 /// halt on failure.
 pub fn tick(app: &mut App) {
     if app.install_phase != Phase::Installing {
+        return;
+    }
+    // Backoff between auto-retries of a failed step. While waiting there is no
+    // running child (install_rx is None), so this MUST come before the channel
+    // drain below — otherwise the empty-channel guard would return first and the
+    // timer would never fire.
+    if let Some(at) = app.install_retry_at {
+        if std::time::Instant::now() >= at {
+            app.install_retry_at = None;
+            spawn_current(app);
+        }
         return;
     }
     // 60-second auto-default: an unattended provider question must not stall
@@ -860,6 +1189,9 @@ pub fn tick(app: &mut App) {
             }
             LogLine::Done(Ok(())) => {
                 app.install_step += 1;
+                // This step succeeded, so the next one starts with a full retry
+                // budget — a blip earlier must not use up a later step's tries.
+                app.install_auto_retries = 0;
                 app.install_rx = None;
                 app.pty_writer = None;
                 app.prompt_active = false;
@@ -867,11 +1199,7 @@ pub fn tick(app: &mut App) {
                 return;
             }
             LogLine::Done(Err(e)) => {
-                app.push_log(format!("!! {e}"));
-                app.install_phase = Phase::Failed;
-                app.install_rx = None;
-                app.pty_writer = None;
-                app.prompt_active = false;
+                handle_step_failure(app, e);
                 return;
             }
         }
@@ -884,5 +1212,173 @@ pub fn footer_hint(app: &App) -> String {
         Phase::Installing => t(app.lang, "sum.footer_installing"),
         Phase::Failed => t(app.lang, "sum.footer_failed"),
         Phase::Succeeded => t(app.lang, "sum.footer_done"),
+    }
+}
+
+/// The "Disk" value in the review: the auto target, or the manual layout in
+/// one line — the review must never show an empty disk path just because the
+/// user brought their own partitions.
+fn disk_review_value(app: &App) -> String {
+    let c = &app.config;
+    if !c.partition_mode.is_manual_family() {
+        return c.disk.clone();
+    }
+    let fs = if c.manual_root_fs.is_empty() {
+        "ext4"
+    } else {
+        c.manual_root_fs.as_str()
+    };
+    let esp_note = if c.manual_esp_format {
+        t(app.lang, "sum.fmt_will")
+    } else {
+        t(app.lang, "sum.fmt_keep")
+    };
+    let mut v = format!(
+        "{}: / {} ({}) · ESP {} ({})",
+        t(app.lang, "sum.pm_manual_short"),
+        c.manual_root,
+        fs,
+        c.manual_esp,
+        esp_note
+    );
+    if !c.manual_swap.is_empty() {
+        v.push_str(&format!(" · swap {}", c.manual_swap));
+    }
+    if !c.manual_home.is_empty() {
+        v.push_str(&format!(" · /home {}", c.manual_home));
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    /// A step is failed with `msg`, its output already in the log window.
+    fn fail_with(app: &mut App, step_lines: &[&str], msg: &str) {
+        app.install_phase = Phase::Installing;
+        app.install_step_log_start = app.log.len();
+        for l in step_lines {
+            app.push_log((*l).to_string());
+        }
+        handle_step_failure(app, msg.to_string());
+    }
+
+    #[test]
+    fn a_download_failure_is_told_apart_from_a_real_error() {
+        // The 404 storm and its kin must match…
+        for l in [
+            "error: failed retrieving file 'xorg-server-21.1.21-2-x86_64.pkg.tar.zst' from mirror.x : The requested URL returned error: 404",
+            "warning: too many errors from mirror.nju.edu.cn, skipping for the remainder of this transaction",
+            "error: failed to commit transaction (failed to retrieve some files)",
+            "curl: (6) Could not resolve host: mirror.example.org",
+        ] {
+            assert!(is_mirror_failure(&[l.to_string()]), "missed a mirror failure:\n{l}");
+        }
+        // …and a genuine error must NOT, or auto-retry would loop on it forever.
+        for l in [
+            "error: failed to commit transaction (conflicting files)",
+            "lua54: /usr/bin/lua5.4 exists in filesystem (owned by lua)",
+            "mkfs.ext4: No space left on device",
+            "error: could not open file: invalid or corrupted package (PGP signature)",
+        ] {
+            assert!(
+                !is_mirror_failure(&[l.to_string()]),
+                "wrongly retryable:\n{l}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mirror_storm_auto_retries_this_step_without_the_user() {
+        let mut app = App::new();
+        fail_with(
+            &mut app,
+            &["error: failed to commit transaction (failed to retrieve some files)"],
+            "artix-chroot exited with 1",
+        );
+        // Scheduled a retry of THIS step, not a halt.
+        assert_eq!(app.install_auto_retries, 1);
+        assert!(app.install_retry_at.is_some(), "no retry was scheduled");
+        assert_eq!(
+            app.install_phase,
+            Phase::Installing,
+            "it halted instead of retrying"
+        );
+    }
+
+    #[test]
+    fn a_real_error_halts_for_the_user_instead_of_looping() {
+        let mut app = App::new();
+        fail_with(
+            &mut app,
+            &["error: failed to commit transaction (conflicting files)"],
+            "artix-chroot exited with 1",
+        );
+        assert_eq!(
+            app.install_auto_retries, 0,
+            "a non-network error must not consume a retry"
+        );
+        assert!(app.install_retry_at.is_none());
+        assert_eq!(app.install_phase, Phase::Failed);
+    }
+
+    #[test]
+    fn auto_retry_gives_up_after_the_cap_so_a_dead_mirror_set_still_stops() {
+        let mut app = App::new();
+        // Each attempt re-fails the same way. The cap must eventually halt.
+        for _ in 0..MAX_AUTO_RETRIES {
+            fail_with(
+                &mut app,
+                &["error: failed to retrieve some files"],
+                "exited with 1",
+            );
+            assert_eq!(app.install_phase, Phase::Installing, "gave up too early");
+            // The retry fired: clear the timer as tick would before re-running.
+            app.install_retry_at = None;
+        }
+        // One more failure past the budget: now it stops for the user.
+        fail_with(
+            &mut app,
+            &["error: failed to retrieve some files"],
+            "exited with 1",
+        );
+        assert_eq!(
+            app.install_phase,
+            Phase::Failed,
+            "it never stops — an infinite loop"
+        );
+        assert_eq!(app.install_auto_retries, MAX_AUTO_RETRIES);
+    }
+
+    #[test]
+    fn a_success_refills_the_retry_budget() {
+        // A blip on an early step must not starve a later step of its retries.
+        let mut app = App::new();
+        fail_with(
+            &mut app,
+            &["failed to retrieve some files"],
+            "exited with 1",
+        );
+        assert_eq!(app.install_auto_retries, 1);
+        // Simulate the step finally succeeding on retry (as tick's Done(Ok) does).
+        app.install_auto_retries = 0;
+        // A later step hits its own blip and still has the full budget.
+        fail_with(
+            &mut app,
+            &["failed to retrieve some files"],
+            "exited with 1",
+        );
+        assert_eq!(
+            app.install_auto_retries, 1,
+            "the budget did not refill after success"
+        );
+    }
+
+    #[test]
+    fn the_backoff_grows_with_each_attempt() {
+        assert!(retry_backoff(1) < retry_backoff(2));
+        assert!(retry_backoff(2) < retry_backoff(3));
     }
 }

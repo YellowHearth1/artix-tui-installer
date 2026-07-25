@@ -142,6 +142,36 @@ pub fn mount_and_detect(app: &mut App, parts: &[Partition]) {
         return;
     }
 
+    // 2a) btrfs: the installer puts the system in the `@` subvolume, so a bare
+    //     mount lands on the TOPLEVEL — a directory holding `@`, `@home`,
+    //     `.snapshots` and no /etc at all. Every step after that then fails in
+    //     the most confusing way possible: fstab "isn't there", the chroot
+    //     opens into a shell with no system in it, and the user reasonably
+    //     reports "the partitions wouldn't mount" (a real field report — the
+    //     person gave up and reinstalled). Detect the layout and remount the
+    //     actual root. Plain-btrfs installs (no `@`) are left as mounted.
+    let _ = run_shell(&format!(
+        "if [ -d /mnt/@ ] && [ ! -e /mnt/etc ]; then \
+           umount /mnt && mount -o subvol=@ {} /mnt; \
+         fi",
+        shquote(&root_dev)
+    ));
+
+    // 2a-guard) Whatever was mounted must LOOK like a Linux root. Failing loud
+    //     and early here beats every later step failing cryptically.
+    if run_shell("test -e /mnt/etc/fstab").is_err() {
+        let _ = run_shell("umount -R /mnt 2>/dev/null || true");
+        if app.recovery_unlock != 0 {
+            let _ = run_shell("cryptsetup close cryptroot 2>/dev/null || true");
+        }
+        app.recovery_status = format!(
+            "{} does not look like a Linux root (no /etc/fstab after mount) — \
+             wrong partition, or an unexpected btrfs layout.",
+            part.path
+        );
+        return;
+    }
+
     // 2b) Full-disk-encryption case: the installer puts an encrypted /boot on
     //     its own LUKS (mapper "cryptboot") and records it in the target's
     //     /etc/crypttab, unlocked by a keyfile that lives on the now-mounted

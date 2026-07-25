@@ -35,18 +35,34 @@ fn desc(app: &App, k: Kernel) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
+    app.can_advance = true;
+    // Three height tiers. Four bordered cards (3 rows each) + hint + the action
+    // box need ~16 rows; the real content panel on an 80x24 console is only ~15,
+    // so a bordered layout overflows and clips the [Enter] button. Fall back by
+    // height: roomy → 4-row cards with a package line; medium → 3-row cards;
+    // tight → one borderless line per kernel, which always fits.
+    let full = area.height >= 26;
+    let bordered = area.height >= 18;
+
+    if !bordered {
+        draw_tight(f, app, area);
+        return;
+    }
+
+    let card_h = if full { 4 } else { 3 };
+    let hint_h = if full { 2 } else { 1 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // hint
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(4),
+            Constraint::Length(hint_h),
+            Constraint::Length(card_h),
+            Constraint::Length(card_h),
+            Constraint::Length(card_h),
+            Constraint::Length(card_h),
             Constraint::Min(0),
             Constraint::Length(3), // actions
         ])
-        .spacing(1)
+        .spacing(if full { 1 } else { 0 })
         .split(area);
 
     widgets::hint_line(f, rows[0], &t(app.lang, "kern.hint"));
@@ -58,16 +74,20 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             (theme::border_dim(), theme::normal())
         };
-        let pkgs = k.packages().join(" ");
-        let card = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(if active { "▎ " } else { "  " }, theme::accent()),
-                Span::styled(label(app, *k), ts),
-                Span::styled(format!("   {}", desc(app, *k)), theme::dim()),
-            ]),
-            Line::from(Span::styled(format!("    {pkgs}"), theme::mute())),
-        ])
-        .block(
+        let mut lines = vec![Line::from(vec![
+            Span::styled(if active { "▎ " } else { "  " }, theme::accent()),
+            Span::styled(label(app, *k), ts),
+            Span::styled(format!("   {}", desc(app, *k)), theme::dim()),
+        ])];
+        // The package-names line only when there's vertical room for it.
+        if full {
+            let pkgs = k.packages().join(" ");
+            lines.push(Line::from(Span::styled(
+                format!("    {pkgs}"),
+                theme::mute(),
+            )));
+        }
+        let card = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -76,10 +96,50 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(card, rows[i + 1]);
     }
 
-    app.can_advance = true;
     widgets::action_row(
         f,
         rows[6],
+        &t(app.lang, "app.back"),
+        &t(app.lang, "app.next"),
+        true,
+    );
+}
+
+/// Very short panels (e.g. an 80x24 console → ~15 content rows): one borderless
+/// line per kernel. The active one is marked with the accent bar and highlight,
+/// exactly like the other list screens — no boxes, so nothing clips.
+fn draw_tight(f: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // hint
+            Constraint::Length(1), // spacer
+            Constraint::Min(0),    // list
+            Constraint::Length(3), // actions
+        ])
+        .split(area);
+
+    widgets::hint_line(f, rows[0], &t(app.lang, "kern.hint"));
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, k) in OPTIONS.iter().enumerate() {
+        let active = i == app.kernel_cursor;
+        let ts = if active {
+            theme::selected()
+        } else {
+            theme::normal()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if active { "▎ " } else { "  " }, theme::accent()),
+            Span::styled(label(app, *k), ts),
+            Span::styled(format!("   {}", desc(app, *k)), theme::dim()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), rows[2]);
+
+    widgets::action_row(
+        f,
+        rows[3],
         &t(app.lang, "app.back"),
         &t(app.lang, "app.next"),
         true,

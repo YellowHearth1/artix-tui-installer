@@ -44,3 +44,7 @@ installer/Cargo.lock
 uploaded/
 prev_backup/
 mockbin/
+
+# Робоча інструкція для Claude Code — локальна, у репозиторій не публікується.
+# Вона їде в тарболах розробки й описує внутрішню кухню, а не продукт.
+CLAUDE.md

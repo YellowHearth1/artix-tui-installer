@@ -8,6 +8,7 @@ use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
     text::{Line, Span},
     widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph},
     Frame,
@@ -90,10 +91,15 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let de_list = List::new(de_items)
         .block(de_block)
+        // The unfocused panel's cursor row must not be REPAINTED — a `mute()`
+        // highlight here greyed out whichever desktop the cursor last sat on,
+        // so a ticked Cinnamon looked dropped the moment focus moved to the
+        // login-screen list. No style at all: rows keep their own colours, and
+        // losing the ▎ bar is what says the panel isn't focused.
         .highlight_style(if de_panel_focused {
             theme::selected()
         } else {
-            theme::mute()
+            Style::default()
         })
         .highlight_symbol(if de_panel_focused { "▎ " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always);
@@ -134,10 +140,11 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let dm_list = List::new(dm_items)
         .block(dm_block)
+        // Mirror of the DE list above: never repaint the unfocused cursor row.
         .highlight_style(if !de_panel_focused {
             theme::selected()
         } else {
-            theme::mute()
+            Style::default()
         })
         .highlight_symbol(if !de_panel_focused { "▎ " } else { "  " })
         // Always reserve the highlight-symbol column so every row's [ ]/[✓] mark
@@ -360,14 +367,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // de_focus picks which list the cursor is in.
         KeyCode::Up | KeyCode::Char('k') => {
             if app.de_focus == 1 {
-                // In the DM list: cycle the login-manager choice, clamped at the
-                // top (no jump back to the DE list — use Esc/Enter to move).
+                // In the DM list: cycle the login-manager choice. At its TOP,
+                // step back up to the desktop list.
+                //
+                // That last part matters: Esc is the global "back a page" and
+                // Enter here advances, so without it the login-screen list is a
+                // one-way door — and since navigation now hands this step back
+                // the row you left it on (which IS this list), the desktop and
+                // seat pickers would be unreachable on every return visit.
+                // Walking UP cannot skip the seat modal: coming back DOWN is
+                // still Enter-only, and Enter on the desktop list opens it.
                 let i = DM_ORDER
                     .iter()
                     .position(|m| *m == app.config.display_manager)
                     .unwrap_or(0);
                 if i > 0 {
                     cycle_dm(app, false);
+                } else {
+                    app.de_focus = 0;
                 }
             } else {
                 app.cursor = app.cursor.saturating_sub(1);

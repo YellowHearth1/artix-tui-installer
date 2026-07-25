@@ -68,38 +68,67 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         app.user_focus = flds.len() - 1;
     }
 
-    // Build dynamic row constraints: mode selector (3) + each field (4) +
-    // status (min) + actions (3).
-    let mut constraints = vec![Constraint::Length(3)]; // mode
+    // A boxed field (label + 3-row bordered input) is 4 rows; the mode selector
+    // is a 3-row box; with spacing, even the 5-field default mode needs ~28 rows
+    // and the 7-field separate-root mode ~38. The content panel on any normal
+    // console (80x24 → ~15 rows, even 100x30 → ~21) is far smaller, so the boxed
+    // form clips its inputs into borderless stubs. Below a tall threshold, render
+    // each field as a single inline line with no spacing — the whole form fits.
+    let compact = area.height < 26;
+    let mode_h = if compact { 1 } else { 3 };
+    let field_h = if compact { 1 } else { 4 };
+
+    let mut constraints = vec![Constraint::Length(mode_h)]; // mode
     for fld in flds.iter().skip(1) {
         let _ = fld;
-        constraints.push(Constraint::Length(4));
+        constraints.push(Constraint::Length(field_h));
     }
     constraints.push(Constraint::Min(0)); // status
     constraints.push(Constraint::Length(3)); // actions
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .spacing(1)
+        .spacing(if compact { 0 } else { 1 })
         .split(area);
 
     let cur = flds[app.user_focus];
 
     // Row 0: mode selector (segmented over two lines is awkward; use a single
     // highlighted line showing the chosen mode + hint that ←→ changes it).
-    let mode_line = Line::from(vec![
-        Span::styled(format!("  {}  ", t(app.lang, "user.mode")), theme::dim()),
-        Span::styled(
-            format!("‹ {} ›", mode_label(app, mode(app))),
-            if cur == Field::Mode {
-                theme::selected()
-            } else {
-                theme::normal()
-            },
-        ),
-    ]);
+    let mode_style = if cur == Field::Mode {
+        theme::selected()
+    } else {
+        theme::normal()
+    };
+    // Compact drops the "Account settings" prefix: the longest mode label plus
+    // that prefix overruns a 59-col panel, and the mode values already read as
+    // full sentences (the footer explains ←/→ switches them).
+    let mode_line = if compact {
+        Line::from(vec![
+            Span::styled(
+                if cur == Field::Mode {
+                    "\u{203a} "
+                } else {
+                    "  "
+                },
+                theme::accent(),
+            ),
+            Span::styled(format!("‹ {} ›", mode_label(app, mode(app))), mode_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("  {}  ", t(app.lang, "user.mode")), theme::dim()),
+            Span::styled(format!("‹ {} ›", mode_label(app, mode(app))), mode_style),
+        ])
+    };
+    let mode_para = Paragraph::new(mode_line);
+    // The rounded frame only when there's room; compact drops it to one line.
     f.render_widget(
-        Paragraph::new(mode_line).block(theme::box_rounded()),
+        if compact {
+            mode_para
+        } else {
+            mode_para.block(theme::box_rounded())
+        },
         rows[0],
     );
 
@@ -107,56 +136,39 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     // index; offset by 1 because row 0 is the account-mode picker above.
     for (ri, fld) in flds.iter().enumerate().skip(1) {
         let focused = *fld == cur;
-        match fld {
-            Field::Hostname => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.hostname"),
-                &app.config.hostname,
-                focused,
+        let (label, value, mask): (String, &str, bool) = match fld {
+            Field::Hostname => (
+                t(app.lang, "user.hostname"),
+                app.config.hostname.as_str(),
                 false,
             ),
-            Field::Username => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.username"),
-                &app.config.username,
-                focused,
+            Field::Username => (
+                t(app.lang, "user.username"),
+                app.config.username.as_str(),
                 false,
             ),
-            Field::UserPass => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.password"),
-                &app.config.user_password,
-                focused,
+            Field::UserPass => (
+                t(app.lang, "user.password"),
+                app.config.user_password.as_str(),
                 true,
             ),
-            Field::UserConfirm => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.confirm"),
-                &app.user_confirm,
-                focused,
+            Field::UserConfirm => (t(app.lang, "user.confirm"), app.user_confirm.as_str(), true),
+            Field::RootPass => (
+                t(app.lang, "user.root_password"),
+                app.config.root_password.as_str(),
                 true,
             ),
-            Field::RootPass => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.root_password"),
-                &app.config.root_password,
-                focused,
+            Field::RootConfirm => (
+                t(app.lang, "user.root_confirm"),
+                app.root_confirm.as_str(),
                 true,
             ),
-            Field::RootConfirm => widgets::input(
-                f,
-                rows[ri],
-                &t(app.lang, "user.root_confirm"),
-                &app.root_confirm,
-                focused,
-                true,
-            ),
-            Field::Mode => {}
+            Field::Mode => continue,
+        };
+        if compact {
+            widgets::input_inline(f, rows[ri], &label, value, focused, mask);
+        } else {
+            widgets::input(f, rows[ri], &label, value, focused, mask);
         }
     }
 

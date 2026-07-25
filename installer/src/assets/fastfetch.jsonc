@@ -5,17 +5,25 @@
     // як сирий PNG ("PNG" + знаки питання). Пряма вказівка — стабільна.
     "type": "kitty-direct",
     "source": "$HOME/.config/fastfetch/fastfetch.png",
+    // Size the logo by HEIGHT ONLY (in terminal cells). Set ONLY height and
+    // fastfetch scales the width to keep the square PNG SQUARE; setting BOTH
+    // stretches it into the cell box (kitty cells aren't 2:1) and it renders
+    // distorted/portrait. IMPORTANT: the source PNGs are ~500px, and kitty does
+    // NOT upscale past that — so the logo TOPS OUT around 25–26 rows no matter
+    // how big this number is. That is why the logo and config are matched by
+    // keeping the CONFIG short (~25 rows: only the essentials + Disk), not by
+    // growing the logo. No `break`/padding at the top, so both columns start on
+    // the same row (no full-width blank line). If they don't line up, adjust the
+    // CONFIG length (add/remove a module), not this number.
+    "height": 26,
     "padding": {
-      "top": 5
+      "top": 0
     }
   },
   "display": {
     "separator": " : "
   },
   "modules": [
-  "break",
-  "break",
-  "break",
    {
             "type": "custom",
             "format": "\u001b[90m  \u001b[31m  \u001b[32m  \u001b[33m  \u001b[34m  \u001b[35m  \u001b[36m  \u001b[37m      \u001b[90m  \u001b[31m  \u001b[32m  \u001b[33m  \u001b[34m  \u001b[35m  \u001b[36m  \u001b[37m                 "
@@ -88,6 +96,12 @@
       "type": "gpu",
       "format": "{2}",
       "key": "   GPU",
+      "keyColor": "blue"
+    },
+    {
+      "type": "disk",
+      "folders": "/",
+      "key": "  󰋊 Disk (/)",
       "keyColor": "blue"
     },
     {

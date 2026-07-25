@@ -112,16 +112,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Write the embedded script to a temp file and run it, collecting the output.
+/// Write the embedded script to a temp file and run it in a worker thread.
 ///
-/// Run synchronously: the whole thing takes a couple of seconds (module load +
-/// hostapd start), and blocking briefly keeps the code simple — no channel, no
-/// background thread, no partial-render states to reason about. The screen is
-/// a developer/testing tool, not part of the install flow.
+/// An earlier version ran it synchronously, reasoning "it's only a couple of
+/// seconds". It isn't: modprobe + two sleeps + hostapd + a wait loop is ~5 s
+/// on a good day and unbounded on a bad one — and for that whole time the
+/// event loop was dead. A frozen spinner on a screen whose entire job is
+/// "reassure me the ISO's Wi-Fi stack works" is the exact opposite of
+/// reassurance. Same architecture as every other slow job here: thread +
+/// channel, `tick()` collects.
 fn run(app: &mut App) {
     use std::io::Write;
     use std::process::Command;
 
+    if app.wifitest_rx.is_some() {
+        return; // already running — Enter shouldn't stack a second hostapd
+    }
     app.wifitest_running = true;
     app.wifitest_log.clear();
 
@@ -134,24 +140,52 @@ fn run(app: &mut App) {
         return;
     }
 
-    match Command::new("sh").arg(path).output() {
-        Ok(out) => {
-            let push = |v: &mut Vec<String>, bytes: &[u8]| {
-                for l in String::from_utf8_lossy(bytes).lines() {
-                    // Strip the ANSI colour codes the script prints — the TUI
-                    // draws its own styling and raw escapes would show as junk.
-                    v.push(strip_ansi(l));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    app.wifitest_rx = Some(rx);
+
+    std::thread::spawn(move || {
+        let mut log = Vec::new();
+        match Command::new("sh").arg(path).output() {
+            Ok(out) => {
+                let mut push = |bytes: &[u8]| {
+                    for l in String::from_utf8_lossy(bytes).lines() {
+                        // Strip the ANSI colour codes the script prints — the
+                        // TUI draws its own styling and raw escapes would show
+                        // as junk.
+                        log.push(strip_ansi(l));
+                    }
+                };
+                push(&out.stdout);
+                push(&out.stderr);
+                if log.is_empty() {
+                    log.push("(no output)".into());
                 }
-            };
-            push(&mut app.wifitest_log, &out.stdout);
-            push(&mut app.wifitest_log, &out.stderr);
-            if app.wifitest_log.is_empty() {
-                app.wifitest_log.push("(no output)".into());
             }
+            Err(e) => log.push(format!("!! sh: {e}")),
         }
-        Err(e) => app.wifitest_log.push(format!("!! sh: {e}")),
+        let _ = tx.send(log);
+    });
+}
+
+/// Collect the worker's log once it lands. The spinner keeps animating the
+/// whole time because the UI thread never waits on anything.
+pub fn tick(app: &mut App) {
+    let Some(rx) = &app.wifitest_rx else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(log) => {
+            app.wifitest_rx = None;
+            app.wifitest_log = log;
+            app.wifitest_running = false;
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => {}
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            app.wifitest_rx = None;
+            app.wifitest_log.push("!! worker died".into());
+            app.wifitest_running = false;
+        }
     }
-    app.wifitest_running = false;
 }
 
 /// Remove ANSI SGR escape sequences (`ESC [ … m`) from a line.

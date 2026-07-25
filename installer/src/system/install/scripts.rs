@@ -174,100 +174,14 @@ background_opacity 0.8
 /// so it works no matter how the system boots — a subvol=@ pin or the default
 /// subvolume, under GRUB, rEFInd or Limine. Bilingual via $LANG. This is the
 /// dependable path; native `snapper rollback` also works when set up (Path A).
-pub(crate) const ROLLBACK_SCRIPT: &str = r##"#!/bin/sh
-# artix-rollback — roll the btrfs root subvolume (@) back to a snapshot.
-# Installed by the Artix installer. Usage: sudo artix-rollback [NUMBER]
-set -eu
-
-UK=0
-case "${LANG:-}" in uk*|*UA*|*ua*) UK=1 ;; esac
-msg() { if [ "$UK" = 1 ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
-
-if [ "$(id -u)" -ne 0 ]; then
-    msg "Please run as root: sudo artix-rollback" "Запусти від root: sudo artix-rollback"
-    exit 1
-fi
-
-DEV=$(findmnt -no SOURCE / | sed 's/\[.*//')
-if [ -z "$DEV" ]; then
-    msg "Could not determine the root device." "Не вдалося визначити кореневий пристрій."
-    exit 1
-fi
-
-msg "Available snapshots (config: root):" "Доступні знімки (конфіг: root):"
-snapper -c root list || true
-echo
-
-N="${1:-}"
-if [ -z "$N" ]; then
-    if [ "$UK" = 1 ]; then printf 'Номер знімка для відкату: '; else printf 'Snapshot number to roll back to: '; fi
-    read -r N
-fi
-case "$N" in ''|*[!0-9]*)
-    msg "Invalid snapshot number." "Хибний номер знімка."
-    exit 1 ;;
-esac
-
-TOP=$(mktemp -d)
-cleanup() { umount "$TOP" 2>/dev/null || true; rmdir "$TOP" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
-mount -o subvolid=5 "$DEV" "$TOP"
-
-if [ ! -d "$TOP/@snapshots/$N/snapshot" ]; then
-    msg "Snapshot $N not found." "Знімок $N не знайдено."
-    exit 1
-fi
-
-STAMP=$(date +%Y%m%d-%H%M%S)
-msg "Backing up the current root to @.rollback-$STAMP ..." "Резервую поточний корінь у @.rollback-$STAMP ..."
-mv "$TOP/@" "$TOP/@.rollback-$STAMP"
-msg "Creating a new root from snapshot $N ..." "Створюю новий корінь зі знімка $N ..."
-btrfs subvolume snapshot "$TOP/@snapshots/$N/snapshot" "$TOP/@" >/dev/null
-
-# snap-pac takes its PRE snapshot while pacman still holds /var/lib/pacman/db.lck,
-# so a snapshot can carry that stale lock. Drop it in the new root, otherwise the
-# rolled-back system reports "unable to lock database". Also clear the resolved
-# pacman sync caches' lock if present.
-rm -f "$TOP/@/var/lib/pacman/db.lck" 2>/dev/null
-
-# Repoint the btrfs default at the new @ so a default-subvolume boot follows the
-# rollback too (a subvol=@ pin already mounts @ by name).
-NEWID=$(btrfs subvolume show "$TOP/@" | sed -n 's/.*Subvolume ID:[[:space:]]*//p')
-if [ -n "$NEWID" ]; then btrfs subvolume set-default "$NEWID" "$TOP"; fi
-
-# Ask the restored root's first boot to reconcile /boot with the snapshot
-# (kernel image, initramfs, boot menu, rescue pair) - consumed by the
-# artix-rollback-fixup one-shot service.
-mkdir -p "$TOP/@/var/lib/artix-rollback"
-: > "$TOP/@/var/lib/artix-rollback/fixup-pending"
-
-echo
-msg "Done. Reboot to boot snapshot $N." "Готово. Перезавантаж, щоб працювати на знімку $N."
-msg "The old root is kept as @.rollback-$STAMP (delete later with btrfs subvolume delete)." "Старий корінь збережено як @.rollback-$STAMP (видали згодом через btrfs subvolume delete)."
-echo
-if [ "$UK" = 1 ]; then printf 'Перезавантажити зараз? [y/N] '; else printf 'Reboot now? [y/N] '; fi
-read -r ans
-case "$ans" in y|Y) reboot ;; esac
-"##;
+pub(crate) const ROLLBACK_SCRIPT: &str = include_str!("../../assets/sh/rollback-script.sh");
 
 /// mkinitcpio *install* hook (`/etc/initcpio/install/artix-rollback`). Bundles
 /// the artix-rollback tool (the installer binary, which doubles as the rollback
 /// picker) plus btrfs/mount/umount into the initramfs and pulls in the run-time
 /// hook. Only matters when the kernel is booted with `artix.rollback`.
-pub(crate) const ROLLBACK_INITCPIO_INSTALL: &str = r#"#!/bin/bash
-# Managed by the Artix installer.
-build() {
-    add_binary /usr/local/bin/artix-rollback
-    add_binary btrfs
-    add_binary mount
-    add_binary umount
-    add_binary /usr/bin/sync
-    add_runscript
-}
-help() {
-    echo "Artix snapshot rollback picker for early boot (kernel param: artix.rollback)."
-}
-"#;
+pub(crate) const ROLLBACK_INITCPIO_INSTALL: &str =
+    include_str!("../../assets/sh/rollback-initcpio-install.sh");
 
 /// mkinitcpio *run-time* hook (`/etc/initcpio/hooks/artix-rollback`). Runs as a
 /// latehook — after `encrypt` has unlocked the root, before the root is mounted.
@@ -276,31 +190,8 @@ help() {
 /// the boot continues into it, read-write (no overlay, any kernel, any
 /// bootloader). Without the parameter it does nothing, so normal boots are
 /// untouched.
-pub(crate) const ROLLBACK_INITCPIO_HOOK: &str = r#"#!/bin/bash
-# Managed by the Artix installer.
-run_latehook() {
-    if grep -qw artix.rollback /proc/cmdline 2>/dev/null; then
-        local dev
-        dev="$(resolve_device "${root}" 2>/dev/null)" || dev="${root}"
-        [ -n "$dev" ] || return 0
-        mkdir -p /run/artix-rb
-        if mount -o subvolid=5 "$dev" /run/artix-rb 2>/dev/null; then
-            /usr/local/bin/artix-rollback --rollback-initramfs /run/artix-rb <>/dev/console 1>&0 2>&0
-            # Second commit layer (the picker already commits, but it may exit
-            # early or crash mid-swap): flush page cache and force a btrfs
-            # transaction commit so the swapped @ is fully on disk BEFORE we
-            # release the pool. Then release cleanly — falling back to a lazy
-            # umount so a transient EBUSY can't leave the pool mounted and block
-            # the init's root mount. This is what guarantees the very next mount
-            # of the SAME device (the real root, subvol=@) sees the new @ on the
-            # first try, on every bootloader.
-            sync 2>/dev/null
-            btrfs filesystem sync /run/artix-rb 2>/dev/null
-            umount /run/artix-rb 2>/dev/null || umount -l /run/artix-rb 2>/dev/null
-        fi
-    fi
-}
-"#;
+pub(crate) const ROLLBACK_INITCPIO_HOOK: &str =
+    include_str!("../../assets/sh/rollback-initcpio-hook.sh");
 
 /// A custom GRUB generator (`/etc/grub.d/45_artix_rollback`, runs after
 /// 10_linux) that emits one top-level "System Rollback" menuentry. It mirrors
@@ -407,47 +298,13 @@ every update — you don't need to repeat step 3.
 кожному оновленні — крок 3 повторювати не треба.
 "#;
 
-pub(crate) const ARTIX_ROLLBACK_GRUBD: &str = r#"#!/bin/sh
-# Managed by the Artix installer. Adds a "System Rollback" GRUB entry that boots
-# the FROZEN RESCUE kernel/initramfs (falling back to the live pair) with
-# artix.rollback so the early-boot snapshot picker runs — even when a kernel
-# update broke the live kernel. Device access mirrors 10_linux via
-# grub-mkconfig_lib.
-set -e
-. /usr/share/grub/grub-mkconfig_lib
-RESCUE=1
-K="/boot/vmlinuz-artix-rescue"
-I="/boot/initramfs-artix-rescue.img"
-if [ ! -e "$K" ] || [ ! -e "$I" ]; then
-    RESCUE=0
-    K="/boot/@@VMLINUZ@@"
-    I="/boot/@@INITRD@@"
-fi
-[ -e "$K" ] || exit 0
-. /etc/default/grub 2>/dev/null || true
-dev="$("${grub_probe:-grub-probe}" --target=device "$K")"
-rk="$(make_system_path_relative_to_its_root "$K")"
-ri="$(make_system_path_relative_to_its_root "$I")"
-uc=""
-for u in intel-ucode.img amd-ucode.img; do
-    [ -f "/boot/$u" ] && uc="$uc $(make_system_path_relative_to_its_root "/boot/$u")"
-done
-printf "%s\n" "menuentry 'Artix - System Rollback (pick a snapshot)' --class artix --class gnu-linux {"
-prepare_grub_to_access_device "$dev"
-printf "\tlinux %s rootflags=subvol=@ %s %s artix.rollback\n" "$rk" "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"
-printf "\tinitrd%s %s\n" "$uc" "$ri"
-printf "}\n"
-# Plain boot on the frozen rescue pair - the escape hatch when a kernel update
-# broke the live kernel and /boot lives OUTSIDE the btrfs pool (encrypted
-# /boot partition), where a snapshot rollback alone cannot restore /boot.
-if [ "$RESCUE" = 1 ]; then
-printf "%s\n" "menuentry 'Artix - rescue kernel (known good)' --class artix --class gnu-linux {"
-prepare_grub_to_access_device "$dev"
-printf "\tlinux %s rootflags=subvol=@ %s %s\n" "$rk" "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"
-printf "\tinitrd%s %s\n" "$uc" "$ri"
-printf "}\n"
-fi
-"#;
+/// Chainloader entries for neighbouring OS loaders on every ESP — the piece
+/// os-prober cannot do when a neighbour keeps its kernels on its ESP.
+pub(crate) const GRUB_NEIGHBOUR_CHAIN: &str =
+    include_str!("../../assets/sh/grub-neighbour-chain.sh");
+
+pub(crate) const ARTIX_ROLLBACK_GRUBD: &str =
+    include_str!("../../assets/sh/artix-rollback-grubd.sh");
 
 /// Desktop launcher for the rollback menu: opens `artix-rollback` in the user's
 /// default terminal (Terminal=true), where sudo can prompt for the password and
@@ -466,36 +323,38 @@ Categories=System;Utility;
 Keywords=snapshot;rollback;btrfs;restore;
 ";
 
+/// Shared `log`/`warn` for the boot-time services below, installed to
+/// /usr/local/lib/artix-installer/log.sh and sourced by path.
+///
+/// It has to be a real file, not text pasted into each script: the services do
+/// their work inside `setsid sh -c '...'`, a fresh shell that inherits no
+/// functions, and that block is already single-quoted so a definition cannot be
+/// nested into it cleanly. Sourcing by path is the one thing that works there.
+///
+/// This must be written BEFORE any script that sources it.
+pub(crate) const LOG_LIB: &str = include_str!("../../assets/sh/lib-log.sh");
+
+/// Repair ownership and permissions on an installed system — the way back from
+/// `chmod 777 /`, a stray `chown -R`, or the slip of typing `chown` where
+/// `chmod` was meant (the mode lands as a UID and /home ends up owned by a user
+/// that does not exist). Run from the RECOVERY screen inside the target's
+/// chroot, not during an install.
+///
+/// Two passes: a fixed table of paths whose right answer is not written down
+/// anywhere on disk (/, /tmp, the shadow files, ssh host keys, each user's own
+/// home) — offline and instant, and enough to make the machine usable again —
+/// then every packaged file restored from the package database, which is the
+/// only authority on the rest, setuid binaries included.
+pub(crate) const FIX_PERMISSIONS: &str = include_str!("../../assets/sh/fix-permissions.sh");
+
 /// First-boot baseline snapshot. snapper can't run inside the installer chroot
 /// (no D-Bus → "fatal library error"), so this one-shot script runs on the first
 /// real boot, where snapper works. It detaches into the background (so boot is
 /// never delayed), retries until snapper is ready, takes a "clean system"
 /// snapshot, refreshes the GRUB menu, then removes its own boot.d symlink so it
 /// only ever runs once. This is also the first entry to populate the GRUB submenu.
-pub(crate) const FIRST_SNAPSHOT_SCRIPT: &str = r##"#!/bin/sh
-# One-time baseline snapshot of the freshly installed system (first boot only).
-MARKER=/var/lib/artix-installer/baseline-snapshot-done
-[ -f "$MARKER" ] && exit 0
-
-# Detach so boot is never blocked; retry until snapper/D-Bus are up.
-setsid sh -c '
-    i=0
-    while [ "$i" -lt 60 ]; do
-        if snapper -c root create -d "clean system (post-install baseline)" >/dev/null 2>&1; then
-            mkdir -p /var/lib/artix-installer
-            : > /var/lib/artix-installer/baseline-snapshot-done
-            if [ -d /boot/grub ] && command -v grub-mkconfig >/dev/null 2>&1; then
-                grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1
-            fi
-            rm -f /etc/dinit.d/boot.d/artix-first-snapshot 2>/dev/null
-            break
-        fi
-        i=$((i + 1))
-        sleep 2
-    done
-' >/dev/null 2>&1 &
-exit 0
-"##;
+pub(crate) const FIRST_SNAPSHOT_SCRIPT: &str =
+    include_str!("../../assets/sh/first-snapshot-script.sh");
 
 /// dinit service that fires the baseline-snapshot script at boot. `scripted`
 /// means dinit considers it started the moment the command exits — and the
@@ -541,48 +400,38 @@ When = PostTransaction\n\
 Exec = /usr/bin/install -Dm644 /usr/share/artix-installer/pinnacle-session.desktop /usr/share/wayland-sessions/pinnacle.desktop\n\
 ";
 
+/// Regenerate grub.cfg after a KERNEL change (a new vmlinuz lands/leaves) or a
+/// GRUB upgrade. Arch/Artix's grub package does NOT do this itself, so without a
+/// hook a new kernel never reaches the menu and — for dual boot — the neighbour
+/// generator (35_artix_neighbours) never re-runs, so a system installed later
+/// stays invisible until someone runs grub-mkconfig by hand. `zz-` so it fires
+/// AFTER the initramfs is rebuilt (grub.cfg then points at a real initramfs).
+/// The generator is best-effort (always exits 0), so this can't break an
+/// update. Two [Trigger] blocks: kernel image paths, and the grub package.
+pub(crate) const GRUB_REGEN_HOOK: &str = "\
+[Trigger]\n\
+Operation = Install\n\
+Operation = Upgrade\n\
+Operation = Remove\n\
+Type = Path\n\
+Target = usr/lib/modules/*/vmlinuz\n\
+\n\
+[Trigger]\n\
+Operation = Upgrade\n\
+Type = Package\n\
+Target = grub\n\
+\n\
+[Action]\n\
+Description = Regenerating GRUB config (kernels + neighbour-OS menu)...\n\
+When = PostTransaction\n\
+Exec = /usr/bin/grub-mkconfig -o /boot/grub/grub.cfg\n\
+";
+
 /// Refresh the frozen rescue kernel pair AFTER a successful normal boot. Never
 /// runs on a rollback/rescue boot (artix.rollback on the cmdline), so a broken
 /// live kernel can never overwrite the known-good pair: if the machine fails to
 /// boot, this service simply never fires under the broken kernel.
-pub(crate) const RESCUE_SYNC_SCRIPT: &str = r##"#!/bin/sh
-# Managed by the Artix installer: keep /boot/vmlinuz-artix-rescue (+ its
-# initramfs) in sync with the newest kernel that has PROVEN it can boot.
-grep -qw artix.rollback /proc/cmdline 2>/dev/null && exit 0
-# A pending post-rollback fixup owns the pair right now - let it finish (it
-# refreshes the pair itself once /boot is reconciled).
-[ -f /var/lib/artix-rollback/fixup-pending ] && exit 0
-setsid sh -c '
-    # 30 s of uptime as the "this kernel boots fine" proxy, then sync once.
-    sleep 30
-    live=""
-    for k in /boot/vmlinuz-*; do
-        [ -e "$k" ] || exit 0
-        case "$k" in *artix-rescue*) continue ;; esac
-        live="$k"; break
-    done
-    [ -n "$live" ] || exit 0
-    init="/boot/initramfs-${live#/boot/vmlinuz-}.img"
-    [ -f "$init" ] || exit 0
-    # Only sync when the RUNNING kernel IS the live one. Booting the rescue
-    # (or any other) kernel proves nothing about the live pair - syncing then
-    # could poison the known-good copy with a broken kernel. pacman ships the
-    # image at /usr/lib/modules/<ver>/vmlinuz, so identity is a byte compare.
-    run="/usr/lib/modules/$(uname -r)/vmlinuz"
-    [ -f "$run" ] || exit 0
-    l=$(md5sum < "$live" 2>/dev/null | cut -d" " -f1)
-    r=$(md5sum < "$run" 2>/dev/null | cut -d" " -f1)
-    [ "$l" = "$r" ] || exit 0
-    a=$(md5sum < "$live" 2>/dev/null | cut -d" " -f1)
-    b=$(md5sum < /boot/vmlinuz-artix-rescue 2>/dev/null | cut -d" " -f1)
-    if [ "$a" != "$b" ]; then
-        cp -f "$live" /boot/vmlinuz-artix-rescue
-        cp -f "$init" /boot/initramfs-artix-rescue.img
-        sync
-    fi
-' >/dev/null 2>&1 &
-exit 0
-"##;
+pub(crate) const RESCUE_SYNC_SCRIPT: &str = include_str!("../../assets/sh/rescue-sync-script.sh");
 
 pub(crate) const RESCUE_SYNC_SERVICE: &str = r#"# Managed by the Artix installer: refresh the rescue kernel pair after a
 # successful boot. See /usr/local/lib/artix-installer/rescue-sync.sh.
@@ -596,36 +445,8 @@ restart = false
 /// @ does NOT swap the kernel there — the live vmlinuz can be newer than the
 /// snapshot's /usr/lib/modules. Triggered by the fixup-pending flag that the
 /// rollback tool drops into the freshly restored @.
-pub(crate) const ROLLBACK_FIXUP_SCRIPT: &str = r##"#!/bin/sh
-# Managed by the Artix installer: post-rollback /boot reconciliation.
-FLAG=/var/lib/artix-rollback/fixup-pending
-[ -f "$FLAG" ] || exit 0
-setsid sh -c '
-    # Reinstall the kernel image(s) that belong to the RESTORED root: every
-    # /usr/lib/modules/<ver> ships its vmlinuz + pkgbase (linux, linux-lts, …).
-    for d in /usr/lib/modules/*/; do
-        [ -f "${d}vmlinuz" ] && [ -f "${d}pkgbase" ] || continue
-        install -Dm644 "${d}vmlinuz" "/boot/vmlinuz-$(cat "${d}pkgbase")"
-    done
-    mkinitcpio -P >/dev/null 2>&1
-    if [ -d /boot/grub ] && command -v grub-mkconfig >/dev/null 2>&1; then
-        grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1
-    fi
-    # This very boot proved the restored kernel works — refresh the rescue pair.
-    live=""
-    for k in /boot/vmlinuz-*; do
-        case "$k" in *artix-rescue*) continue ;; esac
-        [ -e "$k" ] && { live="$k"; break; }
-    done
-    if [ -n "$live" ]; then
-        init="/boot/initramfs-${live#/boot/vmlinuz-}.img"
-        [ -f "$init" ] && cp -f "$live" /boot/vmlinuz-artix-rescue                        && cp -f "$init" /boot/initramfs-artix-rescue.img
-    fi
-    sync
-    rm -f /var/lib/artix-rollback/fixup-pending
-' >/dev/null 2>&1 &
-exit 0
-"##;
+pub(crate) const ROLLBACK_FIXUP_SCRIPT: &str =
+    include_str!("../../assets/sh/rollback-fixup-script.sh");
 
 pub(crate) const ROLLBACK_FIXUP_SERVICE: &str = r#"# Managed by the Artix installer: one-shot /boot reconciliation after a
 # snapshot rollback. See /usr/local/lib/artix-installer/rollback-fixup.sh.
@@ -638,20 +459,7 @@ restart = false
 /// builds the Rust config only when sources changed (incremental → instant
 /// when clean), execs the release binary, and logs failures where the user can
 /// actually find them instead of dying into a configless session.
-pub(crate) const PINNACLE_RUN_CONFIG: &str = r##"#!/bin/sh
-# Managed by the Artix installer. pinnacle.toml runs THIS instead of a bare
-# `cargo run`: same effect, but the release profile is used and failures are
-# logged. `cargo build` is incremental - after the installer's prebuild it
-# returns in milliseconds, and it transparently rebuilds after you edit
-# src/main.rs (then just reload the config from inside Pinnacle).
-cd "$(dirname "$0")" || exit 1
-if ! cargo build --release >run-config.log 2>&1; then
-    command -v notify-send >/dev/null 2>&1 && \
-        notify-send "Pinnacle config" "Build failed - see ~/.config/pinnacle/run-config.log"
-    exit 1
-fi
-exec ./target/release/pinnacle-config
-"##;
+pub(crate) const PINNACLE_RUN_CONFIG: &str = include_str!("../../assets/sh/pinnacle-run-config.sh");
 
 pub(crate) const FASTFETCH_CONFIG: &str = include_str!("../../assets/fastfetch.jsonc");
 
@@ -699,145 +507,20 @@ pub(crate) const PINNACLE_FILES: &[(&str, &str)] = &[
         "src/main.rs",
         include_str!("../../assets/pinnacle/src/main.rs"),
     ),
+    // clipboard.sh is the ONLY script left: launcher.sh and mango-tags.sh were
+    // MangoWC leftovers (v239) — the latter spoke `mmsg`, an IPC that doesn't
+    // exist under Pinnacle. Their table rows died with the files; a row here
+    // without a file is a compile error, which is exactly the guard we want.
     (
         "scripts/clipboard.sh",
         include_str!("../../assets/pinnacle/scripts/clipboard.sh"),
     ),
-    (
-        "scripts/launcher.sh",
-        include_str!("../../assets/pinnacle/scripts/launcher.sh"),
-    ),
-    (
-        "scripts/mango-tags.sh",
-        include_str!("../../assets/pinnacle/scripts/mango-tags.sh"),
-    ),
 ];
 
-pub(crate) const NFTABLES_CONFIG_TEMPLATE: &str = r#"#!/usr/sbin/nft -f
-#
-# Default-deny stateful firewall for an Artix/dinit desktop.
-# Inbound is dropped except for established/related, loopback, ICMP, mDNS, and
-# the explicit application ports below. Outbound is allowed.
-#
-# Installed to /etc/nftables.conf and started via nftables-dinit.
-
-flush ruleset
-
-table inet filter {
-
-    # ── Application port sets ────────────────────────────────────────────────
-    # KDE Connect: TCP+UDP 1714-1764 (device pairing, sharing, clipboard, etc.)
-    set kdeconnect_ports {
-        type inet_service
-        flags interval
-        elements = { 1714-1764 }
-    }
-
-    # LocalSend: TCP+UDP 53317 (HTTP file transfer + multicast discovery).
-    set localsend_ports {
-        type inet_service
-        elements = { 53317 }
-    }
-
-    # Sunshine (game streaming, Moonlight host):
-    #   TCP 47984, 47989, 47990, 48010
-    #   UDP 47998, 47999, 48000, 48002, 48010
-    set sunshine_tcp {
-        type inet_service
-        elements = { 47984, 47989, 47990, 48010 }
-    }
-    set sunshine_udp {
-        type inet_service
-        elements = { 47998, 47999, 48000, 48002, 48010 }
-    }
-
-    # RustDesk (direct / peer-to-peer connections):
-    #   TCP 21115-21119, UDP 21116
-    set rustdesk_tcp {
-        type inet_service
-        flags interval
-        elements = { 21115-21119 }
-    }
-    set rustdesk_udp {
-        type inet_service
-        elements = { 21116 }
-    }
-
-    # Steam Remote Play / In-Home Streaming:
-    #   TCP 27036-27037, UDP 27031-27036
-    set steam_tcp {
-        type inet_service
-        flags interval
-        elements = { 27036-27037 }
-    }
-    set steam_udp {
-        type inet_service
-        flags interval
-        elements = { 27031-27036 }
-    }
-
-    # Syncthing (file synchronisation):
-    #   TCP 22000 (sync), UDP 22000 (QUIC sync), UDP 21027 (local discovery)
-    set syncthing_tcp {
-        type inet_service
-        elements = { 22000 }
-    }
-    set syncthing_udp {
-        type inet_service
-        elements = { 22000, 21027 }
-    }
-
-    chain input {
-        type filter hook input priority filter; policy drop;
-
-        # Stateful: allow what we initiated.
-        ct state established,related accept
-        ct state invalid drop
-
-        # Loopback.
-        iif "lo" accept
-
-        # ICMP / ICMPv6 (ping, path MTU, neighbor discovery).
-        ip protocol icmp accept
-        ip6 nexthdr ipv6-icmp accept
-
-        # mDNS / Avahi discovery (LocalSend, KDE Connect, printers).
-        udp dport 5353 accept
-
-        # SSH (remote administration).
-        tcp dport 22 accept
-
-        # ── Applications ──
-        tcp dport @kdeconnect_ports accept
-        udp dport @kdeconnect_ports accept
-
-        tcp dport @localsend_ports accept
-        udp dport @localsend_ports accept
-
-        tcp dport @sunshine_tcp accept
-        udp dport @sunshine_udp accept
-
-        tcp dport @rustdesk_tcp accept
-        udp dport @rustdesk_udp accept
-
-        tcp dport @steam_tcp accept
-        udp dport @steam_udp accept
-
-        tcp dport @syncthing_tcp accept
-        udp dport @syncthing_udp accept
-
-        # Everything else: drop (policy).
-    }
-
-    chain forward {
-        type filter hook forward priority filter; policy drop;
-    }
-
-    chain output {
-        type filter hook output priority filter; policy accept;
-    }
-}
-"#;
+// NOT under assets/sh/: the shebang is `nft -f`, so this is an nftables
+// ruleset, not a shell script — dash and shellcheck have no business parsing
+// it. It lives with the other non-shell configs (waybar, wofi, fastfetch).
+pub(crate) const NFTABLES_CONFIG_TEMPLATE: &str = include_str!("../../assets/nftables.conf");
 
 /// Logging help document, written into the user's home in their chosen
 /// language. Explains the install log plus how to use the system's logging
@@ -969,129 +652,4 @@ Generated by the Artix installer.
 /// NetworkManager — which is what the installer's Wi-Fi screen then sees. Used
 /// from the mode screen's "Wi-Fi test" entry; a no-op on real hardware where
 /// the module isn't present.
-pub(crate) const WIFI_TEST_SCRIPT: &str = r###"#!/bin/sh
-# ─────────────────────────────────────────────────────────────────────────────
-# wifi-test.sh — set up a FAKE Wi-Fi network inside a VM, so the installer's
-# Wi-Fi screen can be tested without any real wireless hardware.
-#
-# Usage (inside the live ISO, as root):
-#     sh wifi-test.sh
-#
-# What it does:
-#   1. loads mac80211_hwsim → two simulated radios appear (wlan0, wlan1)
-#   2. hands wlan0 to hostapd as an access point broadcasting SSID "ArtixTest"
-#   3. leaves wlan1 for NetworkManager → that's what the installer will see
-#
-# Then, in the installer: pick "configure Wi-Fi" → adapter wlan1 → network
-# ArtixTest → password: testtest123
-# ─────────────────────────────────────────────────────────────────────────────
-set -e
-
-SSID="ArtixTest"
-PASS="testtest123"
-
-say() { printf '\n\033[1;36m==>\033[0m %s\n' "$1"; }
-die() { printf '\n\033[1;31m!! %s\033[0m\n' "$1"; exit 1; }
-
-# Needs root (modprobe, hostapd, nmcli device set). If launched as a normal
-# user, re-exec through sudo rather than just failing — the copy in the live
-# user's home is meant to be double-clickable-simple.
-if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        say "Needs root — re-running through sudo…"
-        exec sudo sh "$0" "$@"
-    fi
-    die "Run as root:  sudo sh $0"
-fi
-
-# ── 1. simulated radios ──────────────────────────────────────────────────────
-say "Loading mac80211_hwsim (2 virtual radios)…"
-modprobe mac80211_hwsim radios=2 2>/dev/null || die "mac80211_hwsim not available in this kernel"
-sleep 1
-
-# The kernel names them wlan0/wlan1 by default, but don't assume — ask.
-radios=$(iw dev 2>/dev/null | awk '/Interface/ {print $2}')
-ap=$(printf '%s\n' "$radios" | sed -n 1p)
-sta=$(printf '%s\n' "$radios" | sed -n 2p)
-[ -n "$ap" ] && [ -n "$sta" ] || die "Expected 2 radios, got: $radios"
-printf '    AP radio:      %s\n    Client radio:  %s\n' "$ap" "$sta"
-
-# ── 2. keep NetworkManager off the AP radio ──────────────────────────────────
-# hostapd owns it; if NM also grabs it, they fight and the AP never comes up.
-say "Telling NetworkManager to ignore $ap (hostapd owns it)…"
-nmcli device set "$ap" managed no 2>/dev/null || true
-rfkill unblock wifi 2>/dev/null || true
-
-# ── 3. bring up the access point ─────────────────────────────────────────────
-command -v hostapd >/dev/null 2>&1 || die "hostapd is not installed on this ISO — add it to iso-profile/Packages-Live"
-
-say "Starting access point \"$SSID\" on $ap…"
-cat > /tmp/hostapd.conf <<EOF
-interface=$ap
-driver=nl80211
-ssid=$SSID
-hw_mode=g
-channel=6
-wpa=2
-wpa_passphrase=$PASS
-wpa_key_mgmt=WPA-PSK
-rsn_pairwise=CCMP
-EOF
-
-pkill hostapd 2>/dev/null || true
-hostapd -B /tmp/hostapd.conf >/tmp/hostapd.log 2>&1 || die "hostapd failed — see /tmp/hostapd.log"
-sleep 2
-
-# ── 3b. hand out IP addresses ────────────────────────────────────────────────
-# hostapd only does the 802.11 half: radio, encryption, authentication. Once a
-# client associates it asks for an IP over DHCP — and with nobody answering,
-# NetworkManager waits out the DHCP timeout and then fails the connection with
-# "IP configuration could not be completed". So the AP needs an address itself
-# and a DHCP server behind it. dnsmasq is the smallest thing that does both.
-say "Giving $ap an address and starting DHCP…"
-ip addr flush dev "$ap" 2>/dev/null || true
-ip addr add 10.42.0.1/24 dev "$ap" 2>/dev/null || true
-ip link set "$ap" up 2>/dev/null || true
-
-if command -v dnsmasq >/dev/null 2>&1; then
-    pkill -f "dnsmasq.*$ap" 2>/dev/null || true
-    dnsmasq \
-        --interface="$ap" \
-        --bind-interfaces \
-        --dhcp-range=10.42.0.10,10.42.0.100,12h \
-        --dhcp-option=3,10.42.0.1 \
-        --dhcp-option=6,10.42.0.1 \
-        --pid-file=/tmp/dnsmasq-wifitest.pid \
-        >/tmp/dnsmasq.log 2>&1 \
-        || die "dnsmasq failed — see /tmp/dnsmasq.log"
-    sleep 1
-else
-    printf '\n\033[1;33m~~ dnsmasq is not installed — the client will associate but get no IP,\n'
-    printf '   and NetworkManager will fail with "IP configuration could not be\n'
-    printf '   completed". Add dnsmasq to the ISO to test the full flow.\033[0m\n'
-fi
-
-# ── 4. report ────────────────────────────────────────────────────────────────
-if nmcli -t -f SSID dev wifi list --rescan yes 2>/dev/null | grep -q "^$SSID$"; then
-    say "SUCCESS — NetworkManager can see the network."
-else
-    printf '\n\033[1;33m~~ AP is up, but NM does not list it yet. Give it a few seconds,\n'
-    printf '   or press Enter/r on the installer'\''s network screen to rescan.\033[0m\n'
-fi
-
-cat <<EOF
-
-  ┌───────────────────────────────────────────────┐
-  │  Now go to the installer's Wi-Fi screen:      │
-  │                                               │
-  │     adapter   →  $sta$(printf '%*s' $((28 - ${#sta})) '')│
-  │     network   →  $SSID$(printf '%*s' $((28 - ${#SSID})) '')│
-  │     password  →  $PASS$(printf '%*s' $((28 - ${#PASS})) '')│
-  └───────────────────────────────────────────────┘
-
-  Worth testing while you're there:
-    • a WRONG password  → must stay on the screen with a red error
-    • Enter on an empty list → must rescan, never sit silent
-
-EOF
-"###;
+pub(crate) const WIFI_TEST_SCRIPT: &str = include_str!("../../assets/sh/wifi-test-script.sh");

@@ -24,6 +24,10 @@ enum Row {
     Chaotic,
     Mirrors,
     Encrypt,
+    /// A non-interactive note shown in place of the encryption toggle when the
+    /// install shares a disk with Windows (alongside/manual) — LUKS there isn't
+    /// wired up in v1, so the toggle would do nothing.
+    EncBlocked,
     EncScope,
     UsbKey,
     UsbMode,
@@ -48,8 +52,21 @@ fn rows_for(app: &App) -> Vec<Row> {
     // immediately after it (its sub-rows stay attached to the toggle) — the two
     // decisions belong together. Boot extras (os-prober, the UEFI entry name)
     // come after the encryption block.
-    let mut v = vec![Row::Bootloader, Row::Encrypt];
-    if app.config.encrypt_disk {
+    // On a disk SHARED with Windows (alongside/manual), v1 can't set up LUKS —
+    // so instead of an encryption toggle that the plan silently ignores, show a
+    // one-line note explaining why. A separate-disk or whole-disk install (Auto)
+    // gets the real toggle: that disk is entirely Artix's.
+    // "Shared" means another OS lives on this disk — that is what makes LUKS
+    // unavailable, not manual partitioning as such. A SOLO manual install owns
+    // the disk, so it gets the real toggle like any whole-disk install.
+    let shared_disk = app.config.partition_mode.is_manual_family() && !app.config.manual_solo;
+    let mut v = vec![Row::Bootloader];
+    if shared_disk {
+        v.push(Row::EncBlocked);
+    } else {
+        v.push(Row::Encrypt);
+    }
+    if app.config.encrypt_disk && !shared_disk {
         if app.config.bootloader == Bootloader::Grub {
             v.push(Row::EncScope);
         }
@@ -95,26 +112,43 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         app.cursor = visible.len() - 1;
     }
 
-    // Build the layout: intro + one block per visible row + spacer + actions.
-    // Rows that can show a long red warning (the two USB rows when armed) get
-    // an extra line so the wrapped warning text fits inside the frame instead
-    // of overflowing past the right border.
-    let mut constraints = vec![Constraint::Length(2)]; // intro
-    for row in &visible {
-        let tall = match row {
-            Row::UsbKey => !app.config.usb_key_device.is_empty(),
-            Row::UsbMode => app.config.usb_key_only,
-            _ => false,
-        };
-        constraints.push(Constraint::Length(if tall { 5 } else { 3 }));
+    // Reserve the action row FIRST, as its own split. Everything below is laid
+    // out inside what's left, so however many option rows the current config
+    // produces (Security grows to ~10 with encryption armed), the Next button
+    // can never be the constraint ratatui silently clips away.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+    let (body, actions_area) = (outer[0], outer[1]);
+
+    // Roomy layout: intro(2) + 3 rows each (5 for the USB rows when armed, so a
+    // wrapped red warning fits inside the frame) + 1 spacing between each. On a
+    // 59x15 panel that needs ~23 rows and there are 12, so below the threshold
+    // each option collapses to a single line — and only the FOCUSED one keeps
+    // its explanatory hint, which is the line the user is actually reading.
+    let full_need = 2 + visible.len() * 3 + visible.len() + 1;
+    let compact = (body.height as usize) < full_need;
+
+    let mut constraints = vec![Constraint::Length(if compact { 1 } else { 2 })]; // intro
+    for (i, row) in visible.iter().enumerate() {
+        if compact {
+            constraints.push(Constraint::Length(if i == app.cursor { 2 } else { 1 }));
+        } else {
+            let tall = match row {
+                Row::UsbKey => !app.config.usb_key_device.is_empty(),
+                Row::UsbMode => app.config.usb_key_only,
+                _ => false,
+            };
+            constraints.push(Constraint::Length(if tall { 5 } else { 3 }));
+        }
     }
     constraints.push(Constraint::Min(0)); // spacer
-    constraints.push(Constraint::Length(3)); // actions
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .spacing(1)
-        .split(area);
+        .spacing(if compact { 0 } else { 1 })
+        .split(body);
 
     let intro_key = if app.screen == Screen::Options {
         "opt.intro"
@@ -230,6 +264,22 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     &t(app.lang, "opt.encrypt"),
                     &val,
                     &t(app.lang, "opt.encrypt_hint"),
+                );
+            }
+            Row::EncBlocked => {
+                // A dimmed, non-interactive explanation in the encryption slot.
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("  {}", t(app.lang, "opt.encrypt_shared")),
+                            theme::mute(),
+                        )),
+                        Line::from(Span::styled(
+                            format!("  {}", t(app.lang, "opt.encrypt_shared_hint")),
+                            theme::dim(),
+                        )),
+                    ]),
+                    area,
                 );
             }
             Row::OsProber => {
@@ -504,7 +554,6 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         && app.config.encrypt_scope == "full"
         && app.config.bootloader != Bootloader::Grub);
     app.can_advance = enc_ok && boot_ok;
-    let actions_area = rows[rows.len() - 1];
     widgets::action_row(
         f,
         actions_area,
@@ -545,21 +594,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     let visible = rows_for(app);
     let cur = visible.get(app.cursor).copied().unwrap_or(Row::Sudo);
 
-    // Up/Down navigation is common to all rows.
+    // Up/Down navigation is common to all rows. The EncBlocked note is inert,
+    // so navigation steps over it (landing there would look like a lost cursor).
+    let is_inert = |i: usize| visible.get(i) == Some(&Row::EncBlocked);
     match key.code {
-        KeyCode::Up => {
-            app.cursor = app.cursor.saturating_sub(1);
+        KeyCode::Up | KeyCode::Esc => {
+            let mut n = app.cursor.saturating_sub(1);
+            if is_inert(n) {
+                n = n.saturating_sub(1);
+            }
+            app.cursor = n;
             return;
         }
         KeyCode::Down => {
-            app.cursor = (app.cursor + 1).min(visible.len() - 1);
-            return;
-        }
-        KeyCode::Esc => {
-            // Esc steps focus to the previous row. (When already on the first
-            // row, the global handler intercepts Esc and leaves to the previous
-            // screen, so reaching here always means there's a row above.)
-            app.cursor = app.cursor.saturating_sub(1);
+            let mut n = (app.cursor + 1).min(visible.len() - 1);
+            if is_inert(n) {
+                n = (n + 1).min(visible.len() - 1);
+            }
+            app.cursor = n;
             return;
         }
         _ => {}

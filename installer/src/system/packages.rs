@@ -90,6 +90,10 @@ pub fn popular() -> Vec<Pkg> {
             "System info tool (default; ships the syrnyk logo config)",
         ),
         (
+            "slayfetch",
+            "fastfetch with a pick-your-own Artix + pride logo (Space to choose)",
+        ),
+        (
             "nftables",
             "Firewall (default; ships the default-deny ruleset)",
         ),

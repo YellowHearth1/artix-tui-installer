@@ -64,8 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dash
-        run: sudo apt-get update && sudo apt-get install -y dash
+      - name: Install dash and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y dash shellcheck
 
       - name: Check the shipped scripts
         run: |
@@ -79,6 +79,12 @@ jobs:
             fi
           done
           exit $fail
+
+      # dash answers "does it parse"; shellcheck answers "will it bite".
+      # SC2154-style false positives are waived inline, next to the line,
+      # with the reason — not here, where nobody would see it.
+      - name: Lint the shipped scripts
+        run: shellcheck -S warning scripts/*.sh installer/src/assets/sh/*.sh
 
   # The version on screen comes from Cargo.toml. The CHANGELOG is written by
   # hand. When they disagree, the number a user reports means nothing — which

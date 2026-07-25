@@ -164,24 +164,50 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         st_inner,
     );
 
-    // 5) Action row — label changes once mounted (mount → open root shell).
+    // 5) Action row. Before mounting there is one action; once mounted there
+    //    are two — open a shell, or repair permissions. The repair is offered as
+    //    a button rather than left to the shell because someone recovering from
+    //    `chmod 777 /` has no working sudo to look the commands up with.
     let act_focused = app.recovery_focus == 3;
-    let action_label = if app.recovery_mounted {
-        t(app.lang, "rec.open_shell")
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if app.recovery_mounted {
+        for (i, key) in ["rec.open_shell", "rec.fix_perms"].iter().enumerate() {
+            let picked = act_focused && app.recovery_action == i;
+            spans.push(Span::styled(
+                format!("  [ {} ]", t(app.lang, key)),
+                if picked {
+                    theme::selected()
+                } else {
+                    theme::normal()
+                },
+            ));
+        }
     } else {
-        t(app.lang, "rec.mount")
-    };
-    let act_style = if act_focused {
-        theme::selected()
-    } else {
-        theme::normal()
-    };
+        spans.push(Span::styled(
+            format!("  [ {} ]", t(app.lang, "rec.mount")),
+            if act_focused {
+                theme::selected()
+            } else {
+                theme::normal()
+            },
+        ));
+    }
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(t(app.lang, "rec.back_to_mode"), theme::mute()));
+    let mut action_lines = vec![Line::from(spans)];
+    // What the highlighted action will actually do — the repair rewrites modes
+    // and owners across the system, so it says so before it is pressed. The
+    // action row is three tall, so this second line needs no extra section.
+    if app.recovery_mounted {
+        let note = if app.recovery_action == 1 {
+            t(app.lang, "rec.fix_perms_desc")
+        } else {
+            t(app.lang, "rec.open_shell_desc")
+        };
+        action_lines.push(Line::from(Span::styled(format!("  {note}"), theme::mute())));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("  [ {action_label} ]"), act_style),
-            Span::raw("    "),
-            Span::styled(t(app.lang, "rec.back_to_mode"), theme::mute()),
-        ])),
+        Paragraph::new(action_lines).wrap(Wrap { trim: true }),
         rows[5],
     );
 
@@ -195,8 +221,38 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Esc unmounts back to the mode chooser (handled in event.rs / main loop).
     if app.recovery_mounted {
         match key.code {
+            // Two actions once mounted; ←/→ (and ↑/↓, for muscle memory) pick.
+            KeyCode::Left
+            | KeyCode::Char('h')
+            | KeyCode::Right
+            | KeyCode::Char('l')
+            | KeyCode::Up
+            | KeyCode::Char('k')
+            | KeyCode::Down
+            | KeyCode::Char('j') => app.recovery_action ^= 1,
             KeyCode::Enter => {
-                app.pending_interactive = Some(("artix-chroot".into(), vec!["/mnt".into()]));
+                app.pending_interactive = Some(if app.recovery_action == 1 {
+                    // The repair runs on the real terminal, like the shell does:
+                    // it walks every packaged file and prints what it changes,
+                    // which is both slow and worth reading. Handing it the whole
+                    // console keeps the TUI out of the way and means the user
+                    // sees the outcome rather than a spinner.
+                    //
+                    // One argv element for the script: `/tmp` inside the chroot
+                    // is a fresh tmpfs on every artix-chroot call, so a script
+                    // written there would not exist by the time it ran.
+                    (
+                        "artix-chroot".into(),
+                        vec![
+                            "/mnt".into(),
+                            "sh".into(),
+                            "-c".into(),
+                            crate::system::install::FIX_PERMISSIONS.to_string(),
+                        ],
+                    )
+                } else {
+                    ("artix-chroot".into(), vec!["/mnt".into()])
+                });
             }
             KeyCode::Esc => app.screen = crate::app::Screen::Mode,
             _ => {}
@@ -274,5 +330,91 @@ pub fn footer_hint(app: &App) -> String {
         t(app.lang, "rec.footer_mounted")
     } else {
         t(app.lang, "rec.footer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Once the system is mounted the screen offers TWO actions, and Enter on
+    /// the second one hands the permission repair to the chroot. Getting back
+    /// from `chmod 777 /` must not require knowing the commands — that is
+    /// precisely the state in which sudo no longer works to look them up.
+    #[test]
+    fn the_mounted_recovery_screen_can_repair_permissions() {
+        let mut app = App::new();
+        app.recovery_mounted = true;
+        app.recovery_focus = 3;
+        assert_eq!(
+            app.recovery_action, 0,
+            "the shell must be the default action"
+        );
+
+        // Enter on the default still opens the plain chroot shell.
+        handle_key(&mut app, key(KeyCode::Enter));
+        let (prog, args) = app.pending_interactive.take().expect("no action");
+        assert_eq!(prog, "artix-chroot");
+        assert_eq!(
+            args,
+            vec!["/mnt".to_string()],
+            "the default is not a plain shell"
+        );
+
+        // → picks the repair, and Enter runs the script INSIDE the chroot.
+        handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.recovery_action, 1);
+        handle_key(&mut app, key(KeyCode::Enter));
+        let (prog, args) = app.pending_interactive.take().expect("no repair action");
+        assert_eq!(prog, "artix-chroot");
+        assert_eq!(args.len(), 4, "the script must ride as ONE argv element");
+        assert_eq!(args[0], "/mnt");
+        assert_eq!(args[1], "sh");
+        assert_eq!(args[2], "-c");
+        let script = &args[3];
+        // The repairs that make a machine usable again, and the pass that
+        // restores everything a package owns.
+        for needle in [
+            "chmod",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "ssh_host_",
+            "pacman -Qkk",
+            "--overwrite",
+        ] {
+            assert!(
+                script.contains(needle),
+                "the repair script lost `{needle}` — it no longer does its job"
+            );
+        }
+        // It must never delete anything: this runs on a system the user still
+        // wants, and a repair that removes files is not a repair.
+        for forbidden in ["rm -rf", "rm -f /"] {
+            assert!(
+                !script.contains(forbidden),
+                "the repair script contains a destructive `{forbidden}`"
+            );
+        }
+    }
+
+    /// The script is shell shipped as an asset, so a syntax slip would only
+    /// surface on the live ISO — where the user is already in trouble.
+    #[test]
+    fn the_repair_script_is_valid_posix_sh() {
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", crate::system::install::FIX_PERMISSIONS])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "the permission-repair script is not valid sh:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

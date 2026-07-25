@@ -248,22 +248,44 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("[ ] ", theme::mute(), theme::normal())
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(mark, mark_style),
-                Span::styled(p.name.clone(), name_style),
-                Span::styled(
-                    if p.desc.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  — {}", p.desc)
-                    },
-                    theme::dim(),
-                ),
-            ]))
+            let mut spans = vec![Span::styled(mark, mark_style)];
+            // slayfetch wears its own flag: the name is painted red→violet so the
+            // entry says what it is before you read the description. Every other
+            // package keeps the plain checked/unchecked styling.
+            if p.name == "slayfetch" {
+                spans.extend(rainbow_text(&p.name));
+            } else {
+                spans.push(Span::styled(p.name.clone(), name_style));
+            }
+            spans.push(Span::styled(
+                if p.desc.is_empty() {
+                    String::new()
+                } else {
+                    format!("  — {}", p.desc)
+                },
+                theme::dim(),
+            ));
+            // Show the chosen pride logo right on the selected slayfetch row, and
+            // flag that Space (re)opens the picker.
+            if p.name == "slayfetch" && checked && !app.config.fastfetch_logo.is_empty() {
+                spans.push(Span::styled(
+                    format!("  → {}", app.config.fastfetch_logo),
+                    theme::title(),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
+    // Like the logo picker, the highlight sets NO foreground: a fg here would
+    // repaint slayfetch's rainbow (and the gold "checked" names) accent-cyan on
+    // whichever row the cursor sits on. bg + bold + the ▎ bar mark it instead,
+    // and all three degrade gracefully on a bare VT.
     let list = List::new(rows)
-        .highlight_style(theme::selected())
+        .highlight_style(
+            ratatui::style::Style::default()
+                .bg(theme::SEL_BG)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
         .highlight_symbol("▎ ");
     let mut st = ListState::default();
     if !rows_source.is_empty() {
@@ -279,9 +301,173 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         st.select(Some(sel));
     }
     f.render_stateful_widget(list, inner[1], &mut st);
+
+    // The slayfetch logo picker renders on top of everything.
+    if app.logo_modal_open {
+        draw_logo_modal(f, app, area);
+    }
+}
+
+/// The slayfetch logo picker: a scrollable list of the embedded Artix + pride
+/// logo variants, the chosen one highlighted. Names only — the actual images
+/// ship in the README collage, so the user knows what each looks like.
+fn draw_logo_modal(f: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+    let variants = crate::system::logos::variants();
+    let w = 46u16.min(area.width.saturating_sub(4)).max(24);
+    let h = 16u16.min(area.height.saturating_sub(2)).max(6);
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border())
+        .title(format!(" {} ", t(app.lang, "pkg.logo_title")))
+        .title_style(theme::title());
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    // Each variant's NAME is painted in ITS flag's colours, distributed across
+    // the letters top→bottom-stripe style. The currently-chosen one is marked
+    // (✓, accent) so it's findable while browsing from the top.
+    let chosen = &app.config.fastfetch_logo;
+    let rows: Vec<ListItem> = variants
+        .iter()
+        .map(|v| {
+            let mut spans = vec![Span::styled(
+                if v == chosen { "\u{2713} " } else { "  " }.to_string(),
+                theme::accent(),
+            )];
+            spans.extend(flag_colored(v));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    // The highlight must NOT set a foreground, or it would repaint the flag
+    // colours cyan on the selected row. A subtle bg + bold + the ▶ symbol mark
+    // the cursor instead (the bg degrades to the ▶/bold on a bare VT).
+    let list = List::new(rows)
+        .highlight_style(
+            ratatui::style::Style::default()
+                .bg(theme::SEL_BG)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+        .highlight_symbol("\u{25b6} ");
+    let mut st = ListState::default();
+    if !variants.is_empty() {
+        let sel = app.logo_cursor.min(variants.len() - 1);
+        let view_h = inner.height.saturating_sub(1) as usize;
+        let max_off = variants.len().saturating_sub(view_h);
+        *st.offset_mut() = sel.saturating_sub(view_h / 2).min(max_off);
+        st.select(Some(sel));
+    }
+    // Reserve the last row for a hint.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    f.render_stateful_widget(list, split[0], &mut st);
+    f.render_widget(
+        Paragraph::new(Span::styled(t(app.lang, "pkg.logo_hint"), theme::mute())),
+        split[1],
+    );
+}
+
+/// Paint a variant's name. Only the RAINBOW flag is coloured — its bright
+/// primaries (red→violet across the letters) map cleanly onto the 16-colour VT
+/// palette. Every other flag leans on pastels or dark tones that a truecolor-
+/// less console approximates poorly, so those names stay plain white for
+/// guaranteed legibility everywhere. Rainbow's one darker stripe is lifted by
+/// `readable()` so it reads on the dark background too.
+fn flag_colored(variant: &str) -> Vec<Span<'static>> {
+    if variant != "Rainbow" {
+        return vec![Span::styled(variant.to_string(), theme::normal())];
+    }
+    rainbow_text(variant)
+}
+
+/// Spread the rainbow palette across a string, one colour per letter (red→violet
+/// left to right). Used for the "Rainbow" logo name and for the `slayfetch`
+/// package name itself, so the entry announces what it is at a glance.
+fn rainbow_text(text: &str) -> Vec<Span<'static>> {
+    use ratatui::style::Color;
+    let palette = crate::system::logos::flag_palette("Rainbow");
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1);
+    let m = palette.len().max(1);
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let (r, g, b) = readable(palette[(i * m / n).min(m - 1)]);
+            Span::styled(
+                ch.to_string(),
+                ratatui::style::Style::default().fg(Color::Rgb(r, g, b)),
+            )
+        })
+        .collect()
+}
+
+/// Lift a colour so it reads on the dark panel background: pure black becomes a
+/// light grey, and any near-black colour is scaled up (hue preserved) to a
+/// visible brightness. Bright colours pass through unchanged.
+fn readable((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    let maxc = r.max(g).max(b);
+    if maxc == 0 {
+        return (0xAE, 0xAE, 0xBE); // black stripe → light grey
+    }
+    if maxc < 130 {
+        let factor = 175.0 / maxc as f32;
+        let s = |v: u8| (v as f32 * factor).round().min(255.0) as u8;
+        return (s(r), s(g), s(b));
+    }
+    (r, g, b)
+}
+
+/// Set up and open the logo picker. The list opens at the top (cursor 0), which
+/// is Rainbow — pinned first by `logos::variants()`, with the rest alphabetical
+/// after it. A leftover-empty choice resolves to DEFAULT_VARIANT in the plan, so
+/// slayfetch always installs a real logo.
+fn open_logo_modal(app: &mut App) {
+    let variants = crate::system::logos::variants();
+    if variants.is_empty() {
+        return; // no logos embedded — nothing to pick
+    }
+    if app.config.fastfetch_logo.is_empty() {
+        app.config.fastfetch_logo = crate::system::logos::DEFAULT_VARIANT.to_string();
+    }
+    app.logo_cursor = 0;
+    app.logo_modal_open = true;
+}
+
+/// Keys while the logo picker is open: move, commit (Enter/Space), or cancel.
+fn logo_modal_key(app: &mut App, key: KeyEvent) {
+    let variants = crate::system::logos::variants();
+    if super::nav::move_cursor(key.code, &mut app.logo_cursor, variants.len().max(1)) {
+        return;
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some(v) = variants.get(app.logo_cursor) {
+                app.config.fastfetch_logo = v.clone();
+            }
+            app.logo_modal_open = false;
+        }
+        KeyCode::Esc => app.logo_modal_open = false,
+        _ => {}
+    }
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    // The slayfetch logo picker owns all keys while it's open.
+    if app.logo_modal_open {
+        logo_modal_key(app, key);
+        return;
+    }
     // Esc steps backward WITHIN the screen, mirroring the forward flow:
     //   • package search with a query  → clear the query (back to popular list)
     //   • package search, empty query  → move focus up to the GPU section
@@ -362,17 +548,32 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             if let Some(name) = picked {
                 if let Some(pos) = app.config.extra_packages.iter().position(|x| *x == name) {
                     app.config.extra_packages.remove(pos);
-                } else {
-                    // zsh and fish are mutually exclusive: only one of them can
-                    // become the login shell, and installing both makes a mess
-                    // of the shell config. Picking one silently unpicks the
-                    // other.
-                    if name == "zsh" {
-                        app.config.extra_packages.retain(|x| x != "fish");
-                    } else if name == "fish" {
-                        app.config.extra_packages.retain(|x| x != "zsh");
+                    // Unticking slayfetch drops its logo choice.
+                    if name == "slayfetch" {
+                        app.config.fastfetch_logo.clear();
                     }
+                } else {
+                    // Mutually exclusive pairs: only one may be picked.
+                    //  • zsh / fish — only one login shell; both makes a mess.
+                    //  • fastfetch / slayfetch — slayfetch IS fastfetch with a
+                    //    chosen logo, so having both would install the package
+                    //    twice and fight over the config.
+                    match name.as_str() {
+                        "zsh" => app.config.extra_packages.retain(|x| x != "fish"),
+                        "fish" => app.config.extra_packages.retain(|x| x != "zsh"),
+                        "fastfetch" => {
+                            app.config.extra_packages.retain(|x| x != "slayfetch");
+                            app.config.fastfetch_logo.clear();
+                        }
+                        "slayfetch" => app.config.extra_packages.retain(|x| x != "fastfetch"),
+                        _ => {}
+                    }
+                    let is_slay = name == "slayfetch";
                     app.config.extra_packages.push(name);
+                    // Picking slayfetch opens the logo picker straight away.
+                    if is_slay {
+                        open_logo_modal(app);
+                    }
                 }
             }
         }

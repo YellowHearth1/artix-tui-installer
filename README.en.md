@@ -79,6 +79,16 @@ segmented toggles, and a live scrollable install log.
   on UEFI, or a **USB key** (a keyfile means you enter the passphrase only once).
 - **🥾 Bootloader choice** — GRUB, rEFInd, Limine or **EFISTUB**; with GRUB, `os-prober` for
   detecting other operating systems. Configured before the extra-disk step.
+  - **Artix-beside-Artix dual boot.** Each system adds its neighbour(s) to the
+    GRUB menu (the `/etc/grub.d/35_artix_neighbours` generator, because
+    `os-prober` misses a Linux whose kernels live on the ESP). But a system
+    installed **later** only becomes visible to the earlier one after that one
+    next regenerates its grub.cfg — which happens automatically on its first
+    kernel or GRUB update (the `zz-artix-grub` pacman hook), or immediately by
+    hand: `doas grub-mkconfig -o /boot/grub/grub.cfg`. Booting itself does not
+    depend on this: the installer also writes a shared fallback loader,
+    `EFI/BOOT/BOOTX64.EFI` (from the newest system, which lists them all), so the
+    machine always reaches a working menu.
 - **📦 EFISTUB (bootloader-less boot)** — the UEFI firmware loads the kernel
   **directly**, with no intermediate bootloader (Artix kernels are already built as
   EFI stubs, `CONFIG_EFI_STUB=y`). The initramfs and cmdline are passed via an
@@ -186,6 +196,27 @@ the full step name is in the panel header.
 
 ---
 
+## 🏳️‍🌈 slayfetch — fastfetch with your own logo
+
+On the **"Additional packages"** step, next to `fastfetch`, there's a
+**`slayfetch`** entry. It's the same fastfetch, just with a different logo: the
+**Artix logo over one of the LGBTQIA+ community flags**. Pick `slayfetch` instead
+of `fastfetch` (they're mutually exclusive — keep only one), press **Space**, and
+a list of logos appears; the chosen one shows right on the row. During install
+the ordinary `fastfetch` package is installed, and the chosen logo is dropped
+into `~/.config/fastfetch/`.
+
+> **How to enable:** Additional packages step → untick `fastfetch` → tick
+> `slayfetch` (Space) → in the picker that opens, choose a logo (↑/↓, Enter).
+> Done.
+
+> 🏳️‍🌈 **A note from the author:** I'm not a member of the LGBTQIA+ community, but
+> I added these flag logos as a gesture of support and solidarity.
+
+<img src="screenshots/slayfetch-logos.png" alt="All slayfetch logo variants: the Artix logo over LGBTQIA+ community flags" width="900">
+
+---
+
 ## ⌨️ Controls
 
 | Keys | Action |
@@ -205,6 +236,66 @@ the full step name is in the panel header.
 | Ctrl+C | emergency exit |
 
 The footer line always shows the contextual key hints for the active screen.
+
+<details>
+<summary><b>⌨️ Pinnacle window-manager hotkeys</b></summary>
+
+> Source: the config the installer places in `~/.config/pinnacle`.
+> **Mod** = the **Super** key (⊞ Win); the default terminal is **kitty**.
+
+**Applications**
+
+| Keys | Action |
+|---|---|
+| Mod + Enter · Mod + Q | terminal (kitty) |
+| Mod + R | app launcher (wofi) |
+| Mod + E | file manager (Caja) |
+| Mod + B | browser (Firefox — if installed) |
+| Mod + O | screenshot (Flameshot) |
+| Mod + V | clipboard history (cliphist) |
+| Mod + N | notification panel (SwayNC) |
+
+**Windows**
+
+| Keys | Action |
+|---|---|
+| Mod + C | close window |
+| Mod + F | fullscreen |
+| Mod + M | maximize |
+| Mod + S · Mod + Ctrl + Space | toggle floating |
+| Mod + LMB (drag) | move window |
+| Mod + RMB (drag) | resize window |
+
+**Tags (workspaces 1–9)**
+
+| Keys | Action |
+|---|---|
+| Mod + 1…9 | switch to tag |
+| Mod + Shift + 1…9 | move window to tag |
+| Mod + Ctrl + 1…9 | toggle tag visibility |
+| Mod + Ctrl + Shift + 1…9 | pin window to several tags |
+
+**Layouts**
+
+| Keys | Action |
+|---|---|
+| Mod + Space | next layout (master-stack, dwindle…) |
+| Mod + Shift + Space | previous layout |
+
+**Compositor**
+
+| Keys | Action |
+|---|---|
+| Mod + Shift + R · Mod + Ctrl + R | reload the config |
+| Mod + Shift + Q | quit (with prompt) |
+| Mod + Ctrl + Shift + Q | quit without prompt |
+
+**Media & brightness** — the hardware XF86 keys work even on the lock screen:
+volume ±2 % and mute (wpctl), mic mute, play/pause/stop/next/prev (playerctl),
+brightness ±10 % (brightnessctl).
+
+</details>
+
 
 ---
 

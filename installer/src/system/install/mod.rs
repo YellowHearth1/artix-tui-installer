@@ -79,6 +79,79 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         c
     };
 
+    // ── Manual-partitioning normalisation (v243) ──────────────────────────
+    // Manual mode keeps its fs choice in `manual_root_fs`; copy it into
+    // `root_fs` so every fs-keyed decision downstream — btrfs-progs in the
+    // host-tools step, snapper/rollback wiring, rootflags=subvol=@ — reads
+    // ONE truth. Three v1 boundaries are enforced here as a backstop behind
+    // the parts screen, because a plan builder must not trust a UI:
+    //   * no LUKS — the manual screen offers none, and improvising half a
+    //     LUKS setup on somebody's dual-boot disk is how data dies;
+    //   * GRUB only — the rEFInd/Limine/EFISTUB steps navigate by the
+    //     PARTLABELs and fixed partition numbers the AUTOMATIC layout
+    //     creates, none of which exist on a user-made table. GRUB probes
+    //     the mounted tree instead, which is exactly right here;
+    //   * os-prober ON — finding the neighbouring OS is the point.
+    // Manual AND install-alongside share this path: both bring pre-existing
+    // partitions and create new ones without wiping the table.
+    let manual = c.partition_mode.is_manual_family();
+    // A SOLO manual install (the user said there is no second OS) owns the disk
+    // outright, so the two v1 limits that exist because of a neighbour OS —
+    // GRUB-only and no LUKS — do not apply to it. `manual_solo` is set by the
+    // pmode survey; Alongside can never be solo, it is defined by the neighbour.
+    let solo = manual && c.manual_solo && c.partition_mode != crate::app::PartitionMode::Alongside;
+    let manual_had_luks = manual && !solo && c.encrypt_disk;
+    let manual_had_other_loader = manual && !solo && c.bootloader != Bootloader::Grub;
+    let manual_fixed: InstallConfig;
+    let c: &InstallConfig = if manual {
+        let mut cc = c.clone();
+        cc.root_fs = if cc.manual_root_fs.is_empty() {
+            "ext4".into()
+        } else {
+            cc.manual_root_fs.clone()
+        };
+        if solo {
+            // Encryption in the manual editor is ROOT-scope only: an encrypted
+            // /boot needs GRUB's cryptodisk plus a second keyfile dance, and
+            // the manual layout is too free-form to promise that yet. Root
+            // scope needs the kernels OUTSIDE the container, so the ESP holds
+            // /boot — the same shape the automatic path uses for this scope.
+            if cc.encrypt_disk {
+                cc.encrypt_scope = "root".into();
+                cc.manual_esp_mount = "/boot".into();
+            }
+            cc.os_prober = false; // no neighbour to find
+        } else {
+            cc.encrypt_disk = false;
+            cc.bootloader = Bootloader::Grub;
+            cc.os_prober = true;
+        }
+        // BIOS GRUB installs to a whole DISK (`grub-install --target=i386-pc
+        // /dev/sdX`), and the rest of the plan reads that from `disk`, which
+        // manual mode otherwise leaves empty. The editor resolved it from the
+        // scan; carry it across so legacy manual installs get a bootloader.
+        if !cc.boot_mode.is_uefi() && cc.disk.is_empty() {
+            cc.disk = if !cc.manual_boot_disk.is_empty() {
+                cc.manual_boot_disk.clone()
+            } else {
+                cc.manual_disk.clone()
+            };
+        }
+        // A partition marked for deletion cannot also be an extra mount: the
+        // storage step may still hold an entry for it from before the user
+        // deleted it, and the plan would then delete the partition and try to
+        // mount it in the same run.
+        if !cc.manual_deleted.is_empty() {
+            let gone = cc.manual_deleted.clone();
+            cc.extra_disks
+                .retain(|d| !gone.iter().any(|p| p.path == d.disk));
+        }
+        manual_fixed = cc;
+        &manual_fixed
+    } else {
+        c
+    };
+
     // Key-only USB mode: the user types NO passphrase at all. LUKS still
     // needs an initial secret to format and open the container, so we mint a
     // strong throwaway one from the kernel CSPRNG. It exists only inside this
@@ -135,6 +208,13 @@ pub fn build_plan(app: &App) -> Vec<Action> {
                echo \">>> Target disk {disk}: ${{dg}} GiB\"; \
                if [ \"$dg\" -lt 8 ]; then echo '!!! Warning: target disk under 8 GiB - may be too small for a full install.'; fi; \
              fi; \
+             yr=$(date -u +%Y 2>/dev/null || echo 0); \
+             echo \">>> System clock: $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null)\"; \
+             if [ \"$yr\" -lt 2024 ] || [ \"$yr\" -gt 2100 ]; then \
+               echo '!!! Warning: the system clock looks wrong. Package signatures are'; \
+               echo '!!! checked against it, so EVERY package may fail as \"signature is'; \
+               echo '!!! invalid\". Fix the date (or the VM/BIOS clock) and run again.'; \
+             fi; \
              if [ \"$FAIL\" = 1 ]; then {no_net}; exit 1; fi; \
              echo '>>> Pre-flight checks passed.'; \
              true",
@@ -178,8 +258,26 @@ pub fn build_plan(app: &App) -> Vec<Action> {
 
     let mut host_tools: Vec<&str> =
         vec!["artools", "gptfdisk", "parted", "dosfstools", "e2fsprogs"];
-    if c.root_fs == "btrfs" {
-        host_tools.push("btrfs-progs");
+    let mkfs_tool = |fs: &str| -> Option<&'static str> {
+        match fs {
+            "btrfs" => Some("btrfs-progs"),
+            "xfs" => Some("xfsprogs"),
+            "f2fs" => Some("f2fs-tools"),
+            "jfs" => Some("jfsutils"),
+            _ => None,
+        }
+    };
+    if let Some(t) = mkfs_tool(&c.root_fs) {
+        host_tools.push(t);
+    }
+    // A manual /home may use its own filesystem (possibly on a second disk):
+    // the LIVE environment needs that mkfs tool to format it.
+    if c.partition_mode.is_manual_family() && !c.manual_home.is_empty() {
+        if let Some(t) = mkfs_tool(&c.manual_home_fs) {
+            if !host_tools.contains(&t) {
+                host_tools.push(t);
+            }
+        }
     }
     // The live environment needs the mkfs tool for every additional disk the
     // user formats too (e.g. a btrfs/xfs/f2fs /home on a second disk).
@@ -208,12 +306,44 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     let host_tools_cmd = format!("pacman -Sy --needed --noconfirm {}", host_tools.join(" "));
     plan.push(act("sh", &["-c", &host_tools_cmd]));
 
-    // 1) Disk: partition, format, mount.
-    plan.extend(disk::build_plan(
-        c,
-        luks_pass,
-        c.extra_disks.iter().any(|d| d.mountpoint == "/home"),
-    ));
+    // 1) Disk: partition, format, mount — two roads to the same mounted /mnt.
+    //    Manual first states its contract in the log, then refuses BIOS as a
+    //    last-resort backstop (the UI refuses it too) BEFORE any destructive
+    //    step.
+    if manual {
+        plan.push(act(
+            "sh",
+            &["-c", "echo '>>> Manual partitioning: only the named partitions will be touched; the partition table stays yours.'"],
+        ));
+        if manual_had_luks {
+            plan.push(act(
+                "sh",
+                &["-c", "echo 'NOTE: disk encryption is not available in manual mode (v1) - continuing WITHOUT LUKS.'"],
+            ));
+        }
+        if manual_had_other_loader {
+            plan.push(act(
+                "sh",
+                &["-c", "echo 'NOTE: manual mode supports GRUB only (v1) - bootloader switched to GRUB.'"],
+            ));
+        }
+        // Legacy (BIOS) manual installs are supported now — the editor asks for
+        // a BIOS-boot partition on GPT and GRUB goes to the whole disk. The
+        // backstop that remains is the one that actually matters: without a
+        // disk to install the bootloader onto, stop BEFORE touching anything.
+        if !c.boot_mode.is_uefi() && c.disk.is_empty() {
+            plan.push(act(
+                "sh",
+                &["-c", "echo '!!! Legacy boot needs a target disk for GRUB, none was resolved. Aborting before any change.' >&2; exit 1"],
+            ));
+        }
+    }
+    let home_on_extra_disk = c.extra_disks.iter().any(|d| d.mountpoint == "/home");
+    if manual {
+        plan.extend(disk::build_manual_plan(c, home_on_extra_disk, luks_pass));
+    } else {
+        plan.extend(disk::build_plan(c, luks_pass, home_on_extra_disk));
+    }
     // Additional whole disks the user chose to format (e.g. a separate /home or
     // a storage disk): partition, format, and mount them now so they're part of
     // /mnt before basestrap and fstabgen records them. Existing partitions to
@@ -459,10 +589,43 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     ));
     plan.push(chroot("pacman-key --init"));
     plan.push(chroot("pacman-key --populate archlinux artix"));
+    // Refresh the KEYRING PACKAGES before anything else is installed.
+    //
+    // `--populate` only loads the keys that came with the keyring already on
+    // disk. When a repo starts signing with a key newer than that keyring, every
+    // later package fails with "signature from Artix Buildbot is invalid" —
+    // dozens in a row, each offering to delete a perfectly good download. The
+    // documented remedy is to update the keyring packages first, then populate
+    // again. Best-effort: a mirror hiccup here must not abort the install, and
+    // if the keyring was already current this is a no-op.
+    plan.push(chroot(
+        "pacman -Sy --needed --noconfirm artix-keyring archlinux-keyring || true",
+    ));
+    plan.push(chroot("pacman-key --populate archlinux artix || true"));
     // Refresh databases so the newly-enabled Arch repos are immediately usable
-    // in the installed system (|| true: don't fail the install if a mirror is
-    // momentarily unreachable — the user can re-sync later).
-    plan.push(chroot("pacman -Sy --noconfirm || true"));
+    // in the installed system — and UPGRADE (-u), never a bare -Sy.
+    //
+    // A bare `-Sy` here left the target a partial upgrade, which is what the
+    // Arch family warns about and it duly bit: basestrap had laid down the base
+    // against the ARTIX-only repo set, then the Arch repos were enabled just
+    // above, and every later `pacman -S` resolved against that wider, newer
+    // database while the base stayed at its older snapshot. When Lua split
+    // (`lua` 5.4 → 5.5, with 5.4 moving to `lua54`), a target holding the old
+    // `lua` met a fresh `lua54` and the whole 387-package transaction died on
+    // "/usr/bin/lua5.4 exists in filesystem (owned by lua)". The two packages
+    // declare no conflict and coexist happily — ONLY the mixed snapshot broke
+    // them. `-u` reconciles the base with the database its new packages come
+    // from, so the base's `lua` moves to 5.5 and frees the 5.4 paths.
+    //
+    // Retried like basestrap: cached packages make a retry cheap, and a stalled
+    // mirror must not decide the fate of the install. Still best-effort at the
+    // end — if the base was already current this is a no-op anyway.
+    plan.push(chroot(
+        "for a in 1 2 3; do pacman -Syu --noconfirm && exit 0; \
+         [ $a = 3 ] && break; \
+         echo \">>> database upgrade failed (attempt $a/3) - retrying in 5s...\"; \
+         sleep 5; done; true",
+    ));
 
     // Chaotic-AUR (optional, user-toggled on the Options screen): a binary
     // repository of prebuilt AUR packages maintained by the Garuda Linux team.
@@ -554,6 +717,27 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         plan.push(chroot(&combined));
     }
 
+    // Re-sync the databases RIGHT BEFORE the package phase, from the mirrors it
+    // will actually download from. The earlier `-Syu` synced against whatever
+    // mirrorlist basestrap left; several minutes and a mirror re-rank later, the
+    // package pool has moved on. If the sync DB still lists a version the
+    // mirrors have already superseded and DELETED, every mirror answers 404 for
+    // that exact file and the whole transaction dies — "failed retrieving …
+    // 404" from mirror after mirror was exactly this: a stale DB, not mirrors
+    // being down. A refresh here makes the DB name versions the pool still has.
+    //
+    // Retried (a stalled mirror must not decide the install's fate), and `-u`
+    // not a bare `-Sy` — a partial upgrade in the target is its own landmine
+    // (the lua/lua54 file conflict). Best-effort tail: if the base was already
+    // current this is a no-op, and a transient failure here still lets the
+    // package phase try — that phase now retries with its own refresh too.
+    plan.push(chroot(
+        "for a in 1 2 3; do pacman -Syu --noconfirm && exit 0; \
+         [ $a = 3 ] && break; \
+         echo \">>> database refresh failed (attempt $a/3) - retrying in 5s...\"; \
+         sleep 5; done; true",
+    ));
+
     // ─── Phase 2: interactive system packages ───────────────────────────────
     // Everything beyond the minimal base — desktop, GPU/vulkan stack, the
     // user's extra packages, display manager, seat backend — is installed here
@@ -602,16 +786,16 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         let xargs = xpkgs.join(" ");
         // --needed so already-present packages aren't reinstalled. No
         // --noconfirm: if the X stack ever has a provider choice the user
-        // decides; in practice these named targets resolve cleanly.
-        plan.push(chroot_interactive(&format!("pacman -S --needed {xargs}")));
+        // decides; in practice these named targets resolve cleanly. Retried:
+        // this is the phase the 404 storm hit, and one flaky download must not
+        // end the install (see pacman_install_retry).
+        plan.push(chroot_interactive(&pacman_install_retry(&xargs)));
     }
     // The rest of the system: desktop, GPU, extras, DM, seat. Interactive.
     let sys_pkgs = system_packages(c);
     if !sys_pkgs.is_empty() {
         let sys_args = sys_pkgs.join(" ");
-        plan.push(chroot_interactive(&format!(
-            "pacman -S --needed {sys_args}"
-        )));
+        plan.push(chroot_interactive(&pacman_install_retry(&sys_args)));
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1230,16 @@ fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
             ROLLBACK_DESKTOP,
         ));
 
+        // The shared log/warn helper the three boot services source. Written
+        // FIRST: each of them falls back to no-op stubs when it is missing, so
+        // a wrong order would not break the boot — it would just silently throw
+        // away the only record those detached services ever leave.
+        plan.push(write_target_file(
+            "/mnt/usr/local/lib/artix-installer/log.sh",
+            LOG_LIB,
+        ));
+        plan.push(chroot("chmod 644 /usr/local/lib/artix-installer/log.sh"));
+
         // First-boot baseline snapshot: take a "clean system" restore point on
         // the first real boot (snapper can't run in the chroot). This also makes
         // the GRUB snapshot submenu non-empty from the very first snapshot. The
@@ -1162,13 +1356,29 @@ fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
         // or if that pull fails, fall back to building paru FROM SOURCE against
         // the system's own libalpm: slower (a Rust build) but robust against a
         // version mismatch. Non-interactive either way.
-        // Under doas, makepkg -si must escalate via doas, not sudo: point it
-        // at doas through the --asdeps/-- install step by exporting
-        // PACMAN's escalation. makepkg reads $PACMAN? No — it calls sudo
-        // directly, so the sudo→doas symlink we created above is what makes
-        // `makepkg -si` work. No extra flag needed here.
+        // Build paru WITHOUT any privilege escalation inside makepkg — the one
+        // thing that reliably breaks on a doas system. `makepkg -si` elevates
+        // twice: to install the makedep (cargo) and to install the built
+        // package. On doas that elevation goes through the sudo→doas shim, and
+        // makepkg calls `sudo -k` (reset the timestamp) — a flag doas rejects
+        // ("usage: doas"), so the dep install fails, cargo never lands, and the
+        // Rust build dies with "could not resolve all dependencies". Seen live.
+        //
+        // So do the three things makepkg would, but split by privilege:
+        //   1. as ROOT: install paru's build deps (base-devel, git, rust →
+        //      cargo). Plain in-chroot pacman, no elevation, no tty, no shim.
+        //   2. as the USER: `makepkg -f` (NOT -s) — every dep is already
+        //      present, so makepkg builds and never tries to elevate.
+        //   3. as ROOT: `pacman -U` the freshly built package. Again no
+        //      elevation. The -debug split (if makepkg produced one) is filtered
+        //      out so only paru itself is installed.
+        // getent gives the real home, so a non-/home layout still works.
         let build_paru_from_src = format!(
-            "su - {user} -c 'cd ~ && rm -rf paru && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si --noconfirm'"
+            "pacman -S --needed --noconfirm base-devel git rust && \
+             su - {user} -c 'cd ~ && rm -rf paru && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -f --noconfirm' && \
+             ph=$(getent passwd {user} | cut -d: -f6) && \
+             pp=$(ls -1t \"$ph\"/paru/paru-*.pkg.tar.zst 2>/dev/null | grep -v -- -debug- | head -n1) && \
+             [ -n \"$pp\" ] && pacman -U --noconfirm \"$pp\""
         );
         if c.chaotic_aur {
             plan.push(chroot(&format!(
@@ -1335,6 +1545,33 @@ fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
         }
     }
 
+    // doas was chosen: get rid of the real `sudo` by REPLACING it with the AUR
+    // `doas-sudo-shim`. It cannot merely be removed — `sudo` is a hard
+    // dependency of `base-devel` (makepkg) and of `qt-sudo` (which `octopi`, a
+    // default package, pulls), so `pacman -R sudo` fails and `-Rdd` would leave
+    // those broken. The shim PROVIDES `sudo`, so it satisfies those exact
+    // dependencies while making the `sudo` command transparently run doas —
+    // nothing is left present-but-unauthorised ("user NOT in sudoers").
+    //
+    // Built directly here (a trivial script package; no paru needed) as the
+    // user, then swapped in as root. Order is chosen for safety: build the
+    // package FIRST, and only if it is in hand force-remove the real sudo and
+    // install the shim — a failed build leaves sudo untouched, and a failed
+    // install reinstalls sudo, so the target is never left with neither.
+    if c.use_doas && c.account_mode.needs_user() {
+        let user = &c.username;
+        plan.push(chroot(&format!(
+            "pacman -S --needed --noconfirm base-devel git && \
+             su - {user} -c 'cd ~ && rm -rf doas-sudo-shim && git clone https://aur.archlinux.org/doas-sudo-shim.git && cd doas-sudo-shim && makepkg -f --noconfirm' && \
+             dsh=$(getent passwd {user} | cut -d: -f6) && \
+             dsp=$(ls -1t \"$dsh\"/doas-sudo-shim/doas-sudo-shim-*.pkg.tar.zst 2>/dev/null | grep -v -- -debug- | head -n1) && \
+             [ -n \"$dsp\" ] && {{ pacman -Rdd --noconfirm sudo 2>/dev/null; pacman -U --noconfirm \"$dsp\" && echo '>>> sudo replaced with doas-sudo-shim (the sudo command now runs doas)' || pacman -S --needed --noconfirm sudo; }}; true"
+        )));
+        plan.push(chroot(&format!(
+            "rm -rf /home/{user}/doas-sudo-shim || true"
+        )));
+    }
+
     // Snapshots: every chroot pacman/paru transaction is now done, so re-enable
     // snap-pac. The BOOTED system (with D-Bus + snapper working) will then take
     // pre/post snapshots on each pacman run — no more chroot "fatal library error".
@@ -1396,6 +1633,33 @@ fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
     }
 }
 
+/// A `pacman -S --needed <pkgs>` install, wrapped so one flaky download does not
+/// end the install.
+///
+/// This is the phase a real 404 storm hit: every Arch mirror answered 404 for
+/// the exact xorg-server / libinput / … files the sync DB named, because the DB
+/// had gone stale against a moved-on pool, and the transaction died outright.
+/// Two things make a retry worth having here: a genuinely transient mirror
+/// hiccup, and — the real case — a stale DB, which the `-Syu` between attempts
+/// refreshes so the next try asks for versions the pool still carries.
+///
+/// Kept INTERACTIVE (no --noconfirm on the install itself): the system phase
+/// still has to show provider choices. The refresh IS --noconfirm, and `-u`
+/// not a bare `-Sy` — a partial upgrade in the target is its own landmine.
+/// A retry re-shows any provider prompt, which is a fair price for the rare
+/// failure it rescues.
+fn pacman_install_retry(pkgs: &str) -> String {
+    format!(
+        "for a in 1 2 3; do \
+           pacman -S --needed {pkgs} && exit 0; \
+           [ $a = 3 ] && exit 1; \
+           echo \">>> package retrieval failed (attempt $a/3) - refreshing databases, retrying in 5s...\"; \
+           pacman -Syu --noconfirm || true; \
+           sleep 5; \
+         done"
+    )
+}
+
 fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
     // 9) Accounts. Four modes (see AccountMode). Passwords are piped to
     //    chpasswd via printf so we avoid interactive prompts; the values come
@@ -1439,11 +1703,17 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
         }
         // chpasswd reads "user:password" from stdin — no shell quoting of the
         // password is needed, which avoids breakage on special characters.
-        plan.push(chroot(&format!(
-            "printf '%s:%s\\n' {} \"{}\" | chpasswd",
-            c.username,
-            shell_escape_dq(&c.user_password)
-        )));
+        plan.push(
+            chroot(&format!(
+                "printf '%s:%s\\n' {} \"{}\" | chpasswd",
+                c.username,
+                shell_escape_dq(&c.user_password)
+            ))
+            .logged_as(&format!(
+                "chroot: printf '%s:%s\\n' {} \"***\" | chpasswd",
+                c.username
+            )),
+        );
         // Privilege escalation for wheel, honouring BOTH options-screen
         // choices: the tool (sudo/doas) and whether it asks for a password.
         if c.use_doas {
@@ -1464,9 +1734,13 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
             plan.push(chroot(
                 "chown root:root /etc/doas.conf && chmod 0400 /etc/doas.conf",
             ));
-            // Some scripts/tools call `sudo` by name; a doas-backed shim
-            // keeps them working without pulling in real sudo.
-            plan.push(chroot("ln -sf $(command -v doas) /usr/local/bin/sudo"));
+            // NO naive `sudo`→`doas` symlink here. It "works" for a bare
+            // `sudo cmd` but breaks the instant a tool passes a sudo-only flag
+            // (makepkg's `sudo -k` is exactly what killed the AUR build), and
+            // opendoas upstream deliberately ships no such symlink for the same
+            // reason. A user who wants `sudo` to drive doas can opt into the
+            // AUR `doas-sudo-shim` package (a proper wrapper) on the options
+            // screen; that is wired through effective_aur_packages.
         } else if c.passwordless_sudo {
             plan.push(chroot(
                 "echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/10-wheel-nopasswd; chmod 440 /etc/sudoers.d/10-wheel-nopasswd",
@@ -1539,11 +1813,23 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
         let home = format!("/home/{}", c.username);
 
         if want_zsh || want_fish {
-            // Generate ~/.config/starship.toml from the built-in preset, as the
-            // user. `mkdir -p ~/.config` first so the output path exists.
+            // Generate ~/.config/starship.toml from the built-in preset AS ROOT.
+            // `starship preset NAME -o FILE` only writes a file — it needs
+            // neither the user's shell nor a login session. The old
+            // `su - {user}` LOGIN shell was fragile in the chroot, and when it
+            // failed it was masked by `|| true`: no theme was written, so
+            // starship fell back to its plain `❯` default — which looks exactly
+            // like "starship isn't installed" (the reported symptom). Ownership
+            // is fixed by the later `chown -R {home}` in plan_session_env, the
+            // same as every other config written here. A VISIBLE log line
+            // replaces the silent `|| true`, so a future failure is diagnosable
+            // instead of a mystery.
             plan.push(chroot(&format!(
-                "su - {user} -c 'mkdir -p ~/.config && starship preset pastel-powerline -o ~/.config/starship.toml' || true",
-                user = c.username
+                "mkdir -p {home}/.config && \
+                 starship preset pastel-powerline -o {home}/.config/starship.toml \
+                 && echo '>>> starship theme (pastel-powerline) written' \
+                 || echo '!! starship theme generation failed - the default prompt will be used'",
+                home = home
             )));
         }
 
@@ -1582,16 +1868,18 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
             ));
         }
 
-        // fastfetch config + logo → ~/.config/fastfetch. fastfetch ships as
-        // a DEFAULT-CHECKED entry in the packages screen; while it stays
-        // selected, the themed config + syrnyk logo are written here. The
-        // logo is a PNG (binary), written via base64; the config is text
-        // whose logo `source` we rewrite to the user's ABSOLUTE home path
+        // fastfetch config + logo → ~/.config/fastfetch. fastfetch (default) and
+        // slayfetch (fastfetch with a chosen Artix + pride logo) are mutually
+        // exclusive entries in the packages screen; either one writes the themed
+        // config here. The logo is a PNG (binary), written via base64; the config
+        // is text whose logo `source` we rewrite to the user's ABSOLUTE home path
         // (fastfetch only expands ~ on v2.41.0+ and $HOME via wordexp, so a
-        // literal absolute path always resolves regardless of version or
-        // launch context, e.g. from .zshrc). Embedded in the installer
+        // literal absolute path always resolves regardless of version or launch
+        // context, e.g. from .zshrc). Everything is embedded in the installer
         // binary, no ISO dependency.
-        if c.extra_packages.iter().any(|x| x == "fastfetch") {
+        let want_fastfetch = c.extra_packages.iter().any(|x| x == "fastfetch");
+        let want_slayfetch = c.extra_packages.iter().any(|x| x == "slayfetch");
+        if want_fastfetch || want_slayfetch {
             plan.push(chroot(&format!("mkdir -p {home}/.config/fastfetch")));
             let fastfetch_config = FASTFETCH_CONFIG.replace(
                 "$HOME/.config/fastfetch/fastfetch.png",
@@ -1602,11 +1890,32 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
                 ".config/fastfetch/config.jsonc",
                 &fastfetch_config,
             ));
+            // slayfetch → the chosen pride logo (resolve() guarantees a real
+            // variant); plain fastfetch → the default syrnyk logo.
+            let logo: std::borrow::Cow<[u8]> = if want_slayfetch {
+                crate::system::logos::resolve(&c.fastfetch_logo)
+                    .and_then(|v| crate::system::logos::bytes(&v))
+                    .map(std::borrow::Cow::Owned)
+                    .unwrap_or(std::borrow::Cow::Borrowed(FASTFETCH_LOGO_PNG))
+            } else {
+                std::borrow::Cow::Borrowed(FASTFETCH_LOGO_PNG)
+            };
             plan.extend(write_home_binary(
                 &home,
                 ".config/fastfetch/fastfetch.png",
-                FASTFETCH_LOGO_PNG,
+                &logo,
             ));
+            // slayfetch: give the user a real `slayfetch` command, since that's
+            // what they picked. A tiny wrapper in /usr/local/bin execs fastfetch
+            // (which reads the config + pride logo above) and works in EVERY
+            // shell — more robust than per-shell aliases.
+            if want_slayfetch {
+                plan.push(write_target_file(
+                    "/mnt/usr/local/bin/slayfetch",
+                    "#!/bin/sh\n# Installed by the Artix installer: slayfetch is fastfetch\n# with the chosen Artix + pride logo.\nexec fastfetch \"$@\"\n",
+                ));
+                plan.push(chroot("chmod 755 /usr/local/bin/slayfetch"));
+            }
         }
 
         // wofi config + stylesheet → ~/.config/wofi. Written when wofi is a
@@ -1890,16 +2199,22 @@ fn plan_session_env(plan: &mut Vec<Action>, c: &InstallConfig) {
     ));
     match c.account_mode {
         crate::app::AccountMode::UserSameRoot => {
-            plan.push(chroot(&format!(
-                "printf 'root:%s\\n' \"{}\" | chpasswd",
-                shell_escape_dq(&c.user_password)
-            )));
+            plan.push(
+                chroot(&format!(
+                    "printf 'root:%s\\n' \"{}\" | chpasswd",
+                    shell_escape_dq(&c.user_password)
+                ))
+                .logged_as("chroot: printf 'root:%s\\n' \"***\" | chpasswd"),
+            );
         }
         crate::app::AccountMode::UserSeparateRoot | crate::app::AccountMode::RootOnly => {
-            plan.push(chroot(&format!(
-                "printf 'root:%s\\n' \"{}\" | chpasswd",
-                shell_escape_dq(&c.root_password)
-            )));
+            plan.push(
+                chroot(&format!(
+                    "printf 'root:%s\\n' \"{}\" | chpasswd",
+                    shell_escape_dq(&c.root_password)
+                ))
+                .logged_as("chroot: printf 'root:%s\\n' \"***\" | chpasswd"),
+            );
         }
         crate::app::AccountMode::UserSudoOnly => {
             // Disable root login entirely; access is via sudo (wheel).
@@ -1959,10 +2274,16 @@ fn plan_initramfs_luks(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool, lu
             plan.push(chroot(
                 "install -d -m 700 /etc/luks && dd if=/dev/urandom of=/etc/luks/boot.key bs=512 count=4 && chmod 600 /etc/luks/boot.key",
             ));
-            plan.push(chroot(&format!(
-                "bootpart=$(blkid -t PARTLABEL=BOOT -o device | head -n1); printf '%s' '{pass}' | cryptsetup luksAddKey \"$bootpart\" /etc/luks/boot.key",
-                pass = pass_esc
-            )));
+            plan.push(
+                chroot(&format!(
+                    "bootpart=$(blkid -t PARTLABEL=BOOT -o device | head -n1); printf '%s' '{pass}' | cryptsetup luksAddKey \"$bootpart\" /etc/luks/boot.key",
+                    pass = pass_esc
+                ))
+                .logged_as(
+                    "chroot: bootpart=$(blkid -t PARTLABEL=BOOT -o device | head -n1); \
+                     printf '%s' '***' | cryptsetup luksAddKey \"$bootpart\" /etc/luks/boot.key",
+                ),
+            );
             // crypttab: open cryptboot from the BOOT partition's LUKS UUID using
             // the keyfile, automatically, when the system comes up.
             plan.push(chroot(
@@ -2025,7 +2346,17 @@ fn plan_initramfs_luks(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool, lu
                 } else {
                     String::new()
                 }
-            )]));
+            )])
+            .logged_as(&format!(
+                "sh -c wipe '{dev}', mkfs.fat ARTIXKEY, mount, mint 4096-byte keyfile, \
+                 cryptsetup luksAddKey \"$rootpart\" (passphrase ***), copy key to stick, \
+                 shred the temporary copy{}",
+                if c.usb_key_only {
+                    ", luksRemoveKey (passphrase ***)"
+                } else {
+                    ""
+                }
+            )));
             // The initramfs must be able to see the stick BEFORE asking for
             // the key: USB storage + vfat + the FAT codepage/NLS modules
             // (autodetect won't reliably include them for a hot-pluggable
@@ -2596,15 +2927,114 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
         Bootloader::Grub => {
             // GRUB (default).
             if uefi {
-                let efi_dir = if c.encrypt_disk && c.encrypt_scope == "full" {
+                // The ESP mountpoint decides --efi-directory. Manual mode lets
+                // the user put the ESP at /boot/efi (small reused Windows ESP,
+                // kernels on root); full-disk encryption always splits it that
+                // way; otherwise the ESP is /boot.
+                let efi_dir = if c.partition_mode.is_manual_family() {
+                    if c.manual_esp_mount == "/boot/efi" {
+                        "/boot/efi"
+                    } else {
+                        "/boot"
+                    }
+                } else if c.encrypt_disk && c.encrypt_scope == "full" {
                     "/boot/efi"
                 } else {
                     "/boot"
                 };
+                let base_id = c.bootloader_id.replace('\'', "");
+                // Our root's filesystem UUID, for the .artix-tui-owned marker.
+                // findmnt answers from the udev/blkid cache, which inside a
+                // just-populated chroot may not be there — and an EMPTY marker
+                // is worse than none: the neighbour generator then cannot
+                // recognise our own loader and emits a menu entry that
+                // chainloads us into our own menu. So probe the device when the
+                // cache comes up empty (btrfs appends [/subvol] to SOURCE,
+                // which has to come off before blkid sees a device path).
+                let root_uuid_sh = "me=$(findmnt -no UUID / 2>/dev/null); \
+                     [ -n \"$me\" ] || me=$(blkid -s UUID -o value \
+                       \"$(findmnt -no SOURCE / 2>/dev/null | sed 's/\\[.*//')\" 2>/dev/null); ";
+                if c.partition_mode.is_manual_family() && !c.manual_solo {
+                    // A SHARED ESP may already carry an EFI/<id> directory from
+                    // the OS next door — and if that OS is another Artix (or any
+                    // distro using the same id), a plain grub-install OVERWRITES
+                    // its loader: the neighbour stops booting the moment ours
+                    // lands. Seen live: Artix installed beside Artix left only
+                    // the new one bootable. Pick the first free id instead, and
+                    // mark the directory ours so a retry reuses it rather than
+                    // minting Artix-3, Artix-4…
+                    // `$id` is quoted EVERYWHERE it is expanded: the UEFI-entry
+                    // name may contain spaces (the Options field allows them),
+                    // and an unquoted "My Artix" would word-split the [ -d ]
+                    // test and touch, breaking the whole install script.
+                    // The marker carries WHO owns the directory — the root
+                    // filesystem UUID of the install that wrote it — not merely
+                    // "some artix-tui install". An empty marker was the whole
+                    // bug: a SECOND Artix put here by this same installer found
+                    // the first one's marker, read it as its own, and
+                    // grub-install overwrote the neighbour's loader exactly as
+                    // before. Reuse the directory only when it is genuinely
+                    // ours (a re-install of THIS system, which should not mint
+                    // Artix-3, Artix-4…); otherwise step to the next free id.
+                    //
+                    // A missing UUID never matches: without it we mint a new id
+                    // rather than risk claiming a stranger's directory.
+                    plan.push(chroot(&format!(
+                        "{uuid_sh}\
+                         id='{base}'; n=2; \
+                         while [ -d \"{efi}/EFI/$id\" ]; do \
+                           owner=$(cat \"{efi}/EFI/$id/.artix-tui-owned\" 2>/dev/null); \
+                           if [ -n \"$me\" ] && [ \"$owner\" = \"$me\" ]; then break; fi; \
+                           id='{base}-'$n; n=$((n+1)); \
+                         done; \
+                         echo \">>> GRUB EFI bootloader-id: $id\"; \
+                         grub-install --target=x86_64-efi --efi-directory={efi} --bootloader-id=\"$id\" && \
+                         printf '%s\\n' \"$me\" > \"{efi}/EFI/$id/.artix-tui-owned\"",
+                        uuid_sh = root_uuid_sh,
+                        base = base_id,
+                        efi = efi_dir
+                    )));
+                } else {
+                    // No id dance here: this install either owns the disk or
+                    // wiped it, so EFI/<id> is ours by construction and minting
+                    // Artix-2 on every reinstall (root is reformatted, so its
+                    // UUID never matches the old marker) would litter the ESP.
+                    //
+                    // The MARKER is still written, because it answers a
+                    // different question: "which EFI directory is mine?" The
+                    // neighbour generator below runs on EVERY install now, and
+                    // without a marker it cannot tell our own loader from a
+                    // stranger's — it would chainload us into our own menu. It
+                    // also stops a LATER install from mistaking our directory
+                    // for a free one and overwriting the loader.
+                    plan.push(chroot(&format!(
+                        "{uuid_sh}\
+                         grub-install --target=x86_64-efi --efi-directory={efi} --bootloader-id='{id}' && \
+                         printf '%s\\n' \"$me\" > '{efi}/EFI/{id}/.artix-tui-owned'",
+                        uuid_sh = root_uuid_sh,
+                        efi = efi_dir,
+                        id = base_id
+                    )));
+                }
+                // ALSO install to the removable/fallback path
+                // EFI/BOOT/BOOTX64.EFI. The bootloader-id install above is meant
+                // to leave a NAMED NVRAM boot entry — but efibootmgr cannot
+                // write one here: artix-chroot mounts /sys READ-ONLY (artools
+                // mount.sh), so efivars is inaccessible and the entry is
+                // silently skipped ("Installation finished. No error reported").
+                // With no NVRAM entry AND no fallback path, the firmware is left
+                // to ENUMERATE the ESP's loaders: fine with a single GRUB, but
+                // with TWO (Artix beside Artix) OVMF picks one AT RANDOM every
+                // boot — sometimes bypassing the menu entirely. That was the
+                // reported chaos. The fallback is one fixed, always-present
+                // target; the NEWEST install wins it, and the newest GRUB is the
+                // one whose chain entries list every neighbour, so booting it
+                // shows them all. Standard reliability install for firmware with
+                // flaky NVRAM (OVMF, many real UEFIs). Best-effort: a firmware
+                // that DID take the named entry still boots fine either way.
                 plan.push(chroot(&format!(
-                    "grub-install --target=x86_64-efi --efi-directory={efi} --bootloader-id='{id}'",
-                    efi = efi_dir,
-                    id = c.bootloader_id.replace('\'', "")
+                    "grub-install --target=x86_64-efi --efi-directory={efi} --removable || true",
+                    efi = efi_dir
                 )));
             } else {
                 plan.push(chroot(&format!("grub-install --target=i386-pc {}", c.disk)));
@@ -2618,6 +3048,76 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
                      sed -i 's/^GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub; \
                      else echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub; fi",
                 ));
+                // GRUB_DEFAULT=saved makes GRUB READ the remembered entry from
+                // grubenv, so a default set from the running system
+                // (`grub-set-default`) survives. Reading is always safe.
+                //
+                // GRUB_SAVEDEFAULT is deliberately NOT set. It would make GRUB
+                // WRITE grubenv on every boot, to remember the last-booted entry
+                // — and that write is done through a block list, which fails
+                // whenever the file is not a plain contiguous run of blocks:
+                //
+                //   error: commands/loadenv.c:check_blocklists:289:
+                //          sparse file not allowed.
+                //   Press any key to continue...
+                //
+                // This code used to set it, with a comment claiming the failure
+                // was silent and harmless on btrfs. It is neither: GRUB prints
+                // that error and HALTS the boot until a key is pressed, on every
+                // single start. Reported from a three-system machine. Remembering
+                // the last choice is a convenience; an error that stops an
+                // unattended boot is not a fair price for it.
+                plan.push(chroot(
+                    "if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then \
+                       sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub; \
+                     else echo 'GRUB_DEFAULT=saved' >> /etc/default/grub; fi; \
+                     if grep -q '^GRUB_SAVEDEFAULT=' /etc/default/grub; then \
+                       sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=false/' /etc/default/grub; fi",
+                ));
+            }
+            // Neighbour OS loaders → chainload entries, installed as a grub.d
+            // GENERATOR (/etc/grub.d/35_artix_neighbours) so it re-scans on
+            // EVERY grub-mkconfig. A one-time scan at install could only see the
+            // neighbours that already existed: the FIRST of two Artix systems
+            // never listed the SECOND (it did not exist yet), so its menu was
+            // missing it forever. As a generator, whenever THIS system next
+            // regenerates its config (a kernel or grub update, or by hand) it
+            // picks up every current neighbour — self-healing in both
+            // directions. os-prober alone misses any Linux whose kernels live
+            // on its ESP (this installer's own default layout), which is why a
+            // dedicated scanner exists at all. Numbered 35 so its entries sit
+            // right after os-prober's (30) and before the rollback entry (45).
+            //
+            // Installed on EVERY UEFI GRUB install, NOT only when the user said
+            // there is another OS. That answer describes the disk at install
+            // time and was trusted absolutely: a person who picked "Artix only"
+            // while a neighbour actually sat on the disk got no generator at
+            // all, and their first system vanished from the menu — reported
+            // exactly that way. The generator costs nothing when there is no
+            // neighbour (it prints entries only for EFI directories that hold a
+            // real loader and are not ours), and being a generator it also
+            // catches a system installed LATER, which no install-time answer
+            // could ever describe. The layout at boot time is the authority,
+            // not what was ticked during setup.
+            if uefi {
+                // Same ESP-mountpoint rule as the grub-install above (its
+                // binding is scoped to that branch, so restate it here).
+                let esp_dir = if c.partition_mode.is_manual_family() {
+                    if c.manual_esp_mount == "/boot/efi" {
+                        "/boot/efi"
+                    } else {
+                        "/boot"
+                    }
+                } else if c.encrypt_disk && c.encrypt_scope == "full" {
+                    "/boot/efi"
+                } else {
+                    "/boot"
+                };
+                plan.push(write_target_file(
+                    "/mnt/etc/grub.d/35_artix_neighbours",
+                    &GRUB_NEIGHBOUR_CHAIN.replace("@@ESP_DIR@@", esp_dir),
+                ));
+                plan.push(chroot("chmod 755 /etc/grub.d/35_artix_neighbours"));
             }
             // Boot-time rollback entry for GRUB: a generator that adds a
             // top-level "System Rollback" menuentry (booting with artix.rollback)
@@ -2633,6 +3133,17 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
                 ));
                 plan.push(chroot("chmod 755 /etc/grub.d/45_artix_rollback"));
             }
+            // Keep grub.cfg current automatically: a pacman hook regenerates it
+            // after any kernel change or grub upgrade. Without it a new kernel
+            // never reaches the menu (Arch/Artix's grub package does not do this
+            // on its own), and — the reason it matters here — the neighbour
+            // generator re-runs on every regeneration, so a dual-boot system
+            // installed LATER becomes visible the next time this one updates its
+            // kernel, with no manual grub-mkconfig.
+            plan.push(write_target_file(
+                "/mnt/etc/pacman.d/hooks/zz-artix-grub.hook",
+                GRUB_REGEN_HOOK,
+            ));
             plan.push(chroot("grub-mkconfig -o /boot/grub/grub.cfg"));
         }
     }
@@ -2669,7 +3180,7 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{BootMode, ExtraDisk};
+    use crate::app::{BootMode, ExtraDisk, PartitionMode};
 
     fn plan_text(plan: &[Action]) -> String {
         plan.iter()
@@ -2712,6 +3223,122 @@ mod tests {
     // Every test below is a bug that actually shipped. They exist so that a
     // future refactor cannot quietly bring it back: the plan is pure data, so
     // an install can be inspected without touching a disk.
+
+    /// The shared log helper lands before anything sources it.
+    ///
+    /// The boot services stub `log`/`warn` out when the library is missing, so
+    /// a wrong order costs no boot and raises no error — it just silently
+    /// throws away the only trace those detached services leave, which is the
+    /// exact failure this logging exists to prevent.
+    #[test]
+    fn the_log_helper_is_installed_before_the_services_that_source_it() {
+        let mut a = install_app();
+        a.config.root_fs = "btrfs".into();
+        a.config.btrfs_subvolumes = true;
+        a.config.btrfs_snapshots = true;
+        let t = plan_text(&build_plan(&a));
+
+        let lib = t
+            .lines()
+            .position(|l| l.contains("/usr/local/lib/artix-installer/log.sh"))
+            .expect("the shared log helper is never installed");
+
+        // Every script that sources it must come later.
+        for (i, line) in t.lines().enumerate() {
+            if line.contains(". /usr/local/lib/artix-installer/log.sh") {
+                assert!(
+                    lib < i,
+                    "a service sources the log helper before it is written:\n{line}"
+                );
+            }
+        }
+        // And the sourcing really is there — otherwise the loop above passes
+        // by simply never running.
+        assert!(
+            t.contains(". /usr/local/lib/artix-installer/log.sh"),
+            "no service sources the helper, so installing it is dead weight"
+        );
+    }
+
+    /// No secret ever reaches the install log.
+    ///
+    /// The log is mirrored to /tmp/installer.log and copied onto the FINISHED
+    /// system, so a password echoed while installing outlives the installation
+    /// and rides along in any bug report the log is pasted into. `0600` is no
+    /// answer: it does not survive a backup, a `cat`, or a helpful paste.
+    ///
+    /// Two halves, because either alone has a hole. The value check cannot see
+    /// the USB-key passphrase (it is MINTED at plan time and never stored), and
+    /// the structural check cannot prove a redaction is actually secret-free.
+    #[test]
+    fn no_password_or_passphrase_can_reach_the_install_log() {
+        const USER_PW: &str = "UserPwNeedle01";
+        const ROOT_PW: &str = "RootPwNeedle02";
+        const LUKS_PW: &str = "LuksPhraseNeedle03";
+
+        // Every account mode, and both LUKS shapes — the secrets live on
+        // different branches and a per-branch miss is exactly how one escapes.
+        let mut configs: Vec<App> = Vec::new();
+        for mode in [
+            crate::app::AccountMode::UserSameRoot,
+            crate::app::AccountMode::UserSeparateRoot,
+            crate::app::AccountMode::RootOnly,
+            crate::app::AccountMode::UserSudoOnly,
+        ] {
+            for encrypt in [false, true] {
+                let mut a = install_app();
+                a.config.account_mode = mode;
+                // A quote and a dollar sign: these reach the command
+                // SHELL-ESCAPED, so a redaction that searched for the raw value
+                // would sail straight past them.
+                a.config.user_password = format!("{USER_PW}'$x");
+                a.config.root_password = format!("{ROOT_PW}\"$y");
+                a.config.encrypt_disk = encrypt;
+                if encrypt {
+                    a.config.luks_passphrase = LUKS_PW.into();
+                }
+                configs.push(a);
+            }
+        }
+        // And the key-only stick, whose passphrase is minted rather than typed.
+        let mut usb = install_app();
+        usb.config.encrypt_disk = true;
+        usb.config.luks_passphrase = String::new();
+        usb.config.usb_key_device = "/dev/vdz".into();
+        usb.config.usb_key_only = true;
+        configs.push(usb);
+
+        for a in &configs {
+            for step in build_plan(a) {
+                let logged = step.log_line();
+
+                // (1) No needle, in any form, in what the log would show.
+                for needle in [USER_PW, ROOT_PW, LUKS_PW] {
+                    assert!(
+                        !logged.contains(needle),
+                        "a secret reaches the install log:\n{logged}"
+                    );
+                }
+
+                // (2) Anything that HANDLES a credential must be redacted, even
+                // when this test cannot see the credential's value. `--key-file`
+                // steps are exempt: they name a path, not a secret.
+                let cmd = format!("{} {}", step.program, step.args.join(" "));
+                let handles_credential = (cmd.contains("chpasswd")
+                    || cmd.contains("luksFormat")
+                    || cmd.contains("luksAddKey")
+                    || cmd.contains("luksRemoveKey")
+                    || cmd.contains("cryptsetup open"))
+                    && !cmd.contains("--key-file");
+                if handles_credential {
+                    assert!(
+                        step.redacted.is_some(),
+                        "a step handling a credential is logged verbatim:\n{cmd}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The USB key stick must never be formatted as an extra disk. Wiping it
     /// destroys the only thing able to unlock a key-only install — an
@@ -2810,6 +3437,31 @@ mod tests {
         assert!(g < u, "groupadd must come before useradd, not after");
     }
 
+    /// Separate-disk dual boot: whole-disk Auto on the Artix disk, with the
+    /// dual-boot survey's os-prober flag on. The chosen disk IS wiped (Auto),
+    /// os-prober is enabled for the GRUB menu, and the NTFS-reading tooling is
+    /// installed so os-prober can actually identify the Windows on the OTHER
+    /// disk — the whole point of this scenario.
+    #[test]
+    fn separate_disk_auto_with_osprober_detects_the_neighbour() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Auto;
+        a.config.os_prober = true; // set by the "separate disk" pmode option
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("sgdisk --zap-all /dev/sda"),
+            "Auto wipes the chosen Artix disk (other disks are untouched)"
+        );
+        assert!(
+            t.contains("GRUB_DISABLE_OS_PROBER=false"),
+            "os-prober must be enabled so Windows on the other disk is detected"
+        );
+        assert!(
+            t.contains("ntfs-3g"),
+            "ntfs-3g lets os-prober read the Windows disk"
+        );
+    }
+
     /// EFISTUB is the only bootloader we can Secure Boot-prepare (no loader in
     /// the chain, so the kernel image itself is what gets signed).
     #[test]
@@ -2829,6 +3481,1753 @@ mod tests {
         assert!(
             efi.contains("sbctl") || efi.contains("secureboot"),
             "EFISTUB with prep enabled must set Secure Boot up"
+        );
+    }
+
+    /// Manual mode touches ONLY what it was told to touch.
+    ///
+    /// The dual-boot contract: no wipefs, no sgdisk — the rest of the table
+    /// belongs to another OS. Root gets formatted; the ESP is REUSED unless
+    /// the user flips the format toggle; the mount targets match the auto
+    /// path so everything downstream is mode-blind.
+    #[test]
+    fn manual_mode_touches_only_what_it_is_told() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("mkfs.ext4 -F /dev/vda5"),
+            "root must be formatted"
+        );
+        assert!(!t.contains("sgdisk"), "the partition table is the user's");
+        assert!(
+            !t.lines().any(|l| l == "wipefs -a /dev/vda"),
+            "the whole disk must not be wiped (a partition wipe before mkfs is fine)"
+        );
+        assert!(
+            !t.contains("mkfs.fat -F32 /dev/vda1"),
+            "the ESP is reused by default — a Windows ESP must survive"
+        );
+        assert!(
+            t.contains("mount /dev/vda1 /mnt/boot"),
+            "the ESP must be mounted where the auto path mounts it"
+        );
+        assert!(
+            t.contains("only the named partitions"),
+            "the log must state the manual contract up front"
+        );
+
+        a.config.manual_esp_format = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("mkfs.fat -F32 /dev/vda1"),
+            "the format toggle must format the ESP"
+        );
+    }
+
+    /// Manual mode v2 — CREATING partitions in free space. The editor plans an
+    /// ESP + a rest-of-disk root as NEW partitions on /dev/vda; the plan must
+    /// ADD them with `sgdisk -n` (never wipefs / --zap-all — the existing table
+    /// and any neighbouring OS survive), format and mount them exactly like the
+    /// existing-partition path, and create a fresh GPT only if the disk has none.
+    #[test]
+    fn manual_mode_creates_new_partitions_without_wiping_the_table() {
+        use crate::app::MANUAL_REST;
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_esp_new_mib = 1024;
+        a.config.manual_esp_format = true;
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_new_mib = MANUAL_REST;
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("sgdisk -n 1:0:+1024M -t 1:ef00 -c 1:EFI /dev/vda"),
+            "the new ESP must be added as a sized partition:\n{t}"
+        );
+        assert!(
+            t.contains("sgdisk -n 2:0:0 -t 2:8300 -c 2:ROOT /dev/vda"),
+            "the rest-of-disk root must be added as partition 2 spanning free space"
+        );
+        assert!(
+            !t.contains("--zap-all") && !t.lines().any(|l| l == "wipefs -a /dev/vda"),
+            "creating partitions must NOT wipe the existing table"
+        );
+        assert!(
+            t.contains("sgdisk -og /dev/vda"),
+            "a blank disk (no PTTYPE) must get a fresh GPT first"
+        );
+        // The created partitions still flow through the same format+mount path.
+        assert!(
+            t.contains("mkfs.fat -F32 /dev/vda1"),
+            "new ESP is formatted"
+        );
+        assert!(
+            t.contains("mkfs.ext4 -F /dev/vda2"),
+            "new root is formatted"
+        );
+        assert!(
+            t.contains("mount /dev/vda1 /mnt/boot"),
+            "new ESP mounts where the auto path mounts it"
+        );
+    }
+
+    /// The ESP-at-/boot/efi layout — what a dual boot with a SMALL reused
+    /// Windows ESP needs, since a 100–300 MiB ESP can't hold Linux kernels.
+    /// The ESP must mount at /mnt/boot/efi (kernels stay on the root fs at
+    /// /boot) AND grub-install must point --efi-directory at /boot/efi to
+    /// match, or GRUB writes its EFI files to the wrong place and won't boot.
+    #[test]
+    fn manual_esp_at_boot_efi_mounts_and_installs_grub_there() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_esp_mount = "/boot/efi".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("mount /dev/vda1 /mnt/boot/efi"),
+            "the ESP must mount at /mnt/boot/efi so kernels stay on root:\n{t}"
+        );
+        assert!(
+            t.contains("mkdir -p /mnt/boot/efi"),
+            "the /boot/efi mountpoint must be created first"
+        );
+        assert!(
+            t.contains("grub-install --target=x86_64-efi --efi-directory=/boot/efi "),
+            "grub-install must target /boot/efi to match the ESP mountpoint"
+        );
+    }
+
+    /// Install-alongside shares the manual plan path: it reuses the ESP at
+    /// /boot/efi, creates the root in free space (additive sgdisk, no wipe),
+    /// turns on os-prober, and — the fix for "GRUB doesn't see Windows" —
+    /// pulls in ntfs-3g so os-prober can read the neighbour's NTFS partition.
+    #[test]
+    fn alongside_reuses_esp_creates_root_and_installs_osprober_tooling() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Alongside;
+        // These are what the alongside screen's apply() fills in.
+        a.config.manual_disk = "/dev/nvme0n1".into();
+        a.config.manual_esp = "/dev/nvme0n1p1".into();
+        a.config.manual_esp_mount = "/boot/efi".into();
+        a.config.manual_esp_format = false;
+        a.config.manual_root = "/dev/nvme0n1p4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_fs = "btrfs".into();
+        a.config.btrfs_subvolumes = true;
+        a.config.btrfs_snapshots = true;
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            !t.contains("--zap-all") && !t.lines().any(|l| l == "wipefs -a /dev/nvme0n1"),
+            "alongside must NOT wipe the disk — the neighbour OS lives there"
+        );
+        assert!(
+            t.contains("sgdisk -n 4:0:0 -t 4:8300 -c 4:ROOT /dev/nvme0n1"),
+            "root is created in the free space as partition 4:\n{t}"
+        );
+        assert!(
+            !t.contains("mkfs.fat -F32 /dev/nvme0n1p1"),
+            "the shared ESP must be REUSED, never reformatted"
+        );
+        assert!(
+            t.contains("mount /dev/nvme0n1p1 /mnt/boot/efi"),
+            "the ESP mounts at /boot/efi so kernels stay on root"
+        );
+        assert!(
+            t.contains("grub-install --target=x86_64-efi --efi-directory=/boot/efi "),
+            "grub-install must target the shared ESP at /boot/efi"
+        );
+        assert!(
+            t.contains("GRUB_DISABLE_OS_PROBER=false"),
+            "os-prober must be enabled so the neighbour lands in the GRUB menu"
+        );
+        // basestrap installs the base set; the sanitiser turns os_prober on for
+        // this mode, so ntfs-3g + os-prober must ride the strap line — the fix
+        // for os-prober silently skipping the Windows NTFS partition.
+        assert!(t.contains("ntfs-3g"), "ntfs-3g must be installed:\n{t}");
+        assert!(t.contains("os-prober"), "os-prober must be installed");
+    }
+
+    /// Artix beside Artix: the shared ESP must NOT lose the neighbour's loader.
+    ///
+    /// Reported live — installing Artix next to an existing Artix left only the
+    /// new one bootable. A plain `grub-install --bootloader-id=Artix` overwrites
+    /// EFI/Artix on the shared ESP, so the old loader is gone. On a shared ESP
+    /// the install now picks the first free id and marks the directory as ours,
+    /// so a neighbour using the same id survives.
+    #[test]
+    fn beside_another_artix_the_shared_esp_gets_a_unique_bootloader_id() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Alongside;
+        a.config.manual_disk = "/dev/nvme0n1".into();
+        a.config.manual_esp = "/dev/nvme0n1p1".into();
+        a.config.manual_esp_mount = "/boot/efi".into();
+        a.config.manual_esp_format = false;
+        a.config.manual_root = "/dev/nvme0n1p4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_fs = "ext4".into();
+        a.config.bootloader_id = "Artix".into();
+        let t = plan_text(&build_plan(&a));
+
+        // It must NOT blindly install to a fixed EFI/Artix on the shared ESP.
+        assert!(
+            !t.contains("--bootloader-id='Artix'"),
+            "a shared ESP still overwrites EFI/Artix, killing the neighbour:\n{t}"
+        );
+        // Instead: probe for a free id, then install and claim it.
+        assert!(
+            t.contains("[ -d \"/boot/efi/EFI/$id\" ]")
+                && t.contains(".artix-tui-owned")
+                && t.contains("grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=\"$id\""),
+            "the unique-id + ownership dance is missing:\n{t}"
+        );
+
+        // The claim must be IDENTITY-BEARING. Writing a bare marker was the
+        // whole bug the second time round: a second Artix from this same
+        // installer read the first one's marker as its own, reused EFI/Artix
+        // and overwrote the neighbour's loader — the very thing this dance
+        // exists to prevent. The marker holds the root filesystem UUID, and
+        // the directory is reused only when that UUID matches ours.
+        assert!(
+            t.contains("me=$(findmnt -no UUID / 2>/dev/null)"),
+            "the install never establishes WHICH system it is:\n{t}"
+        );
+        assert!(
+            !t.contains("touch \"/boot/efi/EFI/$id/.artix-tui-owned\""),
+            "the ownership marker is still empty, so any artix-tui install \
+             claims any other one's directory:\n{t}"
+        );
+        assert!(
+            t.contains("printf '%s\\n' \"$me\" > \"/boot/efi/EFI/$id/.artix-tui-owned\""),
+            "the marker does not record whose directory it is:\n{t}"
+        );
+        assert!(
+            t.contains("if [ -n \"$me\" ] && [ \"$owner\" = \"$me\" ]; then break; fi"),
+            "the directory is reused without checking it is really ours:\n{t}"
+        );
+
+        // The UEFI-entry field allows spaces, and `$id` must be quoted wherever
+        // it expands — an unquoted "My Artix" would word-split the shell test
+        // and abort the whole install.
+        a.config.bootloader_id = "My Artix".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("[ -d \"/boot/efi/EFI/$id\" ]")
+                && t.contains("\"/boot/efi/EFI/$id/.artix-tui-owned\""),
+            "a bootloader id with a space is not safely quoted in the shell:\n{t}"
+        );
+    }
+
+    /// A neighbouring Artix is NOT mistaken for ourselves.
+    ///
+    /// The chain script skipped every directory carrying the .artix-tui-owned
+    /// marker, on the assumption that only our own install ever wrote one. But
+    /// "the other OS" is very often another Linux — and quite possibly another
+    /// Artix from this same installer, whose directory carries the identical
+    /// marker. So the neighbour was skipped as if it were us and never reached
+    /// the menu, which is exactly what a person saw after installing twice.
+    #[test]
+    fn a_neighbouring_artix_is_told_apart_from_our_own_loader() {
+        let script = GRUB_NEIGHBOUR_CHAIN;
+
+        // Ownership is decided by the marker's CONTENT, not its existence.
+        assert!(
+            !script.contains("[ -f \"${d}.artix-tui-owned\" ] && continue"),
+            "the script still skips every marked directory, neighbours included"
+        );
+        assert!(
+            script.contains("own_root=$(findmnt -no UUID / 2>/dev/null)"),
+            "the script never learns which root is ours"
+        );
+        assert!(
+            script.contains("if [ -n \"$own_root\" ] && [ \"$owner\" = \"$own_root\" ]; then"),
+            "the skip is not conditioned on the marker naming OUR root"
+        );
+
+        // Two installs of the same distro default to the same bootloader-id, so
+        // the menu row must carry something that tells them apart (the device).
+        assert!(
+            script.contains("menuentry \"$name (EFI/$name on $3)\" {"),
+            "two identically-named loaders would produce two identical menu rows"
+        );
+        // It is a GENERATOR now: emits to stdout, never appends to 40_custom.
+        assert!(
+            !script.contains(">>/etc/grub.d/40_custom"),
+            "the scanner still appends to 40_custom instead of generating to stdout"
+        );
+    }
+
+    /// The ownership marker must never be written EMPTY.
+    ///
+    /// `findmnt -no UUID /` answers from the udev/blkid cache. On a freshly
+    /// populated chroot — or for any caller that cannot read the block device —
+    /// it returns nothing at all, and the marker then says "owned by ''". The
+    /// generator compares that against the running root's UUID, never matches,
+    /// and so treats OUR OWN loader as a neighbour: the menu grows an entry that
+    /// chainloads the running system into its own menu. Seen live on a btrfs
+    /// install. Probing the device is the fallback that cannot come up empty.
+    #[test]
+    fn the_ownership_marker_never_depends_on_a_single_lookup() {
+        for solo in [true, false] {
+            let mut a = install_app();
+            a.config.partition_mode = PartitionMode::Manual;
+            a.config.manual_solo = solo;
+            a.config.manual_disk = "/dev/vda".into();
+            a.config.manual_boot_disk = "/dev/vda".into();
+            a.config.manual_esp = "/dev/vda1".into();
+            a.config.manual_root = "/dev/vda2".into();
+            a.config.manual_root_fs = "btrfs".into();
+            let t = plan_text(&build_plan(&a));
+            assert!(
+                t.contains("[ -n \"$me\" ] || me=$(blkid -s UUID -o value"),
+                "solo={solo}: no fallback when findmnt returns nothing, so the \
+                 marker can be written empty:\n{t}"
+            );
+            // btrfs hangs [/subvol] off SOURCE; blkid needs a bare device path.
+            assert!(
+                t.contains("sed 's/\\[.*//'"),
+                "solo={solo}: the subvolume suffix is not stripped, so the \
+                 fallback hands blkid a path that is not a device:\n{t}"
+            );
+        }
+    }
+
+    /// The ESP scan must not use `blkid -t PARTTYPE=`, which never worked.
+    ///
+    /// `blkid -t` queries the blkid CACHE, and PARTTYPE is not a cached tag —
+    /// it comes from the partition table and blkid only reports it when probing
+    /// a device directly. So the query returned nothing on every machine, the
+    /// "other ESPs" loop never ran once, and a neighbour on its own disk could
+    /// not be found however correct the rest of the script was. Confirmed on a
+    /// live system whose /dev/sda1 is an ESP: lsblk lists it, `blkid -t
+    /// PARTTYPE=...` prints nothing.
+    #[test]
+    fn the_esp_scan_enumerates_with_lsblk_not_the_blkid_cache() {
+        // CODE only: the comment above the loop names the broken form to explain
+        // why it is gone, and matching prose would fail on the explanation.
+        let code: String = GRUB_NEIGHBOUR_CHAIN
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let script = GRUB_NEIGHBOUR_CHAIN;
+        assert!(
+            !code.contains("blkid -t PARTTYPE="),
+            "the ESP scan is back on the blkid cache, which never returns a \
+             PARTTYPE match — the neighbour loop would be dead again"
+        );
+        assert!(
+            script.contains("lsblk -rno PATH,PARTTYPE"),
+            "the ESP scan has no working enumeration of partitions"
+        );
+        // Matched case-insensitively: the GUID's case is not guaranteed.
+        assert!(
+            script.contains("tolower($2) == g"),
+            "the ESP type GUID is compared case-sensitively"
+        );
+    }
+
+    /// A solo whole-disk-style manual install owns the disk, so no such dance:
+    /// its ESP is its own, and the plain fixed-id install is correct (and keeps
+    /// the config's chosen id verbatim).
+    #[test]
+    fn a_solo_manual_install_keeps_its_plain_bootloader_id() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.bootloader_id = "Artix".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("--bootloader-id='Artix'"),
+            "a solo install owns its ESP and should keep its plain id:\n{t}"
+        );
+        // No ID DANCE: a solo install must never step to Artix-2. Its root is
+        // reformatted on every reinstall, so the marker can never match the old
+        // one, and a dance here would mint Artix-2, Artix-3… on a reused ESP.
+        assert!(
+            !t.contains("while [ -d"),
+            "a solo install must not hunt for a free bootloader-id:\n{t}"
+        );
+        // It DOES mark its directory, which is a different question: the
+        // neighbour generator runs on every install now, and without a marker it
+        // cannot tell our own loader from a stranger's — it would offer a menu
+        // entry chainloading us into our own menu.
+        assert!(
+            t.contains(".artix-tui-owned"),
+            "a solo install leaves its EFI directory unmarked, so its own \
+             generator cannot recognise it:\n{t}"
+        );
+        // A UEFI GRUB install must ALSO write the removable/fallback path — see
+        // the fallback test below for why.
+        assert!(
+            t.contains("--removable"),
+            "no fallback (EFI/BOOT/BOOTX64.EFI) install — boot is left to \
+             firmware enumeration:\n{t}"
+        );
+    }
+
+    /// The neighbour generator ships even when the user said there is no
+    /// neighbour — because that answer describes the disk at INSTALL time.
+    ///
+    /// Reported live: a second Artix installed manually beside a first, with the
+    /// loaders on one disk, and the resulting GRUB did not list the first system
+    /// at all. Picking "Artix only" set os_prober = false, which was also the
+    /// gate on 35_artix_neighbours, so nothing ever scanned for the neighbour
+    /// that was plainly there. The generator re-runs on every grub-mkconfig and
+    /// prints nothing when there is no neighbour, so gating it on a promise
+    /// bought nothing and cost a bootable system its menu entry.
+    #[test]
+    fn even_a_solo_install_ships_the_neighbour_generator() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true; // "there is no other OS here"
+        a.config.os_prober = false;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("/etc/grub.d/35_artix_neighbours"),
+            "a solo install ships no neighbour scanner, so a neighbouring \
+             system — there already, or added later — can never reach the \
+             menu:\n{t}"
+        );
+        assert!(
+            t.contains("chmod 755 /etc/grub.d/35_artix_neighbours"),
+            "the generator is not executable, so grub-mkconfig skips it:\n{t}"
+        );
+    }
+
+    /// A UEFI GRUB install ALSO writes the removable/fallback loader.
+    ///
+    /// efibootmgr cannot create a named NVRAM entry from inside artix-chroot —
+    /// /sys is mounted read-only there, so efivars is inaccessible and the entry
+    /// is silently skipped. With no NVRAM entry and no fallback path, firmware
+    /// has to enumerate the ESP's loaders: harmless with one GRUB, but with two
+    /// (Artix beside Artix) OVMF boots one at random each time, sometimes
+    /// skipping the menu — the reported chaos. EFI/BOOT/BOOTX64.EFI is the fixed
+    /// target the newest install wins, and the newest GRUB lists every
+    /// neighbour, so booting it shows them all.
+    #[test]
+    fn a_uefi_grub_install_writes_the_removable_fallback_loader() {
+        // Solo whole-disk install.
+        let mut a = install_app();
+        a.config.bootloader = Bootloader::Grub;
+        a.config.boot_mode = BootMode::Uefi;
+        let solo = plan_text(&build_plan(&a));
+        assert!(
+            solo.contains("grub-install --target=x86_64-efi") && solo.contains("--removable"),
+            "a solo UEFI GRUB install skips the fallback loader:\n{solo}"
+        );
+
+        // Shared-ESP dual boot: the fallback must be written here TOO — this is
+        // the case that actually broke.
+        let mut b = install_app();
+        b.config.partition_mode = PartitionMode::Alongside;
+        b.config.manual_disk = "/dev/nvme0n1".into();
+        b.config.manual_esp = "/dev/nvme0n1p1".into();
+        b.config.manual_esp_mount = "/boot/efi".into();
+        b.config.manual_root = "/dev/nvme0n1p4".into();
+        b.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        b.config.manual_root_fs = "ext4".into();
+        let dual = plan_text(&build_plan(&b));
+        assert!(
+            dual.contains("--removable"),
+            "a shared-ESP dual-boot install skips the fallback loader — the exact \
+             case that booted at random:\n{dual}"
+        );
+    }
+
+    /// A neighbour OS whose loader lives on an ESP is chainloaded into GRUB.
+    ///
+    /// os-prober misses a Linux that keeps its kernels on its ESP (which is this
+    /// installer's own default layout), so "add the other OS to the boot menu"
+    /// produced a menu with only ourselves. The chainload script fills that gap;
+    /// it must be written and run before grub-mkconfig, and only under UEFI.
+    #[test]
+    fn a_neighbour_os_loader_is_chainloaded_into_the_grub_menu() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Alongside;
+        a.config.manual_disk = "/dev/nvme0n1".into();
+        a.config.manual_esp = "/dev/nvme0n1p1".into();
+        a.config.manual_esp_mount = "/boot/efi".into();
+        a.config.manual_esp_format = false;
+        a.config.manual_root = "/dev/nvme0n1p4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+
+        // The scanner is installed as a grub.d GENERATOR — so it re-runs on
+        // every grub-mkconfig and a later-added neighbour is picked up — not a
+        // one-time append. (The write is a heredoc, so the script body spans
+        // many lines in the plan text; match the `cat >` line for ordering.)
+        assert!(
+            t.contains("emit_esp") && t.contains("/etc/grub.d/35_artix_neighbours"),
+            "the neighbour scanner is never installed as a grub.d generator:\n{t}"
+        );
+        let install = t
+            .lines()
+            .position(|l| l.contains("cat > /etc/grub.d/35_artix_neighbours"))
+            .expect("the generator is never written");
+        assert!(
+            t.contains("chmod 755 /etc/grub.d/35_artix_neighbours"),
+            "the generator is not made executable, so grub-mkconfig would skip it:\n{t}"
+        );
+        // It must land BEFORE grub-mkconfig, which is what runs it.
+        let mkconfig = t
+            .lines()
+            .position(|l| l.contains("grub-mkconfig -o /boot/grub/grub.cfg"))
+            .expect("grub-mkconfig is never run");
+        assert!(
+            install < mkconfig,
+            "the generator must be installed before grub-mkconfig runs it"
+        );
+        // It carries the ESP mountpoint, resolved from the config, and emits
+        // menuentries to STDOUT (it is a generator, not a 40_custom appender).
+        assert!(
+            t.contains("own_dir='/boot/efi'"),
+            "the generator did not get the shared ESP mountpoint"
+        );
+        assert!(
+            !t.contains(">>/etc/grub.d/40_custom"),
+            "the scanner still appends to 40_custom instead of generating"
+        );
+
+        // A default set from the running system is READ back (GRUB_DEFAULT=saved
+        // is a read; that is always safe). GRUB must never be told to WRITE
+        // grubenv on every boot: that write goes through a block list and fails
+        // with "sparse file not allowed", then halts the boot waiting for a
+        // keypress. Reported from a real three-system machine, on every start.
+        assert!(
+            t.contains("GRUB_DEFAULT=saved"),
+            "a default set from the system is not read back:\n{t}"
+        );
+        assert!(
+            !t.contains("GRUB_SAVEDEFAULT=true"),
+            "GRUB is told to write grubenv on every boot — that errors with \
+             'sparse file not allowed' and stops the boot for a keypress:\n{t}"
+        );
+        assert!(
+            !t.contains("\n  savedefault"),
+            "a generated menuentry still carries savedefault, which triggers \
+             the same blocking grubenv write:\n{t}"
+        );
+        assert!(
+            t.contains("chainloader"),
+            "the neighbour entries don't record themselves as the default"
+        );
+    }
+
+    /// grub.cfg is kept current by a pacman hook — new kernels reach the menu,
+    /// and the neighbour generator re-runs, without a manual grub-mkconfig.
+    #[test]
+    fn a_pacman_hook_regenerates_grub_on_kernel_and_grub_updates() {
+        let a = install_app(); // GRUB, UEFI by default
+        let t = plan_text(&build_plan(&a));
+        let hook = t
+            .lines()
+            .position(|l| l.contains("cat > /etc/pacman.d/hooks/zz-artix-grub.hook"))
+            .expect("no grub-regeneration pacman hook is installed");
+        // It must trigger on kernel images and run grub-mkconfig.
+        assert!(
+            t.contains("usr/lib/modules/*/vmlinuz")
+                && t.contains("grub-mkconfig -o /boot/grub/grub.cfg"),
+            "the grub hook does not regenerate on kernel changes:\n{t}"
+        );
+        // The hook is installed before the first grub-mkconfig (order is not
+        // strictly required, but keeps the plan coherent).
+        let _ = hook;
+    }
+
+    /// Alongside with a user-chosen swap: a fixed-size swap partition is carved
+    /// out BEFORE root (a lower partition number, created first), and root then
+    /// fills the rest — the layout the alongside screen's swap control fills in.
+    #[test]
+    fn alongside_with_swap_carves_swap_then_root() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Alongside;
+        a.config.manual_disk = "/dev/nvme0n1".into();
+        a.config.manual_esp = "/dev/nvme0n1p1".into();
+        a.config.manual_esp_mount = "/boot/efi".into();
+        a.config.manual_esp_format = false;
+        // Swap = partition 4 (fixed 8 GiB), root = partition 5 (rest).
+        a.config.manual_swap = "/dev/nvme0n1p4".into();
+        a.config.manual_swap_new_mib = 8192;
+        a.config.manual_root = "/dev/nvme0n1p5".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("sgdisk -n 4:0:+8192M -t 4:8200 -c 4:SWAP /dev/nvme0n1"),
+            "swap must be created as a fixed-size partition 4:\n{t}"
+        );
+        assert!(
+            t.contains("sgdisk -n 5:0:0 -t 5:8300 -c 5:ROOT /dev/nvme0n1"),
+            "root must fill the rest as partition 5"
+        );
+        // Swap is created before root (lower number first → free-block order).
+        let s = t.find("4:SWAP").unwrap();
+        let r = t.find("5:ROOT").unwrap();
+        assert!(s < r, "swap must be created before root");
+        assert!(
+            t.contains("mkswap /dev/nvme0n1p4"),
+            "swap must be formatted"
+        );
+        assert!(
+            t.contains("swapon /dev/nvme0n1p4"),
+            "swap must be activated"
+        );
+    }
+
+    /// The ntfs-3g / os-prober tooling rides ANY os-prober install, manual or
+    /// alongside — the direct guard on the package-selection logic.
+    #[test]
+    fn os_prober_pulls_in_ntfs_tooling() {
+        let mut c = install_app().config;
+        c.os_prober = false;
+        assert!(
+            !base_packages(&c).iter().any(|p| p == "ntfs-3g"),
+            "no ntfs-3g when os-prober is off"
+        );
+        c.os_prober = true;
+        let pkgs = base_packages(&c);
+        for want in ["ntfs-3g", "os-prober", "mtools"] {
+            assert!(
+                pkgs.iter().any(|p| p == want),
+                "{want} must be installed when os-prober is on"
+            );
+        }
+    }
+
+    /// The manual ESP mount DEFAULTS to /boot/efi — the dual-boot-friendly
+    /// layout (kernels on root, only the bootloader on the ESP, so a small
+    /// reused Windows ESP fits). grub-install must target it to match.
+    #[test]
+    fn manual_esp_defaults_to_boot_efi() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        // manual_esp_mount is left at its default (InstallConfig::default).
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("mount /dev/vda1 /mnt/boot/efi"),
+            "the default ESP mount is /boot/efi:\n{t}"
+        );
+        assert!(
+            t.contains("grub-install --target=x86_64-efi --efi-directory=/boot/efi "),
+            "grub-install must target the /boot/efi default"
+        );
+    }
+
+    /// Toggling the ESP mount back to /boot (kernels on the ESP) still works.
+    #[test]
+    fn manual_esp_at_boot_when_toggled() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_esp_mount = "/boot".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id"),
+            "an explicit /boot mount points grub-install at /boot"
+        );
+    }
+
+    /// A manual /home on a SEPARATE disk (the "different disk as /home" case):
+    /// root+ESP on one disk, /home an existing partition on another. Both get
+    /// formatted and mounted; the /home partition is signature-wiped first so a
+    /// previously-encrypted disk reformats cleanly, and its own fs is honoured.
+    #[test]
+    fn manual_home_on_a_separate_disk_formats_and_mounts_it() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/sda1".into();
+        a.config.manual_root = "/dev/sda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        // /home lives on a DIFFERENT disk, as an existing (reformatted) partition.
+        a.config.manual_home = "/dev/sdb1".into();
+        a.config.manual_home_fs = "btrfs".into();
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("wipefs -a /dev/sdb1"),
+            "the /home partition's old signature (maybe LUKS) is scrubbed first:\n{t}"
+        );
+        assert!(
+            t.contains("mkfs.btrfs -f /dev/sdb1"),
+            "/home formatted with its own fs"
+        );
+        assert!(t.contains("mount") && t.contains("/dev/sdb1") && t.contains("/mnt/home"));
+        assert!(
+            !t.contains("sgdisk"),
+            "existing partitions — the table is untouched"
+        );
+        // The installed system + live env get btrfs-progs for the /home fs.
+        assert!(t.contains("btrfs-progs"), "btrfs-progs for the btrfs /home");
+    }
+
+    /// Manual + btrfs gets the SAME @-subvolume layout as the automatic
+    /// path — snapshots and rollback must work identically in both modes.
+    #[test]
+    fn manual_btrfs_gets_the_same_subvolume_layout() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "btrfs".into();
+        a.config.btrfs_subvolumes = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(t.contains("mkfs.btrfs -f /dev/vda5"));
+        assert!(t.contains("btrfs subvolume create /mnt/@"));
+        assert!(
+            t.contains("subvol=@"),
+            "root must be mounted from the @ subvolume"
+        );
+    }
+
+    /// A retry after a partly-finished install must be able to run again.
+    ///
+    /// Reported from QEMU: the first attempt deleted a partition and created
+    /// the new ones, then failed while installing packages. Pressing "retry"
+    /// re-ran the plan, which tried to delete a partition that no longer
+    /// existed — the identity check saw "found none", called it a mismatch and
+    /// stopped. A partition that is GONE is not the wrong partition; it is the
+    /// goal already met. Likewise a partition we created earlier must not make
+    /// `sgdisk -n` fail the second time round.
+    #[test]
+    fn the_partitioning_phase_can_be_run_twice() {
+        use crate::app::DeletedPart;
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_disk = "/dev/vda".into();
+        a.config.manual_deleted = vec![DeletedPart {
+            path: "/dev/vdb1".into(),
+            disk: "/dev/vdb".into(),
+            partuuid: "uuid-vdb1".into(),
+        }];
+
+        let t = plan_text(&build_plan(&a));
+
+        // Deletion is keyed to the PARTUUID, so a retry is a no-op: the marked
+        // partition, deleted last run, is simply not found and nothing happens.
+        let del = t
+            .lines()
+            .find(|l| l.contains("sgdisk -d"))
+            .expect("no deletion planned");
+        assert!(
+            del.contains("already gone") && del.contains("exit 0"),
+            "a deletion of an already-gone partition still aborts the install:\n{del}"
+        );
+        // The delete only ever removes the marked PARTUUID — the fast slot path
+        // and the disk-wide search both compare against it, so a slot reoccupied
+        // by a different partition is never deleted.
+        assert!(
+            del.contains("want=uuid-vdb1") && del.contains("[ \"$got\" = \"$want\" ]"),
+            "the deletion no longer keys on the marked PARTUUID:\n{del}"
+        );
+        assert!(
+            del.contains("sgdisk -p") && del.contains("[ \"$u\" = \"$want\" ]"),
+            "the deletion does not search the disk for the marked PARTUUID (so a \
+             partition that moved slots would be missed):\n{del}"
+        );
+        // Identity comes from the ON-DISK GPT (`sgdisk -i`), not the udev
+        // database (`lsblk`). Reading PARTUUID via lsblk right after the
+        // previous `sgdisk -d` reshuffled the table returned EMPTY — udev had
+        // not settled — and a good deletion was refused with "found none".
+        // This is the exact bug; keep the plan off lsblk for identity.
+        assert!(
+            del.contains("sgdisk -i") && del.contains("tolower($NF)"),
+            "the deletion guard reads identity from a source that races with \
+             the previous delete:\n{del}"
+        );
+        assert!(
+            !del.contains("lsblk -no PARTUUID"),
+            "identity is still read from the udev-backed lsblk, which is stale \
+             right after a table change:\n{del}"
+        );
+
+        // Creation: our own earlier work is recognised and kept — so a retry
+        // does not die on "partition already exists". Identity comes from the
+        // GPT (`sgdisk -i` → "Partition name"), NOT lsblk: each `sgdisk -n`
+        // rewrites the table, so a sibling slot's lsblk check could race the
+        // re-read exactly as the delete guard did.
+        let create = t
+            .lines()
+            .find(|l| l.contains("sgdisk -n"))
+            .expect("no creation planned");
+        assert!(
+            create.contains("Partition name:") && create.contains("exit 0"),
+            "the create-idempotency check is missing:\n{create}"
+        );
+        assert!(
+            !create.contains("lsblk -no PARTLABEL"),
+            "the create check still reads the udev-backed lsblk, which races the \
+             table re-read from a sibling create:\n{create}"
+        );
+    }
+
+    /// The keyring is refreshed before any package is installed.
+    ///
+    /// When a repo signs with a key newer than the keyring basestrap laid down,
+    /// every package afterwards fails as "signature from Artix Buildbot is
+    /// invalid" — dozens in a row, and the install dies at the desktop phase.
+    /// Populating the existing keyring is not enough; the keyring PACKAGES have
+    /// to be updated first.
+    #[test]
+    fn the_keyring_is_refreshed_before_packages_are_installed() {
+        let a = install_app();
+        let t = plan_text(&build_plan(&a));
+
+        let refresh = t
+            .lines()
+            .position(|l| l.contains("artix-keyring") && l.contains("archlinux-keyring"))
+            .expect("the keyring packages are never refreshed");
+        // It must come before the desktop/extra package phase, or it fixes
+        // nothing — that phase is where the failures land.
+        let pkgs = t
+            .lines()
+            .position(|l| {
+                l.contains("pacman -S") && l.contains("--needed") && l.contains("base-devel")
+            })
+            .unwrap_or(usize::MAX);
+        assert!(
+            refresh < pkgs,
+            "the keyring is refreshed after packages are already being installed"
+        );
+        // And the keys are re-populated once the newer keyring is in place.
+        assert!(
+            t.lines()
+                .skip(refresh)
+                .any(|l| l.contains("pacman-key --populate")),
+            "the refreshed keyring is never populated, so the new keys stay unused"
+        );
+    }
+
+    /// A 404 storm from a stale database cannot end the install.
+    ///
+    /// Every Arch mirror answered 404 for the exact xorg-server / libinput / …
+    /// files the sync DB named: the DB had gone stale against a moved-on pool
+    /// (the mirrors deleted those versions), and the transaction died. Two
+    /// safeguards: the DB is refreshed once more RIGHT BEFORE the package phase
+    /// (so it names versions the pool still has), and each package install is
+    /// retried with a refresh between attempts.
+    #[test]
+    fn a_stale_mirror_database_cannot_kill_the_package_phase() {
+        let mut a = install_app();
+        a.config.desktops = vec!["Cinnamon".into()];
+        let t = plan_text(&build_plan(&a));
+
+        // The first package install (X server or system set) must be reachable.
+        let first_pkg = t
+            .lines()
+            .position(|l| l.contains("pacman -S --needed") && l.contains("xorg"))
+            .or_else(|| {
+                t.lines()
+                    .position(|l| l.contains("pacman -S --needed") && l.contains("attempt"))
+            })
+            .expect("no package phase found");
+
+        // A dedicated DB refresh sits before that phase — retried, and `-Syu`
+        // (a bare `-Sy` in the target is the partial-upgrade landmine).
+        let refresh = t
+            .lines()
+            .take(first_pkg)
+            .filter(|l| l.contains("pacman -Syu") && l.contains("attempt"))
+            .count();
+        assert!(
+            refresh >= 1,
+            "no retried database refresh runs before the package phase — a stale \
+             DB would 404 every mirror and end the install:\n{t}"
+        );
+
+        // The package installs themselves are wrapped in a retry that refreshes
+        // between attempts, so one flaky download is not fatal.
+        let install_line = t
+            .lines()
+            .find(|l| l.contains("pacman -S --needed") && l.contains("xorg"))
+            .expect("the X package phase is missing");
+        assert!(
+            install_line.contains("for a in 1 2 3")
+                && install_line.contains("pacman -Syu --noconfirm"),
+            "the package install is not retried with a database refresh:\n{install_line}"
+        );
+        // And that retry must NOT smuggle in a bare `-Sy` (partial upgrade).
+        assert!(
+            !install_line.contains("pacman -Sy ") && !install_line.contains("pacman -Sy;"),
+            "the retry uses a bare -Sy, which leaves the target a partial upgrade:\n{install_line}"
+        );
+    }
+
+    /// The target is UPGRADED before the package phases, never left a partial
+    /// upgrade.
+    ///
+    /// basestrap lays the base down against the Artix repos; the Arch repos are
+    /// enabled afterwards, so every later `pacman -S` resolves against a wider
+    /// and newer database. With a bare `-Sy` the base never caught up, and the
+    /// Lua 5.4→5.5 split turned that into a dead install: the base's old `lua`
+    /// still owned /usr/bin/lua5.4, so the fresh `lua54` that `libinput` needs
+    /// could not be unpacked and all 387 packages rolled back. The packages do
+    /// not conflict — only the mixed snapshot did.
+    #[test]
+    fn the_target_is_upgraded_before_packages_so_it_is_never_a_partial_upgrade() {
+        let a = install_app();
+        let t = plan_text(&build_plan(&a));
+
+        let upgrade = t
+            .lines()
+            .position(|l| l.contains("pacman -Syu"))
+            .expect("the target is never upgraded — a bare -Sy leaves a partial upgrade");
+        let pkgs = t
+            .lines()
+            .position(|l| {
+                l.contains("pacman -S") && l.contains("--needed") && l.contains("base-devel")
+            })
+            .unwrap_or(usize::MAX);
+        assert!(
+            upgrade < pkgs,
+            "the upgrade lands after packages are already being installed"
+        );
+
+        // The database refresh that precedes the package phases must carry -u.
+        // A bare `pacman -Sy` there is the exact shape of the bug.
+        //
+        // Only IN THE TARGET. The same command on the live ISO is fine and is
+        // used deliberately: that system is thrown away when the machine
+        // reboots, nothing is installed onto it beyond the install tools, and
+        // a full upgrade of a running ISO is its own kind of trouble.
+        for line in t.lines().take(pkgs).filter(|l| l.contains("artix-chroot")) {
+            let is_bare_sync = line.contains("pacman -Sy")
+                && !line.contains("pacman -Syu")
+                // Refreshing a NAMED package (the keyrings) is a different job:
+                // it must run before anything can be verified, and it upgrades
+                // only what it names.
+                && !line.contains("keyring");
+            assert!(
+                !is_bare_sync,
+                "a bare `pacman -Sy` in the target before the package phases \
+                 leaves it a partial upgrade:\n{line}"
+            );
+        }
+    }
+
+    /// A planned data partition is created, formatted and mounted by the plan.
+    ///
+    /// The editor only records intent: `manual_data_new` says "carve this",
+    /// and an `extra_disks` entry keyed by the predicted path says "format it
+    /// ext4 and mount it there". This pins the whole chain: sgdisk creates it,
+    /// the extra-disk pass formats and mounts it, and the order is right.
+    #[test]
+    fn a_planned_data_partition_is_created_formatted_and_mounted() {
+        use crate::app::{DataPart, ExtraDisk};
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_data_new.push(DataPart {
+            path: "/dev/vdb1".into(),
+            disk: "/dev/vdb".into(),
+            mib: 20 * 1024,
+        });
+        a.config.extra_disks.push(ExtraDisk {
+            disk: "/dev/vdb1".into(),
+            mountpoint: "/mnt/data".into(),
+            fs: "ext4".into(),
+            format: true,
+            whole_disk: false,
+            ..Default::default()
+        });
+
+        let t = plan_text(&build_plan(&a));
+
+        // Created on its own disk by the partitioning pass…
+        assert!(
+            t.contains("sgdisk -n 1:0:+20480M -t 1:8300 -c 1:DATA /dev/vdb"),
+            "the data partition is never created:\n{t}"
+        );
+        // …then formatted and mounted by the extra-disk pass.
+        assert!(
+            t.contains("mkfs.ext4 -F /dev/vdb1"),
+            "the data partition is never formatted"
+        );
+        assert!(
+            t.contains("mount /dev/vdb1 /mnt/mnt/data")
+                || t.contains("mount -o") && t.contains("/dev/vdb1"),
+            "the data partition is never mounted:\n{t}"
+        );
+        // Creation must precede the mkfs, or it formats a hole in the air.
+        let created = t.find("-c 1:DATA /dev/vdb").unwrap();
+        let formatted = t.find("mkfs.ext4 -F /dev/vdb1").unwrap();
+        assert!(
+            created < formatted,
+            "the data partition is formatted before it exists"
+        );
+    }
+
+    /// New partitions may be created on MORE THAN ONE disk.
+    ///
+    /// The editor used to pin creation to a single disk, so "root here, a fresh
+    /// /home on the other drive" — an ordinary two-drive layout — was refused
+    /// outright with "new partitions only on one disk". Each planned slot now
+    /// records its own disk and the plan carves each drive in turn.
+    #[test]
+    fn new_partitions_can_be_created_on_several_disks() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        // ESP + root carved from the first drive…
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_esp_new_mib = 512;
+        a.config.manual_esp_disk = "/dev/vda".into();
+        a.config.manual_esp_format = true;
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_disk = "/dev/vda".into();
+        a.config.manual_root_fs = "ext4".into();
+        // …and a brand-new /home from the second.
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_home_disk = "/dev/vdb".into();
+        a.config.manual_home_fs = "ext4".into();
+
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("sgdisk -n 1:0:+512M -t 1:ef00 -c 1:EFI /dev/vda"),
+            "the ESP was not created on the first disk:\n{t}"
+        );
+        assert!(
+            t.contains("-c 2:ROOT /dev/vda"),
+            "the root was not created on the first disk"
+        );
+        // The point of the test: a partition carved from the OTHER drive.
+        assert!(
+            t.contains("-c 1:HOME /dev/vdb"),
+            "/home was not created on the second disk — the one-disk limit is back:\n{t}"
+        );
+        assert!(
+            t.contains("mkfs.ext4 -F /dev/vdb1") && t.contains("mount"),
+            "/home on the second disk was not formatted"
+        );
+        // Each disk is re-read after being carved.
+        assert!(
+            t.contains("partprobe /dev/vda") && t.contains("partprobe /dev/vdb"),
+            "a carved disk was not re-read"
+        );
+    }
+
+    /// A disk marked for a full wipe is erased outright, BEFORE anything is
+    /// created, and its per-partition deletions are skipped — the table is gone,
+    /// so `sgdisk -d` on it would be a redundant failure.
+    #[test]
+    fn a_wiped_disk_is_erased_before_creation_and_skips_its_deletes() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_esp_new_mib = 512;
+        a.config.manual_esp_disk = "/dev/vda".into();
+        a.config.manual_esp_format = true;
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_root_disk = "/dev/vda".into();
+        a.config.manual_root_fs = "ext4".into();
+        // A fresh /home on a SECOND disk that we erase first.
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_home_disk = "/dev/vdb".into();
+        a.config.manual_home_fs = "ext4".into();
+        a.config.manual_wipe = vec![crate::app::WipeMark {
+            disk: "/dev/vdb".into(),
+            method: crate::app::WipeMethod::Quick,
+            rota: true,
+            tran: "sata".into(),
+        }];
+        // Also mark one of vdb's partitions for deletion — the wipe must make
+        // that delete a no-op.
+        a.config.manual_deleted = vec![crate::app::DeletedPart {
+            path: "/dev/vdb1".into(),
+            disk: "/dev/vdb".into(),
+            partuuid: "dead".into(),
+        }];
+
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("sgdisk --zap-all /dev/vdb"),
+            "vdb was not wiped:\n{t}"
+        );
+        let zap = t.find("--zap-all /dev/vdb").expect("no wipe");
+        let create = t.find("-c 1:HOME /dev/vdb").expect("no /home create");
+        assert!(zap < create, "the wipe ran after the create:\n{t}");
+        // The vda disk keeps its normal (non-wipe) creation path untouched.
+        assert!(
+            !t.contains("--zap-all /dev/vda"),
+            "an unmarked disk was wiped:\n{t}"
+        );
+        // The per-partition delete on the wiped disk is skipped entirely.
+        assert!(
+            !t.contains("sgdisk -d 1 /dev/vdb") && !t.contains("REFUSING to delete /dev/vdb1"),
+            "a delete ran on a disk that was fully wiped:\n{t}"
+        );
+    }
+
+    /// In dual boot the plan erases EVERY drive the user marked — including the
+    /// one the neighbouring OS boots from. Replacing that system can be the
+    /// whole intent (Artix first, another OS by hand later), so the guard is the
+    /// editor's acknowledgement, not a rule the plan enforces behind the user's
+    /// back. A mark that reached the plan has already been consented to.
+    #[test]
+    fn a_dual_boot_wipe_erases_every_marked_drive() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false; // sharing the machine with another OS
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into(); // the neighbour's ESP, reused
+        a.config.manual_root = "/dev/vda3".into();
+        a.config.manual_root_fs = "ext4".into();
+        // A fresh /home carved from the erased second drive.
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_home_disk = "/dev/vdb".into();
+        a.config.manual_home_fs = "ext4".into();
+        let mark = |disk: &str| crate::app::WipeMark {
+            disk: disk.into(),
+            method: crate::app::WipeMethod::Quick,
+            rota: false,
+            tran: "sata".into(),
+        };
+        a.config.manual_wipe = vec![mark("/dev/vdb"), mark("/dev/vda")];
+
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("sgdisk --zap-all /dev/vdb"),
+            "the second drive was not erased — dual boot must still allow it:\n{t}"
+        );
+        assert!(
+            t.contains("sgdisk --zap-all /dev/vda"),
+            "an acknowledged wipe of the neighbour's drive was silently dropped:\n{t}"
+        );
+    }
+
+    /// The delete guard removes ONLY the marked PARTUUID — at its recorded slot,
+    /// or wherever it moved — and NOTHING when it is gone. Run against a mock
+    /// `sgdisk` so all three branches are exercised: this is the most dangerous
+    /// shell in the installer and it is an inline string shellcheck never sees.
+    #[test]
+    fn the_delete_guard_only_removes_the_marked_partuuid() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_deleted = vec![crate::app::DeletedPart {
+            path: "/dev/vda5".into(),
+            disk: "/dev/vda".into(),
+            partuuid: "aaaa".into(),
+        }];
+        let script = build_plan(&a)
+            .iter()
+            .filter(|act| act.program == "sh")
+            .filter_map(|act| act.args.last().cloned())
+            .find(|s| s.contains("want=aaaa"))
+            .expect("no delete guard script in the plan");
+
+        // A mock `sgdisk`, driven by env vars: SLOT5_UUID is what the recorded
+        // slot 5 holds; MOVED_SLOT (if set) is another slot that holds the marked
+        // uuid. Every `-d N` is appended to $DFILE so the test sees what was
+        // actually deleted.
+        let dir = std::env::temp_dir().join(format!("delguard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mock = dir.join("sgdisk");
+        let mut f = std::fs::File::create(&mock).unwrap();
+        write!(
+            f,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             -i) if [ \"$2\" = 5 ]; then echo \"Partition unique GUID: $SLOT5_UUID\"; fi; \
+                 if [ -n \"$MOVED_SLOT\" ] && [ \"$2\" = \"$MOVED_SLOT\" ]; then \
+                 echo \"Partition unique GUID: AAAA\"; fi ;;\n\
+             -p) echo \"Number  Start\"; echo \"   5   2048\"; \
+                 [ -n \"$MOVED_SLOT\" ] && echo \"   $MOVED_SLOT   4096\"; true ;;\n\
+             -d) echo \"$2\" >> \"$DFILE\" ;;\n\
+             esac\n"
+        )
+        .unwrap();
+        drop(f);
+        std::fs::set_permissions(&mock, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |slot5: &str, moved: &str| -> String {
+            let dfile = dir.join("deleted");
+            let _ = std::fs::remove_file(&dfile);
+            let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", path)
+                .env("DFILE", &dfile)
+                .env("SLOT5_UUID", slot5)
+                .env("MOVED_SLOT", moved)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "guard exited nonzero: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::read_to_string(&dfile).unwrap_or_default()
+        };
+
+        // Marked uuid at its recorded slot 5 → slot 5 deleted.
+        assert_eq!(
+            run("aaaa", "").trim(),
+            "5",
+            "marked uuid at its slot was not deleted"
+        );
+        // Slot 5 holds a DIFFERENT uuid and the marked one is nowhere → nothing
+        // deleted (this is the retry/reuse case: our own fresh partition sits
+        // there now, and it must be left alone).
+        assert_eq!(
+            run("bbbb", "").trim(),
+            "",
+            "a partition that was NOT marked got deleted"
+        );
+        // Marked uuid moved to slot 7 → slot 7 deleted (delete by identity).
+        assert_eq!(
+            run("bbbb", "7").trim(),
+            "7",
+            "the marked uuid that moved slots was not deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every wipe method emits shell a POSIX sh accepts. These run on the live
+    /// ISO, where a syntax slip means the disk is silently NOT erased — and the
+    /// scripts are inline strings, so shellcheck never sees them.
+    #[test]
+    fn wipe_scripts_are_valid_posix_sh() {
+        use crate::app::WipeMethod;
+        for method in [
+            WipeMethod::Quick,
+            WipeMethod::ZeroHdd,
+            WipeMethod::CryptoSsd,
+            WipeMethod::AtaSecure,
+        ] {
+            for allow in [true, false] {
+                for (rota, tran) in [(false, "nvme"), (false, "sata"), (true, "sata")] {
+                    let acts =
+                        crate::system::disk::wipe_actions("/dev/vdz", method, rota, tran, allow);
+                    assert_eq!(acts.len(), 1, "a wipe is one action");
+                    let script = acts[0].args.last().unwrap();
+                    let out = std::process::Command::new("sh")
+                        .args(["-n", "-c", script])
+                        .output()
+                        .expect("run sh -n");
+                    assert!(
+                        out.status.success(),
+                        "wipe script for {method:?} (rota={rota}, tran={tran}, allow={allow}) \
+                         is not valid sh:\n{}\n--- script ---\n{script}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Manual partitioning WITHOUT a second OS unlocks what dual boot blocks.
+    ///
+    /// The v1 limits — GRUB only, no LUKS — exist because the manual path was
+    /// assumed to share a disk with Windows. When the user says there is no
+    /// second OS, that reason is gone: encryption and the other bootloaders are
+    /// available exactly as for a whole-disk install.
+    ///
+    /// The piece that actually had to be built for this: everything downstream
+    /// (crypttab, the initramfs keyfile, the GRUB cmdline) finds the root via
+    /// `blkid -t PARTLABEL=ROOT`. An automatic layout labels its partitions; a
+    /// REUSED partition carries whatever label it had, so the manual plan has
+    /// to stamp it or an encrypted install boots to a rescue prompt.
+    #[test]
+    fn solo_manual_can_encrypt_and_pick_its_own_bootloader() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into(); // an EXISTING partition, reused
+        a.config.manual_root_fs = "ext4".into();
+        a.config.encrypt_disk = true;
+        a.config.luks_passphrase = "correct horse".into();
+        a.config.bootloader = Bootloader::Refind;
+
+        let t = plan_text(&build_plan(&a));
+
+        // The container is created and opened, and the filesystem lands on the
+        // MAPPER — not on the bare partition, which would leave it unencrypted.
+        assert!(
+            t.contains("cryptsetup -q luksFormat --type luks2 /dev/vda2"),
+            "the root was not encrypted:\n{t}"
+        );
+        assert!(
+            t.contains("cryptsetup open /dev/vda2 cryptroot"),
+            "the container was never opened"
+        );
+        assert!(
+            t.contains("mkfs.ext4 -F /dev/mapper/cryptroot"),
+            "the filesystem went on the bare partition, so nothing is encrypted"
+        );
+        assert!(
+            !t.contains("mkfs.ext4 -F /dev/vda2"),
+            "the root partition was formatted unencrypted as well"
+        );
+
+        // Reused partitions carry no PARTLABEL, so the plan must stamp one or
+        // every blkid lookup downstream comes back empty.
+        assert!(
+            t.contains("sgdisk -c 2:ROOT /dev/vda"),
+            "the root was not labelled ROOT — the crypt wiring cannot find it"
+        );
+        // The initramfs must learn to unlock it.
+        assert!(
+            t.contains("encrypt"),
+            "no encrypt hook was added to the initramfs"
+        );
+
+        // And the requested bootloader is honoured rather than forced to GRUB.
+        assert!(
+            t.contains("refind-install"),
+            "solo manual should keep the chosen bootloader:\n{t}"
+        );
+        // No neighbour OS to look for.
+        assert!(
+            !t.contains("GRUB_DISABLE_OS_PROBER=false"),
+            "os-prober was enabled for a single-OS install"
+        );
+    }
+
+    /// A DUAL-BOOT manual install keeps the old limits: it shares the disk.
+    #[test]
+    fn dual_boot_manual_still_refuses_luks_and_other_loaders() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.encrypt_disk = true;
+        a.config.luks_passphrase = "correct horse".into();
+        a.config.bootloader = Bootloader::Refind;
+
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("luksFormat"),
+            "dual-boot manual must not attempt LUKS in v1"
+        );
+        assert!(
+            !t.contains("refind-install") && t.contains("grub-install"),
+            "dual-boot manual must stay on GRUB"
+        );
+        assert!(
+            t.contains("GRUB_DISABLE_OS_PROBER=false"),
+            "dual boot still needs os-prober"
+        );
+    }
+
+    /// Manual partitioning on legacy BIOS, end to end.
+    ///
+    /// Old hardware (and firmware whose UEFI is not to be trusted) still needs a
+    /// way in, so manual mode is no longer UEFI-only. What has to change with
+    /// the firmware: no ESP is created, formatted or mounted; a 1 MiB EF02
+    /// partition is carved for GRUB to embed core.img on GPT; and GRUB is
+    /// installed to a whole DISK rather than an EFI directory.
+    #[test]
+    fn manual_mode_can_boot_legacy_bios() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.boot_mode = BootMode::Bios;
+        a.config.disk.clear(); // manual mode leaves this empty; the sanitiser fills it
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_boot_disk = "/dev/vda".into();
+        a.config.manual_bios = "/dev/vda1".into();
+        a.config.manual_bios_new_mib = 1;
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+
+        let t = plan_text(&build_plan(&a));
+
+        // The BIOS-boot partition is created with the right type and left alone.
+        assert!(
+            t.contains("sgdisk -n 1:0:+1M -t 1:ef02 -c 1:BIOSBOOT /dev/vda"),
+            "no BIOS-boot partition was created:\n{t}"
+        );
+        assert!(
+            !t.contains("mkfs.fat -F32 /dev/vda1"),
+            "the BIOS-boot partition must carry no filesystem"
+        );
+        assert!(
+            !t.lines().any(|l| l.starts_with("mount /dev/vda1")),
+            "the BIOS-boot partition must never be mounted"
+        );
+
+        // GRUB goes to the disk, not an EFI directory.
+        assert!(
+            t.contains("grub-install --target=i386-pc /dev/vda"),
+            "legacy GRUB was not installed to the disk:\n{t}"
+        );
+        assert!(
+            !t.contains("--target=x86_64-efi"),
+            "a UEFI bootloader was planned for a BIOS install"
+        );
+        // And the old "manual requires UEFI" abort must be gone.
+        assert!(
+            !t.contains("Manual partitioning requires UEFI"),
+            "the plan still aborts legacy manual installs"
+        );
+    }
+
+    /// Deleting partitions: the plan must remove exactly what was marked, on the
+    /// right disk, BEFORE it creates anything — and nothing else.
+    ///
+    /// This is the most destructive action the installer can take, and it is
+    /// driven entirely by config the user can still toggle. The guarantees
+    /// pinned here: only marked paths become `sgdisk -d`, the number is resolved
+    /// against the disk recorded in the SCAN (never parsed out of the path), and
+    /// deletions are ordered ahead of every `sgdisk -n`.
+    #[test]
+    fn deleting_partitions_removes_only_what_was_marked_and_does_it_first() {
+        use crate::app::DeletedPart;
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda9".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_root_new_mib = crate::app::MANUAL_REST;
+        a.config.manual_deleted = vec![
+            DeletedPart {
+                path: "/dev/vda3".into(),
+                disk: "/dev/vda".into(),
+                partuuid: "uuid-vda3".into(),
+            },
+            // A second disk: deletions are not limited to the system disk.
+            DeletedPart {
+                path: "/dev/vdb2".into(),
+                disk: "/dev/vdb".into(),
+                partuuid: "uuid-vdb2".into(),
+            },
+        ];
+
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("sgdisk -d 3 /dev/vda"),
+            "vda3 was not deleted:\n{t}"
+        );
+        assert!(t.contains("sgdisk -d 2 /dev/vdb"), "vdb2 was not deleted");
+        // Each deletion is KEYED to the identity recorded when it was marked: the
+        // plan runs minutes after the scan it was built from, and GPT reuses
+        // freed numbers, so "partition 3" alone is not proof of identity.
+        assert!(
+            t.contains("want=uuid-vda3") && t.contains("want=uuid-vdb2"),
+            "a deletion fires without checking the partition is still the right one:\n{t}"
+        );
+        // Nothing else may be deleted — in particular not the ESP being reused.
+        let deletes: Vec<&str> = t.lines().filter(|l| l.contains("sgdisk -d")).collect();
+        assert_eq!(deletes.len(), 2, "unexpected deletions: {deletes:?}");
+
+        // Deletions come before creations, or the freed space isn't free yet.
+        let first_delete = t.lines().position(|l| l.contains("sgdisk -d")).unwrap();
+        // Creation is wrapped in a guard now (idempotent retries), so match the
+        // command inside the line rather than at its start.
+        let first_create = t
+            .lines()
+            .position(|l| l.contains("sgdisk -n"))
+            .expect("no partition was created");
+        assert!(
+            first_delete < first_create,
+            "creation was planned before the deletion that frees its space"
+        );
+        // And the whole-disk wipe of the automatic path must stay absent.
+        assert!(
+            !t.lines().any(|l| l == "wipefs -a /dev/vda"),
+            "manual mode must never wipe the whole disk"
+        );
+    }
+
+    /// A partition marked for deletion must not also be mounted as an extra
+    /// disk: the storage step may still hold an entry from before the user
+    /// deleted it, and the plan would then delete it and mount it in one run.
+    #[test]
+    fn a_deleted_partition_is_dropped_from_the_extra_mounts() {
+        use crate::app::DeletedPart;
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.extra_disks.push(ExtraDisk {
+            disk: "/dev/vdb1".into(),
+            mountpoint: "/data".into(),
+            fs: "ext4".into(),
+            ..Default::default()
+        });
+        a.config.manual_deleted = vec![DeletedPart {
+            path: "/dev/vdb1".into(),
+            disk: "/dev/vdb".into(),
+            partuuid: "uuid-vdb1".into(),
+        }];
+
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("sgdisk -d 1 /dev/vdb"),
+            "the deletion is missing"
+        );
+        assert!(
+            !t.contains("/mnt/data"),
+            "a partition being deleted was also mounted:\n{t}"
+        );
+    }
+
+    /// Every extra disk carries its OWN mount options — from each other, and
+    /// from the root.
+    ///
+    /// The manual editor's /home row had the opposite bug (its "[o]" cue wrote
+    /// to the root's flags), so this pins the property for the whole extra-disk
+    /// path: two btrfs disks, one compressed and one not, plus a root whose own
+    /// setting differs from both, must produce three independent mount lines.
+    #[test]
+    fn each_extra_disk_keeps_its_own_mount_options() {
+        let mut a = install_app();
+        a.config.root_fs = "btrfs".into();
+        a.config.btrfs_compress = false; // root: NOT compressed
+        a.config.extra_disks.push(ExtraDisk {
+            disk: "/dev/sdb".into(),
+            mountpoint: "/data".into(),
+            fs: "btrfs".into(),
+            format: true,
+            whole_disk: true,
+            compress: true, // this one IS compressed
+            ..Default::default()
+        });
+        a.config.extra_disks.push(ExtraDisk {
+            disk: "/dev/sdc".into(),
+            mountpoint: "/media/scratch".into(),
+            fs: "btrfs".into(),
+            format: true,
+            whole_disk: true,
+            compress: false, // this one is not
+            ..Default::default()
+        });
+
+        let t = plan_text(&build_plan(&a));
+        let line_for = |mp: &str| -> String {
+            t.lines()
+                .find(|l| l.starts_with("mount") && l.ends_with(mp))
+                .unwrap_or_else(|| panic!("no mount line for {mp} in the plan"))
+                .to_string()
+        };
+
+        let data = line_for("/mnt/data");
+        assert!(
+            data.contains("compress=zstd"),
+            "the disk asked to compress did not: {data}"
+        );
+        let scratch = line_for("/mnt/media/scratch");
+        assert!(
+            !scratch.contains("compress=zstd"),
+            "compression leaked from the other extra disk: {scratch}"
+        );
+        let root = line_for("/mnt");
+        assert!(
+            !root.contains("compress=zstd"),
+            "compression leaked from an extra disk onto the root: {root}"
+        );
+    }
+
+    /// A dedicated /home is its OWN filesystem, so its btrfs options must not be
+    /// the root's.
+    ///
+    /// The manual editor draws an "[o] Options" cue on the /home row, but the
+    /// modal it opened always edited the ROOT's flags — so ticking compression
+    /// "for /home" compressed root instead, and unticking Subvolumes there tore
+    /// the root's @/@snapshots layout down while the user believed they were
+    /// configuring a second disk. The two sets are separate now; this pins that.
+    #[test]
+    fn home_btrfs_options_are_not_the_roots() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "btrfs".into();
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_fs = "btrfs".into();
+        // Root compresses; /home does not.
+        a.config.btrfs_compress = true;
+        a.config.manual_home_compress = false;
+
+        let t = plan_text(&build_plan(&a));
+        let home_mount = t
+            .lines()
+            .find(|l| l.starts_with("mount") && l.ends_with("/mnt/home"))
+            .expect("no /home mount in the plan");
+        assert!(
+            !home_mount.contains("compress=zstd"),
+            "/home inherited the root's compression: {home_mount}"
+        );
+        assert!(
+            t.lines().any(|l| l.contains("compress=zstd")),
+            "the root itself should still be compressed"
+        );
+
+        // And the other way round: /home compresses, root does not.
+        a.config.btrfs_compress = false;
+        a.config.manual_home_compress = true;
+        a.config.manual_home_discard = true;
+        let t = plan_text(&build_plan(&a));
+        let home_mount = t
+            .lines()
+            .find(|l| l.starts_with("mount") && l.ends_with("/mnt/home"))
+            .expect("no /home mount in the plan");
+        assert!(
+            home_mount.contains("compress=zstd") && home_mount.contains("discard=async"),
+            "/home did not get its own options: {home_mount}"
+        );
+        let root_mount = t
+            .lines()
+            .find(|l| l.starts_with("mount") && l.ends_with("/mnt"))
+            .expect("no root mount in the plan");
+        assert!(
+            !root_mount.contains("compress=zstd"),
+            "the root picked up /home's compression: {root_mount}"
+        );
+    }
+
+    /// Manual mode exists FOR dual boot: GRUB must be told to look for the
+    /// neighbours (os-prober is off by default since GRUB 2.06), and the
+    /// sanitiser must pin the loader to GRUB even if the config asked for
+    /// another one — the other loaders navigate by auto-layout PARTLABELs.
+    #[test]
+    fn manual_mode_enables_os_prober_and_pins_grub() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_esp = "/dev/vda1".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.bootloader = Bootloader::Refind;
+        let t = plan_text(&build_plan(&a));
+        assert!(t.contains("GRUB_DISABLE_OS_PROBER=false"));
+        assert!(
+            t.contains("grub-install --target=x86_64-efi"),
+            "manual is pinned to GRUB"
+        );
+        assert!(
+            !t.contains("refind-install"),
+            "the requested rEFInd must be overridden"
+        );
+    }
+
+    /// Cinnamon must arrive as a desktop, not a bare shell.
+    ///
+    /// The `cinnamon` group ships no text editor, no archiver and no document
+    /// viewers; Linux Mint fills that gap with the X-Apps and a few GTK3 GNOME
+    /// tools. The plan mirrors that selection, so a fresh Cinnamon login can
+    /// open a zip, read a PDF and edit a file without a trip to pacman.
+    #[test]
+    fn cinnamon_ships_a_usable_desktop_not_a_bare_shell() {
+        let mut a = install_app();
+        a.config.desktops = vec!["Cinnamon".into()];
+        let t = plan_text(&build_plan(&a));
+        for pkg in ["xed", "xreader", "xviewer", "file-roller", "celluloid"] {
+            assert!(
+                t.contains(pkg),
+                "Mint-style default {pkg} must be installed with Cinnamon"
+            );
+        }
+    }
+
+    /// Pinnacle's runtime dependencies ride the pacman phase, not the AUR one.
+    ///
+    /// A live `pactree -d2 pinnacle-comp` showed that of the whole dependency
+    /// tree only TWO packages are genuinely AUR (pinnacle-comp and
+    /// lua54-protobuf — `pacman -Qm` listed exactly those); the other fourteen
+    /// are plain repo packages since Arch's Lua 5.5 split. Installing them via
+    /// pacman puts them inside the retried, mirror-ranked transaction — and
+    /// paru's job shrinks to the two builds that actually need it.
+    #[test]
+    fn pinnacle_runtime_deps_ride_the_pacman_phase() {
+        let mut a = install_app();
+        a.config.desktops = vec!["Pinnacle".into()];
+        let t = plan_text(&build_plan(&a));
+
+        for pkg in [
+            "lua54-http",
+            "lua54-posix",
+            "libdisplay-info",
+            "protobuf",
+            "rust",
+        ] {
+            assert!(
+                t.contains(pkg),
+                "{pkg} is a repo package and must be pre-seeded in the pacman phase"
+            );
+        }
+
+        // The AUR-INSTALL line (paru actually installing the packages), told
+        // apart from the paru-BUILD line by `--skipreview`, which is paru's own
+        // flag — the build line runs plain pacman/makepkg and never has it.
+        let paru_line = t
+            .lines()
+            .find(|l| l.contains("paru") && l.contains("--skipreview"))
+            .expect("a Pinnacle install must have the paru install line");
+        assert!(paru_line.contains("pinnacle-comp"));
+        assert!(
+            !paru_line.contains("lua54"),
+            "the lua54 stack is repo territory — paru must not be asked to \
+             build it: {paru_line}"
         );
     }
 
@@ -2905,6 +5304,174 @@ mod tests {
         assert!(
             t.contains("FAILED to install"),
             "a failed AUR build must be announced in the log"
+        );
+    }
+
+    /// No naive sudo→doas symlink, ever.
+    ///
+    /// It "works" for a bare `sudo cmd` but breaks the instant a tool passes a
+    /// sudo-only flag (makepkg's `sudo -k` is what killed the AUR build), and
+    /// opendoas upstream ships none for the same reason. The user opts into the
+    /// proper `doas-sudo-shim` package instead.
+    #[test]
+    fn no_naive_sudo_to_doas_symlink_is_created() {
+        let mut a = install_app();
+        a.config.use_doas = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("ln -sf") || !t.contains("/usr/local/bin/sudo"),
+            "the naive sudo→doas symlink is back — it breaks on sudo-only flags:\n{t}"
+        );
+    }
+
+    /// Choosing doas replaces the real sudo with doas-sudo-shim.
+    ///
+    /// sudo can't just be removed — base-devel and qt-sudo (pulled by octopi)
+    /// hard-depend on it. The shim PROVIDES sudo, so it satisfies those deps
+    /// while the real sudo binary goes away and `sudo` starts running doas. It
+    /// is built directly (no paru) and swapped in build-first, replace-second so
+    /// a failed build leaves sudo intact.
+    #[test]
+    fn doas_replaces_sudo_with_the_shim() {
+        let mut a = install_app();
+        a.config.username = "tester".into();
+        a.config.use_doas = true;
+        let doas = plan_text(&build_plan(&a));
+        assert!(
+            doas.contains("git clone https://aur.archlinux.org/doas-sudo-shim.git"),
+            "doas install does not build the sudo-compat shim:\n{doas}"
+        );
+        // It must FORCE-remove sudo (plain -R fails on the hard deps) and install
+        // the shim that re-satisfies them.
+        assert!(
+            doas.contains("pacman -Rdd --noconfirm sudo") && doas.contains("pacman -U --noconfirm"),
+            "the shim is built but sudo is never swapped out:\n{doas}"
+        );
+
+        // A sudo install must NOT do any of this.
+        let mut b = install_app();
+        b.config.username = "tester".into();
+        b.config.use_doas = false;
+        let sudo = plan_text(&build_plan(&b));
+        assert!(
+            !sudo.contains("doas-sudo-shim") && !sudo.contains("pacman -Rdd --noconfirm sudo"),
+            "a sudo install must keep sudo and never touch the shim:\n{sudo}"
+        );
+    }
+
+    /// Building paru from source must not depend on privilege escalation, which
+    /// is exactly what breaks on a doas system.
+    ///
+    /// `makepkg -si` elevates to install the makedep (cargo) and again to
+    /// install the built package. On doas that goes through the sudo→doas shim,
+    /// and makepkg's `sudo -k` is a flag doas rejects — cargo never installs and
+    /// the Rust build dies with "could not resolve all dependencies". The build
+    /// instead installs deps as root, builds `makepkg -f` (never `-si`) as the
+    /// user with every dep already present, and installs the result with
+    /// `pacman -U` as root. No sudo, no doas, no tty anywhere in the build.
+    #[test]
+    fn paru_builds_from_source_without_any_privilege_escalation() {
+        let mut a = install_app();
+        a.config.aur_packages.push("some-aur-pkg".into());
+        a.config.use_doas = true;
+        a.config.chaotic_aur = false; // force the from-source path
+        let t = plan_text(&build_plan(&a));
+
+        let build = t
+            .lines()
+            .find(|l| l.contains("git clone https://aur.archlinux.org/paru.git"))
+            .expect("no paru source build in the plan");
+
+        // makepkg must NOT self-install (that is the line that elevates).
+        assert!(
+            !build.contains("makepkg -si") && !build.contains("makepkg -s "),
+            "makepkg still installs deps itself, which elevates and breaks on doas:\n{build}"
+        );
+        assert!(
+            build.contains("makepkg -f"),
+            "the build no longer runs makepkg at all:\n{build}"
+        );
+        // The build deps (cargo via rust) are laid down by ROOT pacman first…
+        let deps_pos = build
+            .find("pacman -S --needed --noconfirm")
+            .unwrap_or(usize::MAX);
+        let make_pos = build.find("makepkg -f").unwrap_or(0);
+        assert!(
+            deps_pos < make_pos && build[..make_pos].contains("rust"),
+            "cargo/rust is not installed by root before the build:\n{build}"
+        );
+        // …and the finished package is installed with root pacman -U, not by
+        // makepkg elevating.
+        assert!(
+            build.contains("pacman -U --noconfirm"),
+            "the built package is not installed by root pacman -U:\n{build}"
+        );
+    }
+
+    /// The starship theme is generated robustly, before the home is chowned.
+    ///
+    /// Symptom seen live: the shell came up with starship's plain `❯` default,
+    /// looking as if starship never installed. It HAD — but the theme file was
+    /// missing, because the `su - {user}` login shell that generated it was
+    /// fragile in the chroot and its failure was swallowed by `|| true`. The
+    /// preset is now written by root (starship preset only writes a file) and
+    /// the later `chown -R {home}` hands it over.
+    #[test]
+    fn the_starship_theme_is_generated_by_root_before_the_home_is_chowned() {
+        let mut a = install_app();
+        a.config.extra_packages = vec!["zsh".into()];
+        let t = plan_text(&build_plan(&a));
+
+        let theme = t
+            .lines()
+            .position(|l| l.contains("starship preset pastel-powerline -o"))
+            .expect("the starship theme is never generated");
+        // Not through a fragile login shell.
+        assert!(
+            !t.lines().nth(theme).unwrap().contains("su - "),
+            "the theme is still generated via a `su -` login shell, which was \
+             the fragile step that silently produced no theme"
+        );
+        // And it must land BEFORE the blanket home chown, or it stays root-owned.
+        let chown = t
+            .lines()
+            .position(|l| l.contains("chown -R") && l.trim_end().ends_with("/home/tester"))
+            .expect("the home is never chowned to the user");
+        assert!(
+            theme < chown,
+            "the starship theme is written after the home chown, so it stays \
+             root-owned"
+        );
+    }
+
+    /// "slayfetch" is not a real package — it installs the ordinary fastfetch
+    /// with a chosen Artix + pride logo. The plan must install `fastfetch` (never
+    /// a bogus `slayfetch` target) and still write the fastfetch config.
+    #[test]
+    fn slayfetch_installs_real_fastfetch_and_its_config() {
+        let mut a = install_app();
+        a.config.extra_packages = vec!["slayfetch".into()];
+        a.config.fastfetch_logo = "Transgender".into();
+        let t = plan_text(&build_plan(&a));
+        // slayfetch is a UI alias — it maps to the real fastfetch package and
+        // must never be handed to pacman as an install target.
+        assert!(
+            system_packages(&a.config).iter().any(|p| p == "fastfetch"),
+            "slayfetch must install the real fastfetch package"
+        );
+        assert!(
+            !system_packages(&a.config).iter().any(|p| p == "slayfetch"),
+            "slayfetch must not be a pacman target"
+        );
+        assert!(
+            t.contains(".config/fastfetch/config.jsonc"),
+            "the fastfetch config must still be written for slayfetch"
+        );
+        // A `slayfetch` command (wrapper → fastfetch) is installed so the name
+        // the user picked actually works in the shell.
+        assert!(
+            t.contains("/usr/local/bin/slayfetch") && t.contains("exec fastfetch"),
+            "a slayfetch → fastfetch wrapper must be installed:\n{t}"
         );
     }
 
@@ -3042,5 +5609,38 @@ mod tests {
 
         c.root_fs = "ext4".into();
         assert_eq!(rootflags_part(&c), "", "no rootflags for non-btrfs");
+    }
+
+    /// The rollback GRUB entry MUST put root= on the kernel cmdline.
+    ///
+    /// A hand-written menuentry does not get 10_linux's automatic root=, and
+    /// without it the initramfs boots with an EMPTY root device: "device ''
+    /// not found", "Failed to mount '' on real root", straight to an emergency
+    /// shell. Seen live on BOTH dual-boot systems when picking a snapshot. The
+    /// rollback hook reads the same ${root}, so an empty one also makes the
+    /// rollback itself a silent no-op.
+    #[test]
+    fn the_rollback_grub_entry_sets_root_on_the_kernel_cmdline() {
+        let s = ARTIX_ROLLBACK_GRUBD;
+
+        // It resolves the ROOT filesystem (`/`), not where the kernel lives —
+        // those differ when /boot is a separate/ESP partition.
+        assert!(
+            s.contains("--target=device /") && s.contains("--target=fs_uuid"),
+            "the rollback entry never resolves the root filesystem's UUID"
+        );
+
+        // Every `linux` line the script prints must carry root=. The kernel line
+        // template is `linux %s %s rootflags=subvol=@ …` — the second %s is the
+        // root argument, so there must be no `linux %s rootflags` left (the old
+        // form that shipped the empty-root bug).
+        assert!(
+            s.contains("$rootarg"),
+            "the root argument is never added to the kernel cmdline"
+        );
+        assert!(
+            !s.contains("linux %s rootflags=subvol=@"),
+            "a linux line still omits root= (the empty-root emergency-shell bug)"
+        );
     }
 }

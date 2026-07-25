@@ -107,6 +107,39 @@ pub fn input(f: &mut Frame, area: Rect, label: &str, value: &str, focused: bool,
     );
 }
 
+/// One-line labelled input for short consoles: `› label: value▏`, no border box.
+/// The boxed `input` above needs 4 rows per field, so a form with several fields
+/// overflows the panel on an 80x24 console; this fits one field per row while
+/// keeping the same focus caret and password masking.
+pub fn input_inline(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    mask: bool,
+) {
+    let shown = if mask {
+        "•".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
+    let caret = if focused { "\u{258f}" } else { "" };
+    let line = Line::from(vec![
+        Span::styled(if focused { "\u{203a} " } else { "  " }, theme::accent()),
+        Span::styled(format!("{label}: "), theme::dim()),
+        Span::styled(
+            format!("{shown}{caret}"),
+            if focused {
+                theme::normal()
+            } else {
+                theme::mute()
+            },
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
 /// A two-button action row: Back (left) and Next/Confirm (right, accented when
 /// enabled). Returns nothing; purely visual — screens own the key handling.
 pub fn action_row(f: &mut Frame, area: Rect, _back: &str, next: &str, next_enabled: bool) {

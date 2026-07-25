@@ -81,9 +81,11 @@ pub(crate) fn handle_global(app: &mut App, key: KeyEvent) -> bool {
             if app.screen == Screen::Mode
                 || app.screen == Screen::Recovery
                 || app.screen == Screen::WifiTest
+                || app.screen == Screen::TbwTest
             {
                 // Outside the linear flow: these screens own their Esc (Mode →
-                // Language, Recovery → Mode). goto_prev() would index past ALL.
+                // Language, Recovery/WifiTest/TbwTest → Mode). goto_prev() would
+                // index past ALL.
                 false
             } else if app.screen == Screen::Wifi
                 && app.wifi_stage != crate::screens::wifi::Stage::Choose
@@ -148,6 +150,20 @@ fn any_modal_open(app: &App) -> bool {
         || app.storage_opts_modal_open
         || app.disk_warn_modal_open
         || app.confirm_format_open
+        // Manual partition editor: the role picker and the create-partition
+        // wizard own Esc (close / step back). Without them here the global
+        // "back" fires first and ejects from the whole disk screen instead.
+        || app.parts_modal_open
+        || app.parts_create_open || app.parts_mount_open
+        || app.parts_disk_modal_open
+        // The disk-wipe modal owns Esc (step back / close); the "now" wipe
+        // overlay owns it too so Esc cannot eject mid-erase.
+        || app.parts_wipe_open
+        || app.parts_wipe_ack_open
+        || app.wipe_run_rx.is_some()
+        || app.wipe_run_done.is_some()
+        // The slayfetch logo picker on the packages screen owns Esc (close).
+        || app.logo_modal_open
 }
 
 /// True when the current screen's focus is on its TOP item, so a further Up
@@ -168,7 +184,15 @@ fn at_top(app: &App) -> bool {
         Screen::User => app.user_focus == 0,
         Screen::Options | Screen::Security => app.cursor == 0,
         Screen::Storage => app.storage_cursor == 0,
-        Screen::Disk => app.disk_focus == 0,
+        Screen::Disk => {
+            // Two faces of one step: the manual role list navigates app.cursor,
+            // the auto picker its own disk_focus.
+            if app.config.partition_mode.is_manual_family() {
+                app.cursor == 0
+            } else {
+                app.disk_focus == 0
+            }
+        }
         // Packages has two sections; the very top is the GPU list's first row.
         Screen::Packages => {
             app.pkg_focus == crate::screens::packages::FOCUS_GPU && app.gpu_cursor == 0
@@ -314,5 +338,33 @@ mod tests {
             Screen::Desktop,
             "Esc with a modal open must not walk back a screen"
         );
+    }
+
+    /// The manual partition editor's own modals (role picker, create-partition
+    /// wizard) must own Esc too — otherwise Esc ejects from the whole disk
+    /// screen instead of closing the modal, discarding the layout in progress.
+    #[test]
+    fn esc_defers_to_the_manual_partition_modals() {
+        for open in [
+            |a: &mut App| a.parts_modal_open = true,
+            |a: &mut App| a.parts_create_open = true,
+        ] {
+            let mut app = App::new();
+            app.screen = Screen::Disk;
+            app.config.partition_mode = crate::app::PartitionMode::Manual;
+            open(&mut app);
+
+            let consumed = handle_global(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+            assert!(
+                !consumed,
+                "Esc must defer to the open manual-editor modal, not be consumed globally"
+            );
+            assert_eq!(
+                app.screen,
+                Screen::Disk,
+                "Esc with a manual-editor modal open must not walk back a screen"
+            );
+        }
     }
 }

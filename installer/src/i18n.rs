@@ -136,6 +136,87 @@ mod tests {
         );
     }
 
+    /// Every key the SOURCE asks for actually exists.
+    ///
+    /// The parity test above only proves the two files agree — delete a key
+    /// from both and it stays happily silent while the screen renders a raw
+    /// identifier. That is not hypothetical: a file-wide `sed` meant for one
+    /// section deleted `along.hint_disk` from both files at once, and nothing
+    /// failed until it was noticed by eye.
+    ///
+    /// Only literal keys can be checked; a handful are built with `format!`
+    /// (`disk.fsopt_{id}`) and are skipped by construction.
+    #[test]
+    fn every_key_the_code_asks_for_exists() {
+        let defined = keys(Lang::Uk);
+        let mut missing: Vec<String> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // This module tests the lookup ITSELF, including what a missing
+                // key does, so its literals are deliberately not translations.
+                if path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("src/i18n.rs")
+                {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in src.lines() {
+                    // Comments carry examples ("sec.key"), not real lookups.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let b = line.as_bytes();
+                    for (i, _) in line.match_indices("t(") {
+                        // `t(` must be the whole call name, not the tail of
+                        // `act(` or `format!(`.
+                        if i > 0 {
+                            let prev = b[i - 1] as char;
+                            if prev.is_alphanumeric() || prev == '_' || prev == '!' {
+                                continue;
+                            }
+                        }
+                        let rest = &line[i + 2..];
+                        let Some(q1) = rest.find('"') else { continue };
+                        // The key is the SECOND argument, so a comma separates
+                        // it from the language — that alone rejects `act("…")`.
+                        if !rest[..q1].contains(',') {
+                            continue;
+                        }
+                        let after = &rest[q1 + 1..];
+                        let Some(q2) = after.find('"') else { continue };
+                        let key = &after[..q2];
+                        if !key.contains('.') || key.contains('{') || key.contains(' ') {
+                            continue;
+                        }
+                        if !defined.contains(key) && !missing.contains(&key.to_string()) {
+                            missing.push(key.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the code asks for keys that no translation defines: {missing:?}"
+        );
+    }
+
     /// No translation is left as an empty string — an empty value renders as a
     /// blank label, which reads as a broken screen rather than a missing string.
     #[test]

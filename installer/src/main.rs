@@ -443,7 +443,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // "current" so NONE of the install steps render as done/active — they all
     // show as pending, which reads correctly (no install step is in progress).
     let current = match app.screen {
-        Screen::Mode | Screen::Recovery | Screen::WifiTest => usize::MAX,
+        Screen::Mode | Screen::Recovery | Screen::WifiTest | Screen::TbwTest => usize::MAX,
         s => s as usize,
     };
     // Brand. The rail is narrow (12 cols), so keep this short. "ARTIX" centered,
@@ -546,6 +546,7 @@ fn screen_title(app: &App) -> String {
         Screen::Mode => return format!(" {} ", t(app.lang, "mode.title")),
         Screen::Recovery => return format!(" {} ", t(app.lang, "rec.title")),
         Screen::WifiTest => return format!(" {} ", t(app.lang, "wt.title")),
+        Screen::TbwTest => return format!(" {} ", t(app.lang, "tbw.title")),
         _ => {}
     }
     let key = match app.screen {
@@ -557,6 +558,7 @@ fn screen_title(app: &App) -> String {
         Screen::Desktop => "de.title",
         Screen::Packages => "pkg.title",
         Screen::Aur => "aur.title",
+        Screen::PartitionMode => "pmode.title",
         Screen::Disk => "disk.title",
         Screen::Security => "sec.title",
         Screen::Storage => "storage.title",
@@ -565,7 +567,7 @@ fn screen_title(app: &App) -> String {
         Screen::Summary => "sum.title",
         Screen::Finish => "fin.title",
         // Handled above with an early return.
-        Screen::Mode | Screen::Recovery | Screen::WifiTest => unreachable!(),
+        Screen::Mode | Screen::Recovery | Screen::WifiTest | Screen::TbwTest => unreachable!(),
     };
     format!(
         " {} / 15  ·  {} ",

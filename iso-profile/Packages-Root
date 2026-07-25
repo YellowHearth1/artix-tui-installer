@@ -19,6 +19,13 @@ dosfstools
 e2fsprogs
 util-linux
 parted
+# Disk-wipe methods (manual editor → header wipe strip): hdparm = ATA Secure
+# Erase, nvme-cli = `nvme format` for NVMe. blkdiscard/wipefs/shred come from
+# util-linux/coreutils already.
+hdparm
+nvme-cli
+# Drive-wear (TBW) screen reads SMART via `smartctl`.
+smartmontools
 # Bootstrap + chroot helpers:
 artools-pkg
 arch-install-scripts

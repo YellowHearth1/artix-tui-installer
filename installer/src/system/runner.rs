@@ -491,8 +491,11 @@ fn spawn_streamed(program: &str, args: &[&str]) -> Receiver<LogLine> {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
 
     thread::spawn(move || {
-        let pretty = format!("$ {} {}", program, args.join(" "));
-        let _ = tx.send(LogLine::Out(pretty));
+        // The command is NOT echoed here. The install screen already logged it
+        // via `Action::log_line` before spawning, so echoing it again printed
+        // every command twice — and this copy was built from the raw argv, so
+        // for a password step it would have put the secret straight back into
+        // the log that `log_line` had just kept it out of.
 
         let child = Command::new(&program)
             .args(&args)

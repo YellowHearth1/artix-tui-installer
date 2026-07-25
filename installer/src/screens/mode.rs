@@ -37,6 +37,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         format!("  {}", t(app.lang, "mode.install")),
         format!("  {}", t(app.lang, "mode.recovery")),
         format!("  {}", t(app.lang, "mode.wifitest")),
+        format!("  {}", t(app.lang, "mode.tbw")),
     ];
     widgets::select_list(f, rows[1], &items, app.mode_cursor);
 
@@ -53,7 +54,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.mode_cursor = app.mode_cursor.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => app.mode_cursor = (app.mode_cursor + 1).min(2),
+        KeyCode::Down | KeyCode::Char('j') => app.mode_cursor = (app.mode_cursor + 1).min(3),
         KeyCode::Enter => {
             if app.mode_cursor == 0 {
                 // Install: enter the normal flow at its first post-language
@@ -66,6 +67,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 app.wifitest_log.clear();
                 app.wifitest_running = false;
                 app.screen = Screen::WifiTest;
+            } else if app.mode_cursor == 3 {
+                // Drive wear (TBW): read each disk's SMART write total. The scan
+                // is kicked off lazily the first time the screen draws.
+                app.tbwtest_scanned = false;
+                app.tbwtest_running = false;
+                app.tbwtest_rows.clear();
+                app.screen = Screen::TbwTest;
             } else {
                 // Recovery: jump to the recovery tool and start a fresh scan.
                 app.recovery_focus = 0;

@@ -13,6 +13,7 @@ pub(crate) fn act(program: &str, args: &[&str]) -> Action {
         program: program.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
         interactive: false,
+        redacted: None,
     }
 }
 
@@ -25,6 +26,7 @@ pub(crate) fn act_interactive(program: &str, args: &[&str]) -> Action {
         program: program.to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
         interactive: true,
+        redacted: None,
     }
 }
 
@@ -35,6 +37,7 @@ pub(crate) fn chroot(script: &str) -> Action {
         program: "artix-chroot".to_string(),
         args: vec!["/mnt".into(), "sh".into(), "-c".into(), script.to_string()],
         interactive: false,
+        redacted: None,
     }
 }
 
@@ -45,6 +48,7 @@ pub(crate) fn chroot_interactive(script: &str) -> Action {
         program: "artix-chroot".to_string(),
         args: vec!["/mnt".into(), "sh".into(), "-c".into(), script.to_string()],
         interactive: true,
+        redacted: None,
     }
 }
 
@@ -145,6 +149,18 @@ pub(crate) fn write_home_binary(home: &str, rel_path: &str, bytes: &[u8]) -> Vec
 /// directory fails the whole install step.
 pub(crate) fn write_target_file(mnt_path: &str, content: &str) -> Action {
     let in_chroot = mnt_path.strip_prefix("/mnt").unwrap_or(mnt_path);
+    // /tmp and /run inside the target are FRESH tmpfs mounts made by
+    // artix-chroot on every single invocation (artools lib/base/mount.sh), so a
+    // file written there is gone the moment this action returns — the next
+    // chroot call sees an empty tmpfs. That shipped once and killed the install
+    // with exit 127. A one-shot script belongs inline in a single `chroot(...)`
+    // call; anything that must persist belongs on the real filesystem.
+    debug_assert!(
+        !(in_chroot.starts_with("/tmp/") || in_chroot.starts_with("/run/")),
+        "write_target_file({mnt_path}): the target's /tmp and /run are per-call \
+         tmpfs — this file cannot survive to the next chroot call. Run the \
+         script inline via chroot(script) instead."
+    );
     let dir = std::path::Path::new(in_chroot)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

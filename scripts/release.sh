@@ -69,7 +69,10 @@ PRETTY_DATE=$(printf '%s-%s-%s' \
 
 # Warn if the ISO predates the binary: it then does NOT contain this build, and
 # shipping them together would quietly hand users a stale installer.
-if [ "$ISO" -ot "$BIN" ]; then
+# `[ -ot ]` is a bashism — undefined in POSIX sh (SC3013), so under dash this
+# guard would silently misbehave. `find -newer` asks the same question in
+# POSIX: "is BIN newer than ISO?" prints a line exactly when the ISO is stale.
+if [ -n "$(find "$BIN" -newer "$ISO" 2>/dev/null)" ]; then
     echo "~~ WARNING: the ISO is older than the binary."
     echo "   The image probably does not include this installer build."
     echo "   Rebuild the ISO, or continue only if you know it's fine."

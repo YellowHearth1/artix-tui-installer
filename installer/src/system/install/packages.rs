@@ -291,12 +291,26 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
 
     // Userspace tools for the chosen root filesystem, so the installed system
     // can fsck/mount/maintain it. ext2/3/4 use e2fsprogs (pulled by base).
-    match c.root_fs.as_str() {
-        "btrfs" => p.push("btrfs-progs".into()),
-        "xfs" => p.push("xfsprogs".into()),
-        "f2fs" => p.push("f2fs-tools".into()),
-        "jfs" => p.push("jfsutils".into()),
-        _ => {} // ext*/default: e2fsprogs is already part of base
+    let fs_tool = |fs: &str| -> Option<&'static str> {
+        match fs {
+            "btrfs" => Some("btrfs-progs"),
+            "xfs" => Some("xfsprogs"),
+            "f2fs" => Some("f2fs-tools"),
+            "jfs" => Some("jfsutils"),
+            _ => None, // ext*/default: e2fsprogs is already part of base
+        }
+    };
+    if let Some(tool) = fs_tool(&c.root_fs) {
+        p.push(tool.into());
+    }
+    // A manual /home on its own partition may use a different filesystem than
+    // root — the installed system needs its tools too.
+    if c.partition_mode.is_manual_family() && !c.manual_home.is_empty() {
+        if let Some(tool) = fs_tool(&c.manual_home_fs) {
+            if !p.iter().any(|x| x == tool) {
+                p.push(tool.into());
+            }
+        }
     }
     // Auto-snapshots: snapper manages the btrfs snapshots and snap-pac hooks
     // pacman to take a pre/post snapshot around every transaction. Only added
@@ -331,6 +345,20 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
             }
         } else if d.fs.eq_ignore_ascii_case("ntfs") && !p.iter().any(|x| x == "ntfs-3g") {
             p.push("ntfs-3g".into());
+        }
+    }
+    // Dual-boot detection tooling. When os-prober is on (manual / install-
+    // alongside), grub-mkconfig runs os-prober to add the neighbouring OS to
+    // the menu — and to identify a Windows install it must MOUNT and READ the
+    // NTFS partition, which needs ntfs-3g (its /sbin/mount.ntfs helper). Without
+    // it os-prober silently skips the NTFS volume and "GRUB doesn't see Windows"
+    // — the single most common dual-boot complaint. os-prober itself is already
+    // in the base list; mtools lets it read FAT/EFI loaders cleanly too.
+    if c.os_prober {
+        for pkg in ["ntfs-3g", "os-prober", "mtools"] {
+            if !p.iter().any(|x| x == pkg) {
+                p.push(pkg.into());
+            }
         }
     }
     // Bootloader package for the chosen bootloader (grub is already in the base
@@ -486,6 +514,59 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
                 "xdg-desktop-portal",
                 "xdg-desktop-portal-wlr",
                 "kdeconnect",
+                // ── The compositor's own runtime dependencies ───────────────
+                // Transcribed from `pactree -d2 pinnacle-comp` on a working
+                // install (2026-07-16). Of the whole tree only TWO packages
+                // are AUR — pinnacle-comp itself and lua54-protobuf (both
+                // showed "Unknown Packager"; `pacman -Qm` listed exactly those
+                // two). Everything below is a plain repo package, first-class
+                // since Arch's Lua 5.5 split (Dec 2025) made lua54* official.
+                //
+                // paru WOULD resolve all of these on its own while installing
+                // the built pinnacle-comp — but mid-AUR-phase, outside the
+                // retried, mirror-ranked pacman transaction. Pre-seeding them
+                // here shrinks the AUR phase to exactly two builds, and keeps
+                // the recovery path after a failed build (`paru -S
+                // pinnacle-comp`, printed by the guard in build_plan) a
+                // two-package job on an otherwise-complete system.
+                //
+                // `seatd` here is the libseat DEPENDENCY the compositor links
+                // against. seatd and elogind are alternatives at the SERVICE
+                // level: exactly one of the two services may run, and the
+                // autoscan enforces that in both directions — a package sitting
+                // next to the other is acceptable only as a compatibility
+                // layer. `systemd-libs` from the pactree is NOT named:
+                // on Artix it's satisfied by the distro's own providers and
+                // arrives as a dependency.
+                "wayland",
+                "libxkbcommon",
+                "libinput",
+                "mesa",
+                "seatd",
+                "libdisplay-info",
+                "protobuf",
+                // `lua54` is in Artix world AND Arch extra; the three below are
+                // Arch extra ONLY. So this whole group is unresolvable until the
+                // Arch repos are enabled — which is why it belongs in the
+                // in-chroot phase and never in basestrap. It is also why the
+                // target must be `-Syu`'d once those repos are on: the base came
+                // from Artix alone, and pulling `lua54` (a hard dependency of
+                // `libinput`) onto a base still holding the pre-split `lua` 5.4
+                // is a file conflict that kills the entire transaction.
+                "lua54",
+                "lua54-cqueues",
+                "lua54-http",
+                "lua54-posix",
+                // The shipped Pinnacle config is itself a Cargo project that
+                // build_plan compiles inside the chroot (cargo build --release
+                // in ~/.config/pinnacle). When pinnacle-comp is BUILT from the
+                // AUR, cargo happens to remain as a leftover make-dependency —
+                // but when it lands PREBUILT (Chaotic-AUR), no makedeps are
+                // pulled and the config build dies with "cargo: command not
+                // found". Name the toolchain explicitly instead of relying on
+                // paru's RemoveMake default. (git, needed for the config's git
+                // dependencies, rides in as a dependency of paru either way.)
+                "rust",
             ] {
                 if !p.iter().any(|x| x == pkg) {
                     p.push(pkg.to_string());
@@ -502,7 +583,19 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
             }
         }
     }
-    p.extend(c.extra_packages.iter().cloned());
+    // "slayfetch" is not a real package — it's fastfetch with a chosen logo.
+    // Map it to the actual `fastfetch` package here (deduped, so picking both is
+    // harmless) and let the plan swap the logo. Everything else passes through.
+    for name in &c.extra_packages {
+        let real = if name == "slayfetch" {
+            "fastfetch"
+        } else {
+            name.as_str()
+        };
+        if !p.iter().any(|x| x == real) {
+            p.push(real.to_string());
+        }
+    }
     // Companion packages: some apps are split into a thin main package plus
     // separate plugin/codec packages, and are nearly useless without them. We
     // pull those in automatically so the app works out of the box.
