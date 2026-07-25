@@ -86,6 +86,26 @@ TAG="build-$ISO_DATE"
 ISO_SIZE=$(du -h "$ISO" | cut -f1)
 BIN_SIZE=$(du -h "$BIN" | cut -f1)
 
+# The release page says WHAT was built; the changelog says what CHANGED. Link
+# them, or the only description a downloader gets is a table of file sizes.
+#
+# The link points at the tag this release creates, not at main: a release is a
+# snapshot, and its notes must keep describing THAT build after main moves on.
+#
+# The anchor reproduces GitHub's own scheme for the "## [244] — date" heading:
+# punctuation (the brackets and the em dash) is deleted, then EVERY remaining
+# space becomes a hyphen. Spaces are deliberately not collapsed first — dropping
+# the em dash leaves two spaces behind, and GitHub turns them into two hyphens:
+# the real anchor is "244--2026-07-25". Collapsing them yielded one hyphen and a
+# link that silently landed at the top of the file. Verified against the
+# rendered page rather than assumed.
+MAJOR=$(echo "$VERSION" | cut -d. -f1)
+CHANGELOG_ANCHOR=$(grep -m1 "^## \[$MAJOR\]" "$REPO_DIR/CHANGELOG.md" 2>/dev/null |
+    sed 's/^## //; s/[][—]//g; s/ /-/g' |
+    tr '[:upper:]' '[:lower:]')
+CHANGELOG_URL="https://github.com/$GH_REPO/blob/$TAG/CHANGELOG.md"
+[ -n "$CHANGELOG_ANCHOR" ] && CHANGELOG_URL="$CHANGELOG_URL#$CHANGELOG_ANCHOR"
+
 echo ">>> ISO:     $(basename "$ISO")  ($ISO_SIZE)"
 echo ">>> Binary:  $BIN  ($BIN_SIZE)"
 echo ">>> Tag:     $TAG   (installer v$VERSION)"
@@ -112,6 +132,9 @@ _Prebuilt installer binary and a live ISO with the installer baked in._
 | **Версія інсталятора** | _Installer version_ | v$VERSION |
 | **ISO** | _ISO_ | \`$ISO_ASSET_NAME\` — $ISO_SIZE |
 | **Бінарник** | _Binary_ | \`artix-installer\` — $BIN_SIZE, x86_64 |
+
+📝 **Що змінилося у v$MAJOR** — [журнал змін]($CHANGELOG_URL)
+_**What changed in v$MAJOR** — [changelog]($CHANGELOG_URL)_
 
 ---
 
