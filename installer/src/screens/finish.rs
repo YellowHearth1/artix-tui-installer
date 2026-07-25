@@ -248,3 +248,143 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode the half-block art back into a module matrix:
+    /// each text row carries two module rows.
+    fn modules(rows: &[&str]) -> Vec<Vec<bool>> {
+        let mut out = Vec::new();
+        for r in rows {
+            let mut top = Vec::new();
+            let mut bot = Vec::new();
+            for ch in r.chars() {
+                top.push(ch == '█' || ch == '▀');
+                bot.push(ch == '█' || ch == '▄');
+            }
+            out.push(top);
+            out.push(bot);
+        }
+        out
+    }
+
+    /// The QR art is hand-pasted block characters, so a stray edit — one
+    /// glyph, one trimmed trailing space — silently produces a code that
+    /// still *looks* fine and scans to nothing, or to somewhere else. Both
+    /// codes were generated for their exact URL and verified to decode back
+    /// to it; this pins the structure that verification relied on: a square
+    /// 29×29 symbol (QR version 3), the spec's 4-module quiet zone on every
+    /// side, and only the four legal half-block glyphs.
+    #[test]
+    fn the_donate_qr_codes_are_structurally_intact() {
+        for (name, art) in [("QR_UK", QR_UK), ("QR_EN", QR_EN)] {
+            for (i, row) in art.iter().enumerate() {
+                assert!(
+                    row.chars().all(|c| matches!(c, ' ' | '█' | '▀' | '▄')),
+                    "{name} row {i} has a glyph that is not a half-block"
+                );
+                assert_eq!(
+                    row.chars().count(),
+                    art[0].chars().count(),
+                    "{name} row {i} is a different width — the code is skewed"
+                );
+            }
+
+            let m = modules(art);
+            let dark: Vec<(usize, usize)> = m
+                .iter()
+                .enumerate()
+                .flat_map(|(y, row)| {
+                    row.iter()
+                        .enumerate()
+                        .filter(|(_, &d)| d)
+                        .map(move |(x, _)| (y, x))
+                })
+                .collect();
+            assert!(!dark.is_empty(), "{name} is blank");
+
+            let (y0, y1) = (
+                dark.iter().map(|p| p.0).min().unwrap(),
+                dark.iter().map(|p| p.0).max().unwrap(),
+            );
+            let (x0, x1) = (
+                dark.iter().map(|p| p.1).min().unwrap(),
+                dark.iter().map(|p| p.1).max().unwrap(),
+            );
+            assert_eq!(y1 - y0 + 1, 29, "{name} is not 29 modules tall");
+            assert_eq!(x1 - x0 + 1, 29, "{name} is not 29 modules wide");
+
+            let w = m[0].len();
+            assert!(y0 >= 4, "{name} quiet zone above is {y0}, needs 4");
+            assert!(m.len() - 1 - y1 >= 4, "{name} quiet zone below is too thin");
+            assert!(x0 >= 4, "{name} quiet zone left is {x0}, needs 4");
+            assert!(w - 1 - x1 >= 4, "{name} quiet zone right is too thin");
+        }
+
+        assert_ne!(
+            QR_UK, QR_EN,
+            "each language must keep its own code — one was pasted over the other"
+        );
+    }
+
+    /// FNV-1a over the art, newline after each row. Hand-rolled because
+    /// `DefaultHasher` is explicitly not stable across Rust releases, and a
+    /// pinned constant has to outlive the toolchain.
+    fn fnv1a(rows: &[&str]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for r in rows {
+            r.bytes().for_each(&mut mix);
+            mix(b'\n');
+        }
+        h
+    }
+
+    /// The structural test above catches skew, stray glyphs and a missing
+    /// quiet zone — but NOT a single flipped module deep inside the payload,
+    /// which is the one corruption that stays invisible and sends a scan
+    /// somewhere else. Nothing short of decoding catches that, and a decoder
+    /// is not a dependency worth taking, so the verified art is pinned by
+    /// content instead.
+    ///
+    /// If this fails, the QR was edited. That is only correct when the URL
+    /// changed: regenerate with `segno.make(url, error='m')`, confirm the new
+    /// code decodes back to the exact URL, then update these hashes in the
+    /// same commit — never update them to make a red test go away.
+    #[test]
+    fn the_donate_qr_codes_still_encode_the_urls_they_were_verified_for() {
+        assert_eq!(
+            fnv1a(QR_UK),
+            0x1090_518f_3e0e_c323,
+            "QR_UK changed — does it still decode to {DONATE_URL_UK} ?"
+        );
+        assert_eq!(
+            fnv1a(QR_EN),
+            0x1350_e49e_8dec_2faf,
+            "QR_EN changed — does it still decode to {DONATE_URL_EN} ?"
+        );
+    }
+
+    /// Both links must stay on the fund's permanent donate page: individual
+    /// fundraisings close, and a dead link on the last screen is a donation
+    /// that never happens.
+    #[test]
+    fn the_donate_links_point_at_the_permanent_page() {
+        use crate::i18n::Lang;
+        assert_eq!(donate_url(Lang::En), DONATE_URL_EN);
+        assert_eq!(donate_url(Lang::Uk), DONATE_URL_UK);
+        assert_ne!(donate_url(Lang::Uk), donate_url(Lang::En));
+        for url in [DONATE_URL_UK, DONATE_URL_EN] {
+            assert!(
+                url.starts_with("https://www.sternenkofund.org/"),
+                "{url} is not the fund's site"
+            );
+            assert!(url.ends_with("/donate"), "{url} is not the donate page");
+        }
+    }
+}
