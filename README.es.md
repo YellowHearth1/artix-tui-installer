@@ -14,7 +14,7 @@
 <img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
 
 <a href="LICENSE"><img alt="Licencia: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
-<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%8C%D0%BA%D0%B0_%7C_spanish-FFD700?style=for-the-badge">
+<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%8C%D0%BA%D0%B0_%7C_english_%7C_spanish-FFD700?style=for-the-badge">
 <img alt="Se aceptan PRs" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
 
 <img alt="Último commit" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square">
@@ -29,12 +29,13 @@
 <br>
 
 
-[![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Developer_Docs-ARCHITECTURE.en.md-6e40c9?style=for-the-badge)](ARCHITECTURE.en.md)
+[![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Developer_Docs-ARCHITECTURE.es.md-6e40c9?style=for-the-badge)](ARCHITECTURE.es.md)
+
 **[Mapa del código, cambios comunes, build y tests → ARCHITECTURE.es.md](ARCHITECTURE.es.md)**
 
 **Un instalador terminal bilingüe (inglés / ucraniano) para un spin personalizado
 de [Artix Linux](https://artixlinux.org) que ejecuta
-el init[dinit](https://davmac.org/projects/dinit/) como sistema de inicio.**
+el init [dinit](https://davmac.org/projects/dinit/) como sistema de inicio.**
 
 Hecho en Rust con [ratatui](https://ratatui.rs) y con estilo para sentirse como un instalador gráfico moderno: un carril
 de pasos a la izquierda, paneles con bordes redondeados, un acento azul de Artix, con interruptores segmentados
@@ -64,21 +65,21 @@ y un registro de instalación en vivo con scroll.
 
 ## ✨ Funciones
 
-- **🌐 Interfaz bilingüe — inglés y ucraniano, seleccionable en la primera pantalla.
-- **⚙️ dinit-native — configura una instancia de dinit por usuario al estilo de dinit,
-  sin asumir ⚙️ systemd en ningún lugar:
- - **turnstile** para `seatd` (su propio módulo PAM, no se necesita elogind);
- - **userspawn** para `elogind` (la opción estándar de Artix);
- - el administrador de asientos `seatd`/`elogind` y servicios de audio PipeWire por usuario.
-- **📦 Instalación interactiva de paquetes — los paquetes se instalan mediante `pacman` 
+- **🌐 Interfaz bilingüe** — inglés, español, y ucraniano, seleccionable en la primera pantalla.
+- **⚙️ dinit-native** — configura una instancia de dinit por usuario al estilo de dinit,
+  sin asumir systemd en ningún lugar:
+  - **turnstile** para `seatd` (su propio módulo PAM, no se necesita elogind);
+  - **userspawn** para `elogind` (la opción estándar de Artix);
+  - el administrador de asientos `seatd`/`elogind` y servicios de audio PipeWire por usuario.
+- **📦 Instalación interactiva de paquetes** — los paquetes se instalan mediante `pacman` 
   ejecutándose bajo un PTY, así que tú eliges proveedores (controladores GPU/Vulkan, backends 
   multimedia, …) en lugar de que se elija el primero silenciosamente. En el mismo paquete
   entre repos, se prefiere automáticamente Artix; los prompts `[Y/n]` se confirman automáticamente.
-- **🔒 Cifrado de disco LUKS — solo para root, disco completo con un `/boot` cifrado
+- **🔒 Cifrado de disco LUKS** — solo para root, disco completo con un `/boot` cifrado
   en UEFI, o una **llave USB** (una keyfile significa que ingresas la contraseña una sola vez).
-- **🥾 Elección del cargador de arranque — GRUB, rEFInd, Limine o EFISTUB; con GRUB, `os-prober` para
+- **🥾 Elección del cargador de arranque** — GRUB, rEFInd, Limine o EFISTUB; con GRUB, `os-prober` para
   detectar otros sistemas operativos. Configurado antes del paso del disco extra.
-  - ** Arranque dual Artix-junto-a-Artix.** Cada sistema agrega su(s) vecino(s) al menú
+  - **Arranque dual Artix-junto-a-Artix.** Cada sistema agrega su(s) vecino(s) al menú
   de GRUB (el generador `/etc/grub.d/35_artix_neighbours`, porque `os-prober` no detecta
   un Linux cuyos kernels viven en el ESP). Pero un sistema instalado más **tarde**
   solo se vuelve visible para el anterior después de que ese anterior regenera
