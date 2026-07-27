@@ -2,7 +2,7 @@
 
 # 🐧 Artix TUI Інсталятор
 
-**🇺🇦 Українська** · [🇬🇧 English](README.en.md)
+**🇺🇦 Українська**	·	[🇬🇧 English](README.en.md)	·	[🇲🇽/🇪🇸 Español](README.es.md)
 
 ### Двомовний TUI-інсталятор Artix Linux — dinit, LUKS, btrfs-відкат, Wayland. Без systemd.
 
@@ -14,7 +14,7 @@
 <img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
 
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
-<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english-FFD700?style=for-the-badge">
+<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english_%7C_espa%C3%B1ol-FFD700?style=for-the-badge">
 <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
 
 <img alt="Останній коміт" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square&label=%D0%BE%D1%81%D1%82%D0%B0%D0%BD%D0%BD%D1%96%D0%B9%20%D0%BA%D0%BE%D0%BC%D1%96%D1%82">
@@ -46,6 +46,9 @@ Artix-блакитного, сегментовані перемикачі та �
 [![Init: dinit](https://img.shields.io/badge/init-dinit-green)](https://davmac.org/projects/dinit/)
 
 🇬🇧 **[English version → README.en.md](README.en.md)**
+<br>
+🇲🇽/🇪🇸 **[Version en Español → README.es.md](README.es.md)**
+<br>
 
 </div>
 
@@ -189,18 +192,19 @@ Artix-блакитного, сегментовані перемикачі та �
 А схематично кожен екран влаштовано так:
 
 ```
-┌───────────┬──────────────────────────────────────────────┐
-│  ◆  01    │  09 · Диск та розділи                         │
-│  ●  02    │  ┌────────────────────────────────────────┐   │
-│  ●  …     │  │  Режим      ● UEFI   ○ BIOS             │   │
-│  ◆  09    │  │  Диск: /dev/sda  256G                   │   │
-│  ○  10    │  │  Додати SWAP?  [так]  [ 4 ГіБ ]         │   │
-│  ○  …     │  │  Файлова система  ‹ ext4 ›  btrfs  xfs  │   │
-│           │  │              ◂ Назад       Далі ▸       │   │
-│           │  └────────────────────────────────────────┘   │
-│           ├──────────────────────────────────────────────┤
-│           │  ↑/↓ рух · ←/→ зміна · Enter далі             │
-└───────────┴──────────────────────────────────────────────┘
+┌───────────┬───────────────────────────────────────────────┐
+│	◆	01  │	09 · Диск та розділи						│
+│	●	02	│	┌───────────────────────────────────────┐	│
+│	●	…	│	│ Режим				● UEFI   ○ BIOS		│	│
+│	◆	09	│	│ Диск:				/dev/sda   256G		│	│
+│	○	10	│	│ Додати SWAP?		[ так ] [ 4 ГіБ ]	│	│
+│	○	…	│	│ Файлова система	‹ ext4 › btrfs xfs	│	│
+│			│	│					◂ Назад	   Далі ▸	│	│
+│ 			│	│										│	│
+│			│	└───────────────────────────────────────┘	│
+│			├───────────────────────────────────────────────┤
+│			│	   ↑/↓ рух  ·  ←/→ зміна  ·  Enter далі		│
+└───────────┴───────────────────────────────────────────────┘
 ```
 
 Ліва панель показує лише номери кроків (на активному крутиться маленький ромб);
