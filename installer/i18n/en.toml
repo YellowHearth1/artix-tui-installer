@@ -14,6 +14,7 @@ title = "Choose your language"
 hint = "Select the language for the installer and your system"
 en = "English"
 uk = "Ukrainian (Українська)"
+es = "Español (Spanish)"
 
 [tz]
 title = "Select your time zone"
