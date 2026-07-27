@@ -192,17 +192,17 @@ De forma esquemática, cada pantalla se organiza así:
 
 ```
 ┌───────────┬───────────────────────────────────────────────┐
-│	◆	01  │	09 · Disco y particiones						│
+│	◆	01  │	09 · Disco y particiones					│
 │	●	02	│	┌───────────────────────────────────────┐	│
-│	●	…	│	│ Modo			 ● UEFI		  ○ BIOS	│	│
-│	◆	09	│	│ Disco:		/dev/sda	  256G	│	│
-│	○	10	│	│ ¿Agregar SWAP?	[ sí ]	 [ 4 GiB ]	│	│
-│	○	…	│	│ Filesystem	‹ ext4 ›	btrfs	xfs	│	│
-│			│	│			  ◂ Atras	 Siguiente ▸	│	│
+│	●	…	│	│ Modo			  ● UEFI	  ○ BIOS	│	│
+│	◆	09	│	│ Disco:		 /dev/sda	   256G		│	│
+│	○	10	│	│ ¿Agregar SWAP?  [ sí ]	 [ 4 GiB ]	│	│
+│	○	…	│	│ Filesystem	 ‹ ext4 ›  btrfs  xfs	│	│
+│			│	│			     ◂ Atras   Siguiente ▸	│	│
 │ 			│	│										│	│
 │			│	└───────────────────────────────────────┘	│
 │			├───────────────────────────────────────────────┤
-│			│	  ↑/↓ mover  ·  ←/→ cambiar  ·  Intro siguiente		│
+│			│	↑/↓ mover · ←/→ cambiar · Intro siguiente	│
 └───────────┴───────────────────────────────────────────────┘
 ```
 
