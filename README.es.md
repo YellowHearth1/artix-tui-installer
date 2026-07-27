@@ -2,7 +2,7 @@
 
 # 🐧 Instalador TUI de Artix 
 
-[🇺🇦 Українська](README.md) · [🇬🇧 English](README.en.md) · **🇪🇸 Español**
+[🇺🇦 Українська](README.md) · [🇬🇧 English](README.en.md) · **🇲🇽/🇪🇸 Español**
 
 ### Un instalador TUI bilingüe de Artix Linux — dinit, LUKS, reversión de btrfs, Wayland. Sin systemd.
 
@@ -45,7 +45,9 @@ y un registro de instalación en vivo con scroll.
 [![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui%200.30-blue)](https://ratatui.rs)
 [![Init: dinit](https://img.shields.io/badge/init-dinit-green)](https://davmac.org/projects/dinit/)
 
-🇺🇦 **[Українська версія → README.md](README.md)**
+🇺🇦 **[Українська версія → README.md](README.md)**<br>
+🇬🇧 **[English version → README.en.md](README.en.md)**<br>
+🇲🇽/🇪🇸 **[Version en Español → README.es.md](README.es.md)**<br>
 
 </div>
 
@@ -190,17 +192,17 @@ De forma esquemática, cada pantalla se organiza así:
 
 ```
 ┌───────────┬───────────────────────────────────────────────┐
-│	01	  │	09 · Disco y particiones					│
-│	● 02	  │	┌───────────────────────────────────────┐	│
-│	● …	  │	│ Modo		 UEFI ○ BIOS			│	│
-│	09	  │	│ Disco:	/dev/sda 256G				│	│
-│	○ 10	  │	│ ¿Agregar SWAP?	[sí] [ 4 GiB ]		│	│
-│	○ …	  │	│ Filesystem	‹ ext4 ›	btrfs	xfs	│	│
-│		  │	│			◂ Back		Next▸	│	│
-│		  │	│								│	│
-│		  │	└───────────────────────────────────────┘	│
-│		  ├───────────────────────────────────────────────┤
-│		  │	↑/↓ mover · ←/→ cambiar · Enter siguiente	│
+│	◆	01  │	09 · Disco y particiones						│
+│	●	02	│	┌───────────────────────────────────────┐	│
+│	●	…	│	│ Modo			 ● UEFI		  ○ BIOS	│	│
+│	◆	09	│	│ Disco:		/dev/sda	  256G	│	│
+│	○	10	│	│ ¿Agregar SWAP?	[ sí ]	 [ 4 GiB ]	│	│
+│	○	…	│	│ Filesystem	‹ ext4 ›	btrfs	xfs	│	│
+│			│	│			  ◂ Atras	 Siguiente ▸	│	│
+│ 			│	│										│	│
+│			│	└───────────────────────────────────────┘	│
+│			├───────────────────────────────────────────────┤
+│			│	  ↑/↓ mover  ·  ←/→ cambiar  ·  Intro siguiente		│
 └───────────┴───────────────────────────────────────────────┘
 ```
 
@@ -235,10 +237,10 @@ se deja en `~/.config/fastfetch/`.
 |	Teclas					|	Acción										|
 |----------------------------------|-----------------------------------------------------------|
 |	↑ / ↓					|	moverte entre listas y campos						|
-|	Enter					|	seleccionar / siguiente							|
-|	Esc o Shift+Tab			|	volver; Esc también cierra diálogos modales			|
+|	Intro					|	seleccionar / siguiente							|
+|	Esc o Mayús+Tab			|	volver; Esc también cierra diálogos modales			|
 |	↑ en el elemento superior	|	salir a la pantalla anterior						|
-|	Space					|	marcar un elemento / alternar un toggle				|
+|	Espaciador					|	marcar un elemento / alternar un toggle				|
 |	← / →					|	cambiar un valor: filesystem, tamaño de SWAP,		|
 |							|	modo de cuenta, sesión							|
 |	Escribiendo				|	filtrar listas, buscar paquetes, editar campos		|
@@ -246,7 +248,7 @@ se deja en `~/.config/fastfetch/`.
 |	o						|	opciones de filesystem (pantalla Disk & partitions)	|
 |	w / s					|	desplazarte en la descripción dentro del diálogo de	|
 |							|	opciones de FS									|
-|	PgUp / PgDn · Home / End		|	desplazamiento rápido en listas largas y			|
+|	AvPág / RePág · Inicio / Fin		|	desplazamiento rápido en listas largas y			|
 |							|	el log de instalación							|
 |	q						|	salir del instalador (bloqueado mientras instala)		|
 |	Ctrl+C					|	salida de emergencia							|
@@ -263,7 +265,7 @@ La línea del pie de página siempre muestra las sugerencias de teclas contextua
 
 |				Teclas		|	Acción							|
 |----------------------------------|--------------------------------------------|
-|	Mod + Enter · Mod + Q		|	terminal (kitty)					|
+|	Mod + Intro · Mod + Q		|	terminal (kitty)					|
 |	Mod + R					|	lanzador de apps (wofi)				|
 |	Mod + E					|	gestor de archivos (Caja)			|
 |	Mod + B					|	navegador (Firefox — si está instalado)	|
@@ -278,7 +280,7 @@ La línea del pie de página siempre muestra las sugerencias de teclas contextua
 |	Mod + C					|	cerrar ventana						|
 |	Mod + F					|	pantalla completa					|
 |	Mod + M					|	maximizar							|
-|	Mod + S · Mod + Ctrl + Space	|	alternar ventanas flotantes			|
+|	Mod + S · Mod + Ctrl + Espaciador	|	alternar ventanas flotantes			|
 |	Mod + LMB (arrastrar)		|	mover ventana						|
 |	Mod + RMB (arrastrar)		|	cambiar tamaño						|
 
@@ -287,27 +289,27 @@ La línea del pie de página siempre muestra las sugerencias de teclas contextua
 |	Teclas					|	Acción							|
 |----------------------------------|--------------------------------------------|
 |	Mod + 1…9					|	cambiar a la etiqueta				|
-|	Mod + Shift + 1…9			|	mover ventana a etiqueta				|
+|	Mod + Mayús + 1…9			|	mover ventana a etiqueta				|
 |	Mod + Ctrl + 1…9			|	alternar visibilidad de la etiqueta	|
-|	Mod + Ctrl + Shift + 1…9		|	fijar ventana a varias etiquetas		|
+|	Mod + Ctrl + Mayús + 1…9		|	fijar ventana a varias etiquetas		|
 
 **Distribuciones**
 
 |	Teclas				|	Acción								|
 |-----------------------------|-------------------------------------------------|
-|	Mod + Space			|	siguiente layout (master-stack, dwindle…)	|
-|	Mod + Shift + Space		|	layout anterior						|
+|	Mod + Espaciador			|	siguiente layout (master-stack, dwindle…)	|
+|	Mod + Mayús + Espaciador		|	layout anterior						|
 
 **Compositor**
 
 |	Teclas						|	Acción						|
 |---------------------------------------|---------------------------------------|
-|	Mod + Shift + R · Mod + Ctrl + R	|	recargar la config				|
-|	Mod + Shift + Q				|	salir (con confirmación)			|
-|	Mod + Ctrl + Shift + Q			|	salir sin confirmación			|
+|	Mod + Mayús + R · Mod + Ctrl + R	|	recargar la config				|
+|	Mod + Mayús + Q				|	salir (con confirmación)			|
+|	Mod + Ctrl + Mayús + Q			|	salir sin confirmación			|
 
 **Medios y brillo** — las teclas XF86 del hardware funcionan incluso en
-la pantalla de bloqueo: volumen ±2 % y mute (wpctl), mute del micrófono,
+la pantalla de bloqueo: volumen ±2 % y silenciar (wpctl), silenciar el micrófono,
 reproducir/pausar/detener/siguiente/anterior (playerctl), brillo ±10 % (brightnessctl).
 
 </details>
