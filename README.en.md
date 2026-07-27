@@ -2,7 +2,8 @@
 
 # 🐧 Artix TUI Installer
 
-[🇺🇦 Українська](README.md) · **🇬🇧 English**
+[🇺🇦 Українська](README.md)	·	**🇬🇧 English**	·	[🇲🇽/🇪🇸 Español](README.es.md)
+<br>
 
 ### A bilingual Artix Linux TUI installer — dinit, LUKS, btrfs rollback, Wayland. systemd-free.
 
@@ -14,7 +15,7 @@
 <img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
 
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
-<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english-FFD700?style=for-the-badge">
+<img alt="i18n" src="https://img.shields.io/badge/i18n-%D1%83%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0_%7C_english_%7C_espa%C3%B1ol-FFD700?style=for-the-badge">
 <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
 
 <img alt="Last commit" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square">
@@ -30,10 +31,11 @@
 
 
 [![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Developer_Docs-ARCHITECTURE.en.md-6e40c9?style=for-the-badge)](ARCHITECTURE.en.md)
+<br>
 **[Code map, common changes, build & tests → ARCHITECTURE.en.md](ARCHITECTURE.en.md)**
 
 
-**A bilingual (English / Ukrainian) terminal installer for a custom
+**A multilingual (English / Spanish / Ukrainian) terminal installer for a custom
 [Artix Linux](https://artixlinux.org) spin running the
 [dinit](https://davmac.org/projects/dinit/) init system.**
 
@@ -46,6 +48,9 @@ segmented toggles, and a live scrollable install log.
 [![Init: dinit](https://img.shields.io/badge/init-dinit-green)](https://davmac.org/projects/dinit/)
 
 🇺🇦 **[Українська версія → README.md](README.md)**
+<br>
+🇲🇽/🇪🇸 **[Version en Español → README.es.md](README.es.md)**
+<br>
 
 </div>
 
@@ -65,7 +70,7 @@ segmented toggles, and a live scrollable install log.
 
 ## ✨ Features
 
-- **🌐 Bilingual UI** — English and Ukrainian, selectable on the first screen.
+- **🌐 multilingual UI** — English, Spanish, and Ukrainian, selectable on the first screen.
 - **⚙️ dinit-native** — sets up a per-user dinit instance the dinit way, with no
   systemd assumptions anywhere:
   - **turnstile** for `seatd` (its own PAM module, no elogind needed);
@@ -189,19 +194,19 @@ segmented toggles, and a live scrollable install log.
 Schematically, every screen is laid out like this:
 
 ```
-┌───────────┬──────────────────────────────────────────────┐
-│  ◆  01    │  09 · Disk & partitions                       │
-│  ●  02    │  ┌────────────────────────────────────────┐   │
-│  ●  …     │  │  Mode       ● UEFI   ○ BIOS             │   │
-│  ◆  09    │  │  Disk: /dev/sda  256G                   │   │
-│  ○  10    │  │  Add SWAP?  [yes]  [ 4 GiB ]            │   │
-│  ○  …     │  │  Filesystem  ‹ ext4 ›  btrfs  xfs       │   │
-│           │  │              ◂ Back        Next ▸       │   │
-│           │  │                                          │   │
-│           │  └────────────────────────────────────────┘   │
-│           ├──────────────────────────────────────────────┤
-│           │  ↑/↓ move · ←/→ change · Enter next           │
-└───────────┴──────────────────────────────────────────────┘
+┌───────────┬───────────────────────────────────────────────┐
+│	◆	01  │	09 · Disk & partitions						│
+│	●	02	│	┌───────────────────────────────────────┐	│
+│	●	…	│	│ Mode				● UEFI   ○ BIOS		│	│
+│	◆	09	│	│ Disco:			/dev/sda   256G		│	│
+│	○	10	│	│ Add SWAP?			[ yes ]   [ 4 GiB ]	│	│
+│	○	…	│	│ Filesystem		‹ ext4 › btrfs xfs	│	│
+│			│	│					  ◂ Back	Next ▸	│	│
+│ 			│	│										│	│
+│			│	└───────────────────────────────────────┘	│
+│			├───────────────────────────────────────────────┤
+│			│	    ↑/↓ move · ←/→ change · Enter next		│
+└───────────┴───────────────────────────────────────────────┘
 ```
 
 The left rail shows only step numbers (a small diamond spins on the active step);
