@@ -1,0 +1,70 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 30,
+    "spacing": 10,
+
+    "modules-left": [
+    ],
+    "modules-center": [
+        "wlr/taskbar"
+    ],
+    "modules-right": [
+        "tray",
+        "pulseaudio",
+        "clock"
+    ],
+
+    
+    // Taskbar
+    "wlr/taskbar": {
+        "format": "{icon}",
+        "icon-size": 25,
+        "tooltip": false,
+        "on-click": "activate",
+        "on-click-middle": "close",
+        "all-outputs": false,
+        "sort-by-app-id": true,
+        "markup": true
+    },
+    // System tray
+    "tray": {
+        "spacing": 10,
+        "icon-size": 20,
+        "show-passive-items": true,
+        "reverse-direction": true
+    },
+    // Clock
+    "clock": {
+        "timezone": "Europe/Kyiv",
+        "format": "  {:%d.%m.%Y    %H:%M:%S}",
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+        "format-alt": "󰃭  {:%Y-%m-%d}",
+        "interval": 1
+    },
+    // Audio
+    "pulseaudio": {
+        "format": " {volume}% {format_source}",
+        "format-bluetooth": "󰥰 {volume}% {format_source}",
+        "format-bluetooth-muted": "󰝟 {format_source}",
+        "format-muted": "󰝟 {format_source}",
+        "format-source": "󰍬 {volume}%",
+        "format-source-muted": "󰍭",
+        "format-icons": {
+            "headphone": "",
+            "hands-free": "",
+            "headset": "",
+            "phone": "📱",
+            "portable": "📱",
+            "car": "🚗",
+            "default": ["", "", ""]
+        },
+        "on-click": "pavucontrol",
+        "on-click-middle": "pactl set-source-mute @DEFAULT_SOURCE@ toggle",
+        "on-click-right": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+        "on-scroll-up": "pactl set-sink-volume @DEFAULT_SINK@ +2%",
+        "on-scroll-down": "pactl set-sink-volume @DEFAULT_SINK@ -2%",
+        "scroll-step": 2,
+        "max-volume": 150
+    }
+}

@@ -1,0 +1,40 @@
+#!/bin/sh
+# Launch the TUI installer with a proper controlling terminal on tty1.
+#
+# A bare dinit `process` service does not acquire a controlling tty, which a
+# full-screen TUI needs (for resize signals, etc.). `setsid -c` creates a new
+# session and makes the given tty controlling, then execs the installer.
+#
+# If the installer exits non-zero (crash), we drop to a recovery shell rather
+# than respawn-looping silently — easier to debug a broken live image.
+
+# Size the console font to the screen so the TUI is readable on everything from
+# a small VM window to a 4K panel: a bigger framebuffer gets a bigger font.
+#
+# The font MUST carry both Cyrillic and Latin-1 — the installer speaks
+# Ukrainian, English and Spanish, and a font missing either turns half the
+# interface into blanks. That rules out the obvious candidates: checked against
+# the fonts actually present on the image, ter-116n carries neither script's
+# extras, ter-120n has the Spanish accents but NO Cyrillic, and UniCyr_8x16
+# (what the launcher used to load) has Cyrillic but not one Spanish accent —
+# which is why "Español" rendered as "Espanol" on a live boot.
+#
+# LatArCyrHeb-16+ is the one font on the image that covers both (verified by
+# reading the PSF Unicode tables, not by assuming). It is tried first at every
+# size; the Terminus ladder stays as a second choice for the larger panels,
+# where a 16px font is genuinely too small, and only for those.
+if command -v setfont >/dev/null 2>&1 && [ -r /sys/class/graphics/fb0/virtual_size ]; then
+    fbw=0
+    IFS=, read -r fbw _ < /sys/class/graphics/fb0/virtual_size 2>/dev/null
+    case "$fbw" in
+        ''|*[!0-9]*) fbw=0 ;;
+    esac
+    setfont LatArCyrHeb-16+ 2>/dev/null || setfont LatArCyrHeb-16 2>/dev/null || true
+    # Only scale up on panels where 16px is unreadably small, and only if the
+    # bigger font still has both scripts — otherwise stay on the correct one.
+    if [ "$fbw" -ge 2560 ]; then
+        setfont LatArCyrHeb-19 2>/dev/null || true
+    fi
+fi
+
+exec setsid -c /usr/bin/artix-installer <>/dev/tty1 >&0 2>&1 || exec /bin/sh

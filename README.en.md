@@ -1,0 +1,641 @@
+<div align="center">
+
+# 🐧 Artix TUI Installer
+
+[🇺🇦 Українська](README.md) · **🇬🇧 English** · [🇲🇽 Español](README.es.md) | [ich0x](https://github.com/ich0x)
+
+### An Artix Linux TUI installer — dinit, LUKS, btrfs rollback, Wayland. systemd-free.
+
+<a href="https://github.com/YellowHearth1/artix-tui-installer/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/YellowHearth1/artix-tui-installer/actions/workflows/ci.yml/badge.svg"></a>
+<img alt="Rust" src="https://img.shields.io/badge/Rust-1.90+-B7410E?style=for-the-badge&logo=rust&logoColor=white">
+<img alt="ratatui" src="https://img.shields.io/badge/TUI-ratatui-1D9BF0?style=for-the-badge">
+<img alt="Artix Linux" src="https://img.shields.io/badge/Artix-Linux-10A0CC?style=for-the-badge&logo=artixlinux&logoColor=white">
+<img alt="init: dinit" src="https://img.shields.io/badge/init-dinit-4E9A06?style=for-the-badge">
+<img alt="systemd-free" src="https://img.shields.io/badge/systemd-free-CC0000?style=for-the-badge">
+
+<a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/YellowHearth1/artix-tui-installer?style=for-the-badge&color=1E5AA8"></a>
+<img alt="interface languages" src="https://img.shields.io/github/directory-file-count/YellowHearth1/artix-tui-installer/installer%2Fi18n?type=file&label=languages&style=for-the-badge&color=FFD700">
+<img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-2EA44F?style=for-the-badge">
+
+<img alt="Last commit" src="https://img.shields.io/github/last-commit/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Stars" src="https://img.shields.io/github/stars/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Issues" src="https://img.shields.io/github/issues/YellowHearth1/artix-tui-installer?style=flat-square">
+<img alt="Repo size" src="https://img.shields.io/github/repo-size/YellowHearth1/artix-tui-installer?style=flat-square">
+
+<br>
+
+<img src="screenshots/en/14-summary.png" alt="The installer in action — review & install screen" width="900">
+
+<br>
+
+[![📖 Docs](https://img.shields.io/badge/%F0%9F%93%96_Developer_Docs-ARCHITECTURE.en.md-6e40c9?style=for-the-badge)](ARCHITECTURE.en.md)
+Code map, common changes, build and tests.
+
+**A terminal installer for a custom
+[Artix Linux](https://artixlinux.org) spin running the
+[dinit](https://davmac.org/projects/dinit/) init system.**
+
+Built in Rust with [ratatui](https://ratatui.rs) and styled to feel like a modern
+graphical installer: a left step-rail, rounded panels, an Artix-blue accent,
+segmented toggles, and a live scrollable install log.
+
+</div>
+
+---
+
+> ### 🤖 Code authorship
+>
+> **All of this project's code was written by [Claude](https://claude.ai), an AI
+> model by [Anthropic](https://www.anthropic.com).** The architecture, iterative
+> debugging, and implementation were generated entirely by Claude in
+> conversation. The design vision, testing on real hardware and virtual machines,
+> and the Artix/dinit-specific decisions belong to the project's author.
+
+---
+
+> ### ⚠️ Experimental — use at your own risk
+>
+> This is **not a production-ready installer**. The code here is written by
+> Claude — the note above says so plainly. My part is a different one: I decide
+> what this should be and how it should behave, run the builds in virtual
+> machines, catch what breaks and push it back until it works properly. Every
+> release goes through the tests, `clippy` and a release build.
+>
+> What **cannot** be reproduced is the real hardware landscape: UEFI firmware
+> differs wildly between vendors, and there is RAID, hybrid graphics, unusual
+> controllers and laptops with their own ideas. Here is exactly where my testing
+> stops:
+>
+> - everything is tested **in a virtual machine only** (QEMU/UEFI, different
+>   media types). This installer has **never** been run on physical hardware;
+> - dual boot has been tested **only with Artix beside Artix**. **Windows has
+>   never been installed alongside it.** Detecting Windows, reusing its EFI
+>   partition, preserving its partitions and generating its menu entry are all
+>   written and covered by tests — and confirmed on a live system exactly zero
+>   times. If you have Windows, you are the first to find out.
+>
+> **This installer formats disks.** A mistake here costs data.
+>
+> - Try it in a **virtual machine** first and confirm your scenario behaves the
+>   way you expect.
+> - **Back up anything you are not prepared to lose**, and check that the backup
+>   actually restores.
+> - On a machine with another OS, read the confirmation screen **carefully** —
+>   it lists every partition that will be destroyed.
+> - Something went wrong? [Open an issue](https://github.com/YellowHearth1/artix-tui-installer/issues).
+>   Include the version (bottom-right of the first screen) and what happened.
+>   I do not have your hardware, so without your report I simply never find out
+>   it broke.
+---
+
+> ### 🌐 Adding your language
+>
+> Translations are welcome and are the easiest way to contribute — no Rust
+> required. Spanish ([ich0x](https://github.com/ich0x)) arrived exactly this way.
+>
+> **1. Copy the source file.** Ukrainian is the reference every string starts
+> from:
+>
+> ```sh
+> cp installer/i18n/uk.toml installer/i18n/XX.toml   # XX = language code, e.g. de, pl, fr
+> ```
+>
+> **2. Translate the values, never the keys.** The key on the left
+> (`disk.warn`) is an identifier and must stay identical across every file; only
+> the quoted text on the right is translated. Placeholders such as `{}` and
+> `@@NAME@@ ` must survive.
+>
+> **3. Add the language name to ALL locale files.** Every `*.toml` — including
+> your new one — needs a line for it under `[lang]`:
+>
+> ```toml
+> [lang]
+> en = "English"
+> uk = "Ukrainian (Українська)"
+> de = "German (Deutsch) — translation by your-handle"
+> ```
+>
+> **4. Wire it up in the code** — four small places: `Lang`
+> (`installer/src/i18n.rs`), a loader next to `uk()`/`es()`, an arm in `t()`,
+> and `OPTIONS` in `installer/src/screens/language.rs`, where the locale and
+> keyboard layout for it are set too.
+>
+> **5. Check it.** The tests catch a missing key, an empty string, a language
+> nobody can select, and text that overflows an 80x24 screen:
+>
+> ```sh
+> cd installer && cargo test
+> ```
+>
+> Translating the README (`README.XX.md`) is optional and very welcome.
+> **Spaces only, no tabs**: inside fenced code blocks a tab expands to eight
+> columns and shreds the ASCII screen mock-ups.
+
+---
+
+📋 **[Changelog](CHANGELOG.md)** — what changed in each version.
+
+## ✨ Features
+
+- **🌐 Multilingual UI** — Ukrainian, English, Spanish; picked on the first screen.
+- **⚙️ dinit-native** — sets up a per-user dinit instance the dinit way, with no
+  systemd assumptions anywhere:
+  - **turnstile** for `seatd` (its own PAM module, no elogind needed);
+  - **userspawn** for `elogind` (the stock Artix option);
+  - the `seatd`/`elogind` seat manager and per-user PipeWire audio services.
+- **📦 Interactive package install** — packages are installed through `pacman`
+  running under a PTY, so *you* pick providers (GPU/Vulkan drivers, multimedia
+  backends, …) instead of the first one being chosen silently. Same-package
+  across repos auto-prefers Artix; `[Y/n]` prompts are auto-confirmed.
+- **🔒 LUKS disk encryption** — root-only, **full-disk with an encrypted `/boot`**
+  on UEFI, or a **USB key** (a keyfile means you enter the passphrase only once).
+- **🥾 Bootloader choice** — GRUB, rEFInd, Limine or **EFISTUB**; with GRUB, `os-prober` for
+  detecting other operating systems. Configured before the extra-disk step.
+  - **Artix-beside-Artix dual boot.** Each system adds its neighbour(s) to the
+    GRUB menu (the `/etc/grub.d/35_artix_neighbours` generator, because
+    `os-prober` misses a Linux whose kernels live on the ESP). But a system
+    installed **later** only becomes visible to the earlier one after that one
+    next regenerates its grub.cfg — which happens automatically on its first
+    kernel or GRUB update (the `zz-artix-grub` pacman hook), or immediately by
+    hand: `doas grub-mkconfig -o /boot/grub/grub.cfg`. Booting itself does not
+    depend on this: the installer also writes a shared fallback loader,
+    `EFI/BOOT/BOOTX64.EFI` (from the newest system, which lists them all), so the
+    machine always reaches a working menu.
+- **📦 EFISTUB (bootloader-less boot)** — the UEFI firmware loads the kernel
+  **directly**, with no intermediate bootloader (Artix kernels are already built as
+  EFI stubs, `CONFIG_EFI_STUB=y`). The initramfs and cmdline are passed via an
+  `efibootmgr` entry. **Needs no extra packages and no systemd** — unlike UKI, which
+  requires `systemd-stub`. UEFI only; incompatible with an encrypted `/boot`.
+  **Compatible with rollback** — kernel, initramfs and cmdline stay separate files,
+  so the installer registers extra UEFI entries for rollback and rescue (selected
+  from the firmware boot menu). This is the basis for Secure Boot (below).
+- **🔐 Secure Boot preparation (EFISTUB only)** — the installer **prepares** but
+  deliberately does **not enable** Secure Boot: it installs `sbctl`, generates
+  signing keys, and writes a detailed bilingual guide to `~/SECURE-BOOT.txt`. The
+  final steps — enrolling keys (`sbctl enroll-keys`), signing the kernel, and
+  putting the firmware into **Setup Mode** — are left to the user on the installed
+  system, because they can't be automated safely. **Note: this needs BIOS/UEFI
+  steps, and on some hardware a bad key enrollment can brick the device** — the
+  installer shows explicit warnings. `sbctl` ships a pacman hook that re-signs the
+  kernel on every update.
+- **🗄️ Additional disks** — mount other disks or partitions (under home, `/mnt`,
+  or a custom path), optionally formatting or encrypting each. Encrypted extra
+  disks unlock automatically at boot (key on the encrypted root, via a dinit
+  service), regardless of how the root itself is unlocked.
+- **💾 Filesystem choice** — ext4, btrfs, xfs, f2fs, jfs, ext3, ext2.
+- **🌳 Btrfs with snapshots & rollback** — @/@home/@snapshots/@log/@cache subvolumes, auto-snapshots around every pacman action (snapper + snap-pac), and artix-rollback on any bootloader (a graphical menu entry under GRUB/rEFInd/Limine; a separate firmware boot-menu entry under EFISTUB).
+- **🖥️ Desktop choice** — KDE Plasma, LXQt, **Pinnacle** (an AwesomeWM-like
+  Wayland compositor), XFCE, Cinnamon, MATE, LXDE, or none.
+- **🎮 GPU drivers** — NVIDIA (open-dkms), NVIDIA 580xx (legacy), nouveau, AMD,
+  Intel; nouveau is automatically blacklisted when a proprietary driver is chosen.
+- **🛟 System recovery mode** — mounts an existing install (unlocking LUKS if
+  needed), detects the bootloader, and opens a chroot shell to repair it.
+- **🔁 AUR support** — `paru` is built from source (so it always matches the
+  system's `libalpm`), then used to install the packages you selected.
+- **🧩 Automatic dinit service enablement** — any installed `*-dinit` package has
+  its service enabled automatically, whether from the repos or the AUR.
+- **📜 System logging out of the box** — `syslog-ng` collects all logs to
+  `/var/log`, and `logrotate` (via `cronie`) keeps **one week**, deletes older,
+  and rotates immediately if a file exceeds **5 GB**. User services log to a
+  buffer, so `dinitctl catlog` works for them right away.
+- **🔥 Prebaked firewall** — an embedded nftables config opens the ports for KDE
+  Connect, LocalSend, Sunshine, RustDesk, Steam Remote Play, Syncthing, and SSH.
+- **🎨 Embedded configs** — kitty (Catppuccin Mocha), a starship prompt, fastfetch,
+  plus waybar and wofi for Pinnacle; no external assets required.
+- **🕹️ Gaming-ready** — raises the open-file limit (`nofile`) for Wine/Proton
+  fsync, and optionally sets up `auto-cpufreq` automatically.
+- **🧳 Self-contained** — the host tools it needs (artools, gptfdisk, cryptsetup,
+  …) are installed automatically, so the installer works even from the **official
+  Artix ISO**, not just its own image.
+- **🏷️ Configurable** hostname and UEFI boot-entry label.
+- **🚦 Careful start** — the disk is only touched after your explicit confirmation
+  on the "Review and install" screen, and the required host tools (git, gptfdisk,
+  dosfstools, parted, …) are fetched in the background as soon as the network is up.
+- **⚠️ Pre-flight disk warnings** — on the disk-selection screen the installer
+  advises you (without blocking the choice) when: the selected disk is the **boot
+  medium** the installer is running from (detected by the iso9660 live-image
+  filesystem); the disk is **smaller than 20 GiB** (a base system fits, but a full
+  desktop may run out of room); or the chosen **UEFI/BIOS mode doesn't match** the
+  firmware you actually booted in (which would produce an unbootable system). Each
+  warning is a full, plain-language sentence in a scrollable modal (press `w` on
+  the disk list); you can always proceed if you truly mean to.
+- **🧨 Erase confirmation** — the last step before formatting: a dedicated modal
+  spells out exactly which disk (path, model, size) and which **existing
+  partitions** will be destroyed, and requires an explicit Enter. Formatting never
+  begins without this second confirmation, making it much harder to wipe the wrong
+  disk by accident.
+- **🌍 The mirrorlist stays readable and hand-editable.** The rebuilt file is
+  **grouped by country** — each block carries its country heading, countries are
+  ordered by their fastest mirror, and mirrors inside a block by response time.
+  Moved somewhere else? Comment out one block, uncomment another. That is all.
+- **💤 Mirrors that fail the check are COMMENTED OUT, not deleted** — with their
+  countries, at the bottom of the file. One that is down today may be the
+  closest one tomorrow, or after a move, so it stays where you can find it.
+- **🪞 Fast, resilient mirrors** — right before packages are installed the
+  installer health-checks **every** mirror in each list (Artix, Arch and
+  Chaotic-AUR), active and commented-out alike: 12 probes in parallel, 6 s cap
+  each. Live ones are rewritten **fastest response first**, dead or crawling
+  ones are commented out with a reason. No geographic or time-zone guessing —
+  the ranking comes from a real measurement. A mirror that dies mid-download can
+  no longer kill the whole transaction at 95 %: it simply isn't in the active
+  list. The original list is kept beside it as `*.bak-installer`, and if the
+  network is down and nothing answers, the list is left untouched. Plus an
+  optional Chaotic-AUR repository with prebuilt AUR binaries.
+- **📊 Live progress** — a streaming install log with scrollback (PgUp/PgDn,
+  Home/End); after a failure, retry without losing any of your choices.
+- **🏁 Three ways to finish** — reboot, power off, or chroot straight into the new
+  system; partitions are unmounted safely in every case.
+- 📀 Built as a live ISO with **artools** (`buildiso`).
+
+---
+
+## 👁️ Look
+
+![The Disk & partitions screen, live](screenshots/en/09-disk.png)
+
+*Captured in a graphical terminal; on a bare TTY the colors are simpler (see the note in the Screenshots section).*
+
+Schematically, every screen is laid out like this:
+
+```
+┌───────────┬──────────────────────────────────────────────┐
+│  ◆  01    │  09 · Disk & partitions                       │
+│  ●  02    │  ┌────────────────────────────────────────┐   │
+│  ●  …     │  │  Mode       ● UEFI   ○ BIOS             │   │
+│  ◆  09    │  │  Disk: /dev/sda  256G                   │   │
+│  ○  10    │  │  Add SWAP?  [yes]  [ 4 GiB ]            │   │
+│  ○  …     │  │  Filesystem  ‹ ext4 ›  btrfs  xfs       │   │
+│           │  │              ◂ Back        Next ▸       │   │
+│           │  │                                          │   │
+│           │  └────────────────────────────────────────┘   │
+│           ├──────────────────────────────────────────────┤
+│           │  ↑/↓ move · ←/→ change · Enter next           │
+└───────────┴──────────────────────────────────────────────┘
+```
+
+The left rail shows only step numbers (a small diamond spins on the active step);
+the full step name is in the panel header.
+
+---
+
+## 🏳️‍🌈 slayfetch — fastfetch with your own logo
+
+On the **"Additional packages"** step, next to `fastfetch`, there's a
+**`slayfetch`** entry. It's the same fastfetch, just with a different logo: the
+**Artix logo over one of the LGBTQIA+ community flags**. Pick `slayfetch` instead
+of `fastfetch` (they're mutually exclusive — keep only one), press **Space**, and
+a list of logos appears; the chosen one shows right on the row. During install
+the ordinary `fastfetch` package is installed, and the chosen logo is dropped
+into `~/.config/fastfetch/`.
+
+> **How to enable:** Additional packages step → untick `fastfetch` → tick
+> `slayfetch` (Space) → in the picker that opens, choose a logo (↑/↓, Enter).
+> Done.
+
+> 🏳️‍🌈 **A note from the author:** I'm not a member of the LGBTQIA+ community, but
+> I added these flag logos as a gesture of support and solidarity.
+
+<img src="screenshots/slayfetch-logos.png" alt="All slayfetch logo variants: the Artix logo over LGBTQIA+ community flags" width="900">
+
+---
+
+## ⌨️ Controls
+
+| Keys | Action |
+|---|---|
+| ↑ / ↓ | move through lists and fields |
+| Enter | select / next |
+| Esc or Shift+Tab | back; Esc also closes modal dialogs |
+| ↑ on the top item | leave to the previous screen |
+| Space | mark an item / flip a toggle |
+| ← / → | change a value: filesystem, SWAP size, account mode, session |
+| Typing | filter lists, search packages, edit fields |
+| Tab | next field on the Accounts screen |
+| o | filesystem options (the Disk & partitions screen) |
+| w / s | scroll the description inside the FS-options dialog |
+| PgUp / PgDn · Home / End | fast scrolling in long lists and the installation log |
+| q | quit the installer (blocked while installing) |
+| Ctrl+C | emergency exit |
+
+The footer line always shows the contextual key hints for the active screen.
+
+<details>
+<summary><b>⌨️ Pinnacle window-manager hotkeys</b></summary>
+
+> Source: the config the installer places in `~/.config/pinnacle`.
+> **Mod** = the **Super** key (⊞ Win); the default terminal is **kitty**.
+
+**Applications**
+
+| Keys | Action |
+|---|---|
+| Mod + Enter · Mod + Q | terminal (kitty) |
+| Mod + R | app launcher (wofi) |
+| Mod + E | file manager (Caja) |
+| Mod + B | browser (Firefox — if installed) |
+| Mod + O | screenshot (Flameshot) |
+| Mod + V | clipboard history (cliphist) |
+| Mod + N | notification panel (SwayNC) |
+
+**Windows**
+
+| Keys | Action |
+|---|---|
+| Mod + C | close window |
+| Mod + F | fullscreen |
+| Mod + M | maximize |
+| Mod + S · Mod + Ctrl + Space | toggle floating |
+| Mod + LMB (drag) | move window |
+| Mod + RMB (drag) | resize window |
+
+**Tags (workspaces 1–9)**
+
+| Keys | Action |
+|---|---|
+| Mod + 1…9 | switch to tag |
+| Mod + Shift + 1…9 | move window to tag |
+| Mod + Ctrl + 1…9 | toggle tag visibility |
+| Mod + Ctrl + Shift + 1…9 | pin window to several tags |
+
+**Layouts**
+
+| Keys | Action |
+|---|---|
+| Mod + Space | next layout (master-stack, dwindle…) |
+| Mod + Shift + Space | previous layout |
+
+**Compositor**
+
+| Keys | Action |
+|---|---|
+| Mod + Shift + R · Mod + Ctrl + R | reload the config |
+| Mod + Shift + Q | quit (with prompt) |
+| Mod + Ctrl + Shift + Q | quit without prompt |
+
+**Media & brightness** — the hardware XF86 keys work even on the lock screen:
+volume ±2 % and mute (wpctl), mic mute, play/pause/stop/next/prev (playerctl),
+brightness ±10 % (brightnessctl).
+
+</details>
+
+---
+
+## 🔨 Building
+
+```sh
+cd installer
+cargo build --release
+# → target/release/artix-installer
+```
+
+The read-only steps (timezone, keyboard, Wi-Fi, package search, disk listing)
+degrade gracefully when their tools aren't available outside the target. The
+install itself (partitioning, basestrap, chroot) needs root and a real target, so
+**test it in a virtual machine**.
+
+---
+
+## 🚀 Running on official Artix
+
+You don't have to run the installer from a custom image — you can run it straight
+from any **official Artix**: both the console "base" ISOs and the community ISOs
+that ship a desktop and a graphical installer (Calamares) — there you just open a
+terminal and run this TUI instead of Calamares. Every host tool it needs (artools,
+gptfdisk, cryptsetup, …) is pulled in automatically while it runs.
+
+### Prebuilt ISO (easiest)
+
+An Artix live image with the installer baked in — write it to a USB stick and boot:
+
+```sh
+curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-tui-dinit-x86_64.iso
+```
+
+### Prebuilt binary
+
+If you're already booted (e.g. from the official Artix ISO), just run the
+installer as root:
+
+```sh
+curl -LO https://github.com/YellowHearth1/artix-tui-installer/releases/latest/download/artix-installer
+chmod +x artix-installer
+sudo ./artix-installer
+```
+
+Both links always resolve to the **newest build** — GitHub handles `latest`
+itself. Every build is listed on the [releases page](https://github.com/YellowHearth1/artix-tui-installer/releases).
+
+### Build from source
+
+`base-devel` provides the compiler and linker that `cargo` needs:
+
+```sh
+sudo pacman -S --needed git rust base-devel
+git clone https://github.com/YellowHearth1/artix-tui-installer.git
+cd artix-tui-installer/installer
+cargo build --release
+sudo ./target/release/artix-installer
+```
+
+A few notes:
+
+- The installer **must run as root** — it partitions disks and runs `basestrap`
+  and `chroot`.
+- It's a full-screen TUI: run it in a real console (`Ctrl`+`Alt`+`F2`) or a
+  terminal in the live desktop, at least **80×24** in size.
+- On a live ISO, building from source happens in RAM; if RAM is tight, grab the
+  pre-built binary above or build it on another Artix machine and copy the single
+  file over to the target.
+- ⚠️ The installer **formats disks** — test in a virtual machine first.
+
+---
+
+## 🧭 Wizard steps
+
+The installer opens with a mode chooser: **Install** or **System recovery**.
+Install runs 15 steps:
+
+1. **Language** — Ukrainian / English; sets the UI language and the system locale.
+2. **Timezone** — the full IANA list with a filter search.
+3. **Wi-Fi** — skip (wired), scan, or connect via `nmcli`.
+4. **Keyboard** — console layouts via `localectl`; the first checked is primary.
+5. **Kernel** — linux / lts / zen / hardened.
+6. **Desktop** — pick a desktop (or none) and the seat manager.
+7. **Packages** — GPU driver + search and multi-select from the repos.
+8. **AUR** — a curated recommended list and a live AUR search.
+9. **Disk** — boot mode, target disk, SWAP, and root filesystem.
+10. **Bootloader & encryption** — choose the bootloader (GRUB / rEFInd / Limine / EFISTUB),
+    other-OS detection (`os-prober`, GRUB only), the UEFI entry label, and disk
+    encryption: root-only, full (encrypted `/boot`) or a USB key, with scope and
+    passphrase. Comes **before** the extra disks so the key on an extra disk
+    actually makes sense.
+11. **Additional disks** — for each detected disk/partition: format (or keep the
+    data), where to mount it (home / `/mnt` / a custom path with a folder name)
+    and a separate encryption checkbox. Nothing changes until you choose.
+12. **User** — hostname, account mode, username, and passwords (kept in memory
+    only; never written to disk by the installer).
+13. **Options** — passwordless sudo, the Chaotic-AUR repository, and mirror
+    optimisation.
+14. **Install** — a review, then a live log runs the plan step by step; it stops
+    on error and lets you go **Back**.
+15. **Finish** — a summary and reboot.
+
+Navigation is the same everywhere: `↑`/`↓` moves focus (and Up on the topmost
+item returns to the previous step), `←`/`→` changes a value, `Enter` advances,
+`Esc` closes a popup or goes back.
+
+---
+
+## 🧱 How the install is organized
+
+`src/system/install.rs` builds a single ordered list of actions; the install
+screen runs each one, streaming output live. Roughly:
+
+install host tools → partition → format (LUKS if asked) → mount → **phase 1**
+`basestrap` a minimal bootable base (kernel, firmware, dinit + services, audio,
+logging) → set up repos + keys → **phase 2** interactive `pacman` for the desktop,
+drivers, and your extra packages → accounts → locale / timezone / keymap /
+hostname + hosts → user-dinit wiring (turnstile or userspawn) → initramfs (with
+the `encrypt` hook when encrypting) → bootloader → embedded nftables → log
+rotation → enable all dinit services → **phase 3** AUR via `paru`.
+
+---
+
+## 🌳 Btrfs: subvolumes, auto-snapshots & system rollback
+
+Choosing **btrfs** on the "Disk & partitions" step reveals extra options under the filesystem picker (each explained right in the UI with its gain/loss):
+
+- **Subvolumes** — the `@` (root), `@home`, `@snapshots` → `/.snapshots`, `@log` → `/var/log`, `@cache` → `/var/cache` layout. System snapshots leave `/home` alone and don't get bloated by logs or cache.
+- **Auto-snapshots (snapper + snap-pac)** — a snapshot **before and after every pacman/paru transaction**; enables subvolumes automatically (needs `@snapshots`).
+- **Compression (zstd)** — transparent `compress=zstd` on write.
+- **SSD TRIM** — `discard=async` in the background.
+- **noatime** is available separately for any filesystem.
+
+The root is always mounted with `rootflags=subvol=@` — by name, not via the default subvolume.
+
+What the installer sets up for snapshots:
+
+- **snapper** is configured by writing `/etc/snapper/configs/root` directly (`create-config` fails inside a chroot): `TIMELINE_CREATE=no` — snapshots are tied to pacman events, not the clock; `NUMBER_LIMIT=10` — the latest ~10 are kept.
+- **Scheduled cleanup** — `/etc/cron.d/snapper` (daily at 5:30) via cronie, because dinit has no systemd timers.
+- **A first-boot baseline snapshot** — a one-shot background job waits for D-Bus and snapper to come up, takes a "clean system (post-install baseline)" snapshot, and removes itself.
+
+Rollback works **on any bootloader** (GRUB, rEFInd, Limine):
+
+- **`sudo artix-rollback [N]`** — lists the snapshots; the chosen one becomes the new `@`, the old root is kept as `@.rollback-<stamp>`, the default subvolume is repointed, and the stale pacman lock is dropped from the snapshot (snap-pac takes its PRE snapshot while `db.lck` is still held). There is also an app-menu launcher.
+- **Pre-boot rollback** — the `artix.rollback` kernel parameter opens a snapshot picker straight from the initramfs; the mkinitcpio hook runs **after** `encrypt`, so it works with LUKS too. On **GRUB** there is a dedicated **System Rollback** menu entry for it.
+- Plain `snapper rollback` works as well.
+
+The rollback is **independent of the live kernel**: `/boot` keeps a frozen pair — `vmlinuz-artix-rescue` + `initramfs-artix-rescue.img` — that pacman never touches. The *System Rollback* entries in GRUB, rEFInd and Limine boot exactly this pair, so the snapshot picker still starts even when an update broke the kernel or the initramfs (and a plain *rescue kernel* entry sits next to it, for a normal boot on the spare kernel with no rollback involved). The pair is refreshed only after a successful normal boot: the `artix-rescue-sync` service fires after 30 s of uptime and first verifies the running kernel IS the live one (a byte compare against `/usr/lib/modules/$(uname -r)/vmlinuz`), so a broken kernel can never poison the copy. Right after a rollback, the one-shot `artix-rollback-fixup` reconciles `/boot` with the restored system: it reinstalls the kernel from the snapshot's `/usr/lib/modules`, rebuilds the initramfs, refreshes the GRUB menu and re-freezes the rescue pair.
+
+> **Why not grub-btrfs:** its snapshot submenu boots snapshots read-only via an overlayfs hook that is broken on kernels ≥ 6.8 (Antynea/grub-btrfs #328) — the entries simply fail to boot. `artix-rollback` instead swaps `@` and boots the restored root **read-write**, no overlay, on any kernel and bootloader.
+
+---
+
+## 📀 ISO profile (`iso-profile/`, for artools `buildiso`)
+
+- `Packages-Root` / `Packages-Live` — packages for the live image (dinit only).
+- `profile.conf` — autologin/display-manager settings for the live session.
+- `live-overlay/usr/bin/installer-launch` — gives the TUI a real controlling
+  terminal on tty1 (`setsid -c`), with a fallback shell on failure.
+- `live-overlay/etc/dinit.d/installer.conf` — the autostart service that runs the
+  installer instead of a getty on tty1.
+- `grub-overrides/loopback.cfg` — boots straight into the installer.
+
+Drop the compiled binary at `live-overlay/usr/bin/artix-installer`, then run
+`sudo buildiso -p <profile>`.
+
+---
+
+## 🗂️ Project layout
+
+```
+installer/        Rust sources (ratatui TUI + install logic)
+  src/app.rs      state model + config
+  src/event.rs    global key handling / navigation
+  src/main.rs     entry point + the "graphical installer" chrome
+  src/screens/    one module per wizard step
+  src/system/     disk, runner (PTY), install plan, packages, recovery
+  src/assets/     embedded configs (kitty, fastfetch, waybar, wofi, pinnacle)
+  i18n/           UI strings en.toml / uk.toml
+iso-profile/      artools buildiso profile + live-image overlay
+screenshots/      screenshots for the README (15 wizard steps)
+```
+
+---
+
+## 📸 Screenshots
+
+> **Note.** All screenshots were taken in a graphical terminal emulator on a machine with a desktop environment installed. On a bare TTY (e.g. right after booting the Artix base image) the interface looks much more modest: the kernel console offers only 16 colors and its own fixed font, so some of ratatui's effects — smooth shades, dimmed tones, rounded borders — are unavailable or simplified there. Functionally everything works the same.
+
+A full walk-through of the wizard — all **15 steps**. The interface is available in Ukrainian, English and Spanish; the screenshots below are in English.
+
+**Step 1/15 — Language.** The installer and system language.
+
+![Step 1 — Language](screenshots/en/01-language.png)
+
+**Step 2/15 — Timezone.** Search and pick your timezone.
+
+![Step 2 — Timezone](screenshots/en/02-timezone.png)
+
+**Step 3/15 — Network.** Skip (wired) or scan Wi-Fi: pick an adapter, a network, and enter the password.
+
+![Step 3 — Network](screenshots/en/03-wifi.png)
+
+**Step 4/15 — Keyboard.** Multi-select layouts with a filter; the first ticked one becomes primary.
+
+![Step 4 — Keyboard](screenshots/en/04-keyboard.png)
+
+**Step 5/15 — Kernel.** Linux, Linux Zen, Linux Hardened or Linux LTS.
+
+![Step 5 — Kernel](screenshots/en/05-kernel.png)
+
+**Step 6/15 — Desktop.** Multi-select desktops, toggle the session (Wayland/X11), and choose a login screen.
+
+![Step 6 — Desktop](screenshots/en/06-desktop.png)
+
+**Step 7/15 — Packages.** GPU drivers + search and pick popular packages.
+
+![Step 7 — Packages](screenshots/en/07-packages.png)
+
+**Step 8/15 — AUR.** Search the AUR and recommended packages (built via paru).
+
+![Step 8 — AUR](screenshots/en/08-aur.png)
+
+**Step 9/15 — Disk & partitions.** UEFI/BIOS, disk selection, SWAP partition, root filesystem.
+
+![Step 9 — Disk](screenshots/en/09-disk.png)
+
+**Step 10/15 — Bootloader & encryption.** GRUB / rEFInd / Limine / EFISTUB, os-prober, UEFI entry name, LUKS encryption.
+
+![Step 10 — Bootloader](screenshots/en/10-bootloader.png)
+
+**Step 11/15 — Extra disks.** Mount other disks and existing partitions (e.g. a Windows NTFS one — keeping its data).
+
+![Step 11 — Storage](screenshots/en/11-storage.png)
+
+**Step 12/15 — Accounts.** Hostname, user and passwords; account mode.
+
+![Step 12 — Accounts](screenshots/en/12-accounts.png)
+
+**Step 13/15 — Install options.** sudo password, Chaotic-AUR repo, mirror optimization.
+
+![Step 13 — Options](screenshots/en/13-options.png)
+
+**Step 14/15 — Review & install.** A summary of every choice before it starts.
+
+![Step 14 — Summary](screenshots/en/14-summary.png)
+
+**Step 15/15 — Finish.** A donation QR code for Ukraine's defense, plus a choice: reboot, power off, or enter the installed system for manual steps.
+
+![Step 15 — Finish](screenshots/en/15-finish.png)
+
+---
+
+## 🙏 Credits
+
+Spanish (es-419, Latin American) translation — **[ich0x](https://github.com/ich0x)**:
+a complete locale file and translated documentation. Thank you.
+
+## 📄 License
+
+Released under the **Apache 2.0** license — full text in [`LICENSE`](LICENSE).

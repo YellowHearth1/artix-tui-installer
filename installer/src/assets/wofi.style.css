@@ -1,0 +1,56 @@
+* {
+  font-family: JetBrainsMono;
+  color: #e5e9f0;
+  background: transparent;
+}
+
+window {
+  background: rgba(41, 46, 66, 0.85);
+  border: 2px solid;
+  border-image: linear-gradient(45deg, #00ffff, #0080ff, #00ff00) 1;
+  border-radius: 10px;
+  transition: opacity 0.3s cubic-bezier(0.4, 0.0, 0.2, 1),
+  transform 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);
+  animation: slideIn 0.25s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+#input {
+  padding: 10px;
+  margin-bottom: 10px;
+  border-radius: 15px;
+}
+
+#outer-box {
+  padding: 20px;
+}
+
+#img {
+  margin-right: 6px;
+}
+
+#entry {
+  padding: 10px;
+  border-radius: 15px;
+  transition: all 0.15s ease;
+}
+
+#entry:selected {
+background: linear-gradient(90deg, rgba(0, 255, 255, 0.2), rgba(0, 255, 0, 0.2));
+transform: translateX(5px);
+transition: all 0.2s ease;
+}
+
+#text {
+  margin: 2px;
+}

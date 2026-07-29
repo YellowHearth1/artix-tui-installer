@@ -1,0 +1,50 @@
+# Rust build artifacts
+/target
+/installer/target
+
+# Editor / OS cruft
+*.rs.bk
+*.swp
+*~
+.DS_Store
+
+# Release artifacts — NEVER commit these to git. They bloat the repo history
+# and blow past storage quotas. Distribute binaries/tarballs via releases
+# (Forgejo/GitHub release attachments), not the git tree.
+*.tar.gz
+*.tar
+*.tgz
+*.rmeta
+# Compiled installer binaries (any name we've used for a built artifact)
+/artix-installer
+/installer/artix-installer
+bin18*
+artix-installer-bin
+/versions
+
+# Cargo.lock is NOT committed.
+#
+# It was, once. But the Pinnacle config we ship is itself a cargo project that
+# gets built ON THE USER'S MACHINE, at first login — and a lockfile frozen at
+# packaging time pinned dependency versions that no longer resolved, so
+# `cargo build --locked` failed and the session never started. The installer
+# now ships no lockfile and passes no --locked; cargo resolves fresh.
+Cargo.lock
+installer/Cargo.lock
+
+# Container / toolchain cruft that lives beside the source tree in the dev
+# environment. None of it belongs in the repository.
+.cache/
+.config/
+.local/
+.npm/
+.npm-global/
+.npmrc
+.wget-hsts
+uploaded/
+prev_backup/
+mockbin/
+
+# Робоча інструкція для Claude Code — локальна, у репозиторій не публікується.
+# Вона їде в тарболах розробки й описує внутрішню кухню, а не продукт.
+CLAUDE.md

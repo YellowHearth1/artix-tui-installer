@@ -1,0 +1,841 @@
+//! Step 11 — install options the user sets just before the final review:
+//! passwordless sudo, disk encryption (LUKS) with scope + passphrase, and the
+//! EFI bootloader entry name. Up/Down moves between rows; Left/Right (or Space)
+//! toggles a choice row; text rows accept typing.
+
+use crate::app::{App, Bootloader, Screen};
+use crate::i18n::t;
+use crate::screens::widgets;
+use crate::theme;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame,
+};
+
+/// The kind of each visible row, so navigation and editing adapt to whether
+/// encryption is enabled (which reveals the scope + passphrase rows).
+#[derive(Clone, Copy, PartialEq)]
+enum Row {
+    Sudo,
+    Escalation,
+    Chaotic,
+    Mirrors,
+    Encrypt,
+    /// A non-interactive note shown in place of the encryption toggle when the
+    /// install shares a disk with Windows (alongside/manual) — LUKS there isn't
+    /// wired up in v1, so the toggle would do nothing.
+    EncBlocked,
+    EncScope,
+    UsbKey,
+    UsbMode,
+    EncPass,
+    Bootloader,
+    OsProber,
+    BootId,
+    SecureBoot,
+}
+
+/// The ordered list of rows currently visible, given the config state. This
+/// module backs two screens: the "Bootloader & encryption" step (before the
+/// storage step, so the root-encryption choice is made before per-disk choices)
+/// and the later "System options" step. The encryption scope row only appears
+/// with GRUB, since only GRUB can boot an encrypted /boot.
+fn rows_for(app: &App) -> Vec<Row> {
+    // System options step: packaging tweaks and passwordless sudo only.
+    if app.screen == Screen::Options {
+        return vec![Row::Sudo, Row::Escalation, Row::Chaotic, Row::Mirrors];
+    }
+    // Bootloader & encryption step. Bootloader first, with the encryption block
+    // immediately after it (its sub-rows stay attached to the toggle) — the two
+    // decisions belong together. Boot extras (os-prober, the UEFI entry name)
+    // come after the encryption block.
+    // On a disk SHARED with Windows (alongside/manual), v1 can't set up LUKS —
+    // so instead of an encryption toggle that the plan silently ignores, show a
+    // one-line note explaining why. A separate-disk or whole-disk install (Auto)
+    // gets the real toggle: that disk is entirely Artix's.
+    // "Shared" means another OS lives on this disk — that is what makes LUKS
+    // unavailable, not manual partitioning as such. A SOLO manual install owns
+    // the disk, so it gets the real toggle like any whole-disk install.
+    let shared_disk = app.config.partition_mode.is_manual_family() && !app.config.manual_solo;
+    let mut v = vec![Row::Bootloader];
+    if shared_disk {
+        v.push(Row::EncBlocked);
+    } else {
+        v.push(Row::Encrypt);
+    }
+    if app.config.encrypt_disk && !shared_disk {
+        if app.config.bootloader == Bootloader::Grub {
+            v.push(Row::EncScope);
+        }
+        // A USB key auto-unlocks ROOT from the initramfs. Full-disk encryption
+        // (encrypted /boot) makes GRUB prompt for the passphrase BEFORE the
+        // initramfs ever runs, so an auto-unlock key would be pointless — the
+        // two are mutually exclusive. Offer the USB key ONLY with root-only
+        // encryption, so the choice is structural (the row simply isn't there
+        // under full-disk) instead of silently flipping the scope back to root
+        // the moment a stick is picked.
+        if app.config.encrypt_scope != "full" {
+            v.push(Row::UsbKey);
+            if !app.config.usb_key_device.is_empty() {
+                v.push(Row::UsbMode);
+            }
+        }
+        // Key-only USB mode needs NO passphrase from the user: a throwaway
+        // secret is minted internally for setup and removed afterwards, so
+        // the row disappears instead of demanding meaningless input.
+        if !app.config.usb_key_only || app.config.usb_key_device.is_empty() {
+            v.push(Row::EncPass);
+        }
+    }
+    if app.config.bootloader == Bootloader::Grub {
+        v.push(Row::OsProber);
+    }
+    v.push(Row::BootId);
+    // Secure Boot preparation is offered ONLY for EFISTUB — the one bootloader
+    // where signing is clean (just the kernel via sbctl, no rebuilds, no shim,
+    // no systemd). GRUB/rEFInd/Limine Secure Boot is far more fragile on Artix
+    // and deliberately not offered here.
+    if app.config.bootloader == Bootloader::Efistub {
+        v.push(Row::SecureBoot);
+    }
+    v
+}
+
+pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
+    let visible = rows_for(app);
+    // Clamp the cursor to the visible rows (it may have pointed at a row that
+    // disappeared when encryption was toggled off).
+    if app.cursor >= visible.len() {
+        app.cursor = visible.len() - 1;
+    }
+
+    // Reserve the action row FIRST, as its own split. Everything below is laid
+    // out inside what's left, so however many option rows the current config
+    // produces (Security grows to ~10 with encryption armed), the Next button
+    // can never be the constraint ratatui silently clips away.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+    let (body, actions_area) = (outer[0], outer[1]);
+
+    // Roomy layout: intro(2) + 3 rows each (5 for the USB rows when armed, so a
+    // wrapped red warning fits inside the frame) + 1 spacing between each. On a
+    // 59x15 panel that needs ~23 rows and there are 12, so below the threshold
+    // each option collapses to a single line — and only the FOCUSED one keeps
+    // its explanatory hint, which is the line the user is actually reading.
+    let full_need = 2 + visible.len() * 3 + visible.len() + 1;
+    let compact = (body.height as usize) < full_need;
+
+    let mut constraints = vec![Constraint::Length(if compact { 1 } else { 2 })]; // intro
+    for (i, row) in visible.iter().enumerate() {
+        if compact {
+            constraints.push(Constraint::Length(if i == app.cursor { 2 } else { 1 }));
+        } else {
+            let tall = match row {
+                Row::UsbKey => !app.config.usb_key_device.is_empty(),
+                Row::UsbMode => app.config.usb_key_only,
+                _ => false,
+            };
+            constraints.push(Constraint::Length(if tall { 5 } else { 3 }));
+        }
+    }
+    constraints.push(Constraint::Min(0)); // spacer
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .spacing(if compact { 0 } else { 1 })
+        .split(body);
+
+    let intro_key = if app.screen == Screen::Options {
+        "opt.intro"
+    } else {
+        "sec.intro"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {}", t(app.lang, intro_key)),
+            theme::dim(),
+        ))),
+        rows[0],
+    );
+
+    for (i, row) in visible.iter().enumerate() {
+        let area = rows[i + 1];
+        let focused = app.cursor == i;
+        match row {
+            Row::Sudo => {
+                let val = t(
+                    app.lang,
+                    if app.config.passwordless_sudo {
+                        "opt.sudo_nopass"
+                    } else {
+                        "opt.sudo_pass"
+                    },
+                );
+                let hint = t(
+                    app.lang,
+                    if app.config.passwordless_sudo {
+                        "opt.sudo_nopass_hint"
+                    } else {
+                        "opt.sudo_pass_hint"
+                    },
+                );
+                draw_choice_row(f, area, focused, &t(app.lang, "opt.sudo"), &val, &hint);
+            }
+            Row::Escalation => {
+                let val = t(
+                    app.lang,
+                    if app.config.use_doas {
+                        "opt.escalation_doas"
+                    } else {
+                        "opt.escalation_sudo"
+                    },
+                );
+                let hint = t(
+                    app.lang,
+                    if app.config.use_doas {
+                        "opt.escalation_doas_hint"
+                    } else {
+                        "opt.escalation_sudo_hint"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.escalation"),
+                    &val,
+                    &hint,
+                );
+            }
+            Row::Chaotic => {
+                let val = t(
+                    app.lang,
+                    if app.config.chaotic_aur {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.chaotic"),
+                    &val,
+                    &t(app.lang, "opt.chaotic_hint"),
+                );
+            }
+            Row::Mirrors => {
+                let val = t(
+                    app.lang,
+                    if app.config.optimize_mirrors {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.mirrors"),
+                    &val,
+                    &t(app.lang, "opt.mirrors_hint"),
+                );
+            }
+            Row::Encrypt => {
+                let val = t(
+                    app.lang,
+                    if app.config.encrypt_disk {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.encrypt"),
+                    &val,
+                    &t(app.lang, "opt.encrypt_hint"),
+                );
+            }
+            Row::EncBlocked => {
+                // A dimmed, non-interactive explanation in the encryption slot.
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("  {}", t(app.lang, "opt.encrypt_shared")),
+                            theme::mute(),
+                        )),
+                        Line::from(Span::styled(
+                            format!("  {}", t(app.lang, "opt.encrypt_shared_hint")),
+                            theme::dim(),
+                        )),
+                    ]),
+                    area,
+                );
+            }
+            Row::OsProber => {
+                let val = t(
+                    app.lang,
+                    if app.config.os_prober {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.osprober"),
+                    &val,
+                    &t(app.lang, "opt.osprober_hint"),
+                );
+            }
+            Row::SecureBoot => {
+                let val = t(
+                    app.lang,
+                    if app.config.prepare_secureboot {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.secureboot"),
+                    &val,
+                    &t(app.lang, "opt.secureboot_hint"),
+                );
+            }
+            Row::EncScope => {
+                let val = t(
+                    app.lang,
+                    if app.config.encrypt_scope == "full" {
+                        "opt.scope_full"
+                    } else {
+                        "opt.scope_root"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.scope"),
+                    &val,
+                    &t(app.lang, "opt.scope_hint"),
+                );
+            }
+            Row::UsbKey => {
+                let off = app.config.usb_key_device.is_empty();
+                let val = if off {
+                    t(app.lang, "opt.off")
+                } else {
+                    // Show model+size from the detection cache when we still
+                    // have it; the bare device path otherwise.
+                    app.usb_devices
+                        .iter()
+                        .find(|d| d.path == app.config.usb_key_device)
+                        .map(|d| format!("{} · {} · {}", d.path, d.size, d.model))
+                        .unwrap_or_else(|| app.config.usb_key_device.clone())
+                };
+                // With a stick selected the hint becomes a RED warning: the
+                // stick will be wiped and reformatted.
+                if off {
+                    draw_choice_row(
+                        f,
+                        area,
+                        focused,
+                        &t(app.lang, "opt.usbkey"),
+                        &val,
+                        &t(app.lang, "opt.usbkey_hint"),
+                    );
+                } else {
+                    let marker = if focused { "›" } else { " " };
+                    let line = Line::from(vec![
+                        Span::styled(format!("  {marker} "), theme::gold()),
+                        Span::styled(
+                            format!("{}: ", t(app.lang, "opt.usbkey")),
+                            if focused {
+                                theme::gold()
+                            } else {
+                                theme::normal()
+                            },
+                        ),
+                        Span::styled(
+                            format!("‹ {val} ›"),
+                            if focused {
+                                theme::gold()
+                            } else {
+                                theme::mute()
+                            },
+                        ),
+                    ]);
+                    let hint = Line::from(Span::styled(
+                        format!("      {}", t(app.lang, "opt.usbkey_warn")),
+                        theme::warn(),
+                    ));
+                    f.render_widget(
+                        Paragraph::new(vec![line, hint])
+                            .wrap(ratatui::widgets::Wrap { trim: true }),
+                        area,
+                    );
+                }
+            }
+            Row::UsbMode => {
+                let key_only = app.config.usb_key_only;
+                let val = t(
+                    app.lang,
+                    if key_only {
+                        "opt.usbmode_only"
+                    } else {
+                        "opt.usbmode_backup"
+                    },
+                );
+                if key_only {
+                    // Key-only deserves a PERMANENT red warning, not a dim hint.
+                    let marker = if focused { "\u{203a}" } else { " " };
+                    let line = Line::from(vec![
+                        Span::styled(format!("  {marker} "), theme::gold()),
+                        Span::styled(
+                            format!("{}: ", t(app.lang, "opt.usbmode")),
+                            if focused {
+                                theme::gold()
+                            } else {
+                                theme::normal()
+                            },
+                        ),
+                        Span::styled(
+                            format!("\u{2039} {val} \u{203a}"),
+                            if focused {
+                                theme::gold()
+                            } else {
+                                theme::mute()
+                            },
+                        ),
+                    ]);
+                    let hint = Line::from(Span::styled(
+                        format!("      {}", t(app.lang, "opt.usbmode_only_warn")),
+                        theme::warn(),
+                    ));
+                    f.render_widget(
+                        Paragraph::new(vec![line, hint])
+                            .wrap(ratatui::widgets::Wrap { trim: true }),
+                        area,
+                    );
+                } else {
+                    draw_choice_row(
+                        f,
+                        area,
+                        focused,
+                        &t(app.lang, "opt.usbmode"),
+                        &val,
+                        &t(app.lang, "opt.usbmode_hint"),
+                    );
+                }
+            }
+            Row::EncPass => {
+                // Masked passphrase text field. The whole focused line shares
+                // ONE intensity (gold = bold accent): mixing bold and non-bold
+                // spans triggers the VT's unreliable intensity-reset handling
+                // on incremental redraws (stale-bright first • while typing).
+                let caret = if focused { "▏" } else { "" };
+                let masked: String = "•".repeat(app.config.luks_passphrase.chars().count());
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if focused { "›" } else { " " }),
+                        theme::gold(),
+                    ),
+                    Span::styled(
+                        format!("{}: ", t(app.lang, "opt.passphrase")),
+                        if focused {
+                            theme::gold()
+                        } else {
+                            theme::normal()
+                        },
+                    ),
+                    Span::styled(
+                        format!("[ {masked}{caret} ]"),
+                        if focused {
+                            theme::gold()
+                        } else {
+                            theme::mute()
+                        },
+                    ),
+                ]);
+                let hint = Line::from(Span::styled(
+                    format!("      {}", t(app.lang, "opt.passphrase_hint")),
+                    theme::dim(),
+                ));
+                f.render_widget(
+                    Paragraph::new(vec![line, hint]).wrap(ratatui::widgets::Wrap { trim: true }),
+                    area,
+                );
+            }
+            Row::Bootloader => {
+                let val = app.config.bootloader.display_name();
+                // Warn only about the one incompatibility the bootloader choice
+                // can hit: an encrypted /boot needs GRUB. EFISTUB is fine with
+                // snapshot rollback, so no extra warning there.
+                let hint_key = if app.config.encrypt_disk
+                    && app.config.encrypt_scope == "full"
+                    && app.config.bootloader != Bootloader::Grub
+                {
+                    "opt.bootloader_warn"
+                } else if app.config.bootloader == Bootloader::Efistub {
+                    "opt.bootloader_efistub_hint"
+                } else {
+                    "opt.bootloader_hint"
+                };
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.bootloader"),
+                    val,
+                    &t(app.lang, hint_key),
+                );
+            }
+            Row::BootId => {
+                let caret = if focused { "▏" } else { "" };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", if focused { "›" } else { " " }),
+                        theme::gold(),
+                    ),
+                    Span::styled(
+                        format!("{}: ", t(app.lang, "opt.bootid")),
+                        if focused {
+                            theme::gold()
+                        } else {
+                            theme::normal()
+                        },
+                    ),
+                    Span::styled(
+                        format!("[ {}{} ]", app.config.bootloader_id, caret),
+                        if focused {
+                            theme::gold()
+                        } else {
+                            theme::mute()
+                        },
+                    ),
+                ]);
+                let hint = Line::from(Span::styled(
+                    format!("      {}", t(app.lang, "opt.bootid_hint")),
+                    theme::dim(),
+                ));
+                f.render_widget(
+                    Paragraph::new(vec![line, hint]).wrap(ratatui::widgets::Wrap { trim: true }),
+                    area,
+                );
+            }
+        }
+    }
+
+    // Can only advance if encryption-off, or encryption-on with a passphrase.
+    // Also block the one incompatible combo: full-disk encryption (encrypted
+    // /boot) only works with GRUB, since rEFInd/Limine/EFISTUB can't decrypt
+    // /boot. (EFISTUB, unlike the earlier UKI attempt, IS compatible with
+    // snapshot rollback, so there's no rollback gate.)
+    let enc_ok = !app.config.encrypt_disk
+        || !app.config.luks_passphrase.is_empty()
+        || (app.config.usb_key_only && !app.config.usb_key_device.is_empty());
+    let boot_ok = !(app.config.encrypt_disk
+        && app.config.encrypt_scope == "full"
+        && app.config.bootloader != Bootloader::Grub);
+    app.can_advance = enc_ok && boot_ok;
+    widgets::action_row(
+        f,
+        actions_area,
+        &t(app.lang, "app.back"),
+        &t(app.lang, "app.next"),
+        app.can_advance,
+    );
+}
+
+fn draw_choice_row(f: &mut Frame, area: Rect, focused: bool, label: &str, value: &str, hint: &str) {
+    let marker = if focused { "›" } else { " " };
+    let label_style = if focused {
+        theme::gold()
+    } else {
+        theme::normal()
+    };
+    // The focused value GLOWS bright bold cyan — same family as the rest of
+    // the UI. (A reversed-video fill was tried here and looked muddy on real
+    // fbcon palettes: grey text on a dark-cyan slab. Plain bright text wins.)
+    let value_style = if focused {
+        theme::gold()
+    } else {
+        theme::mute()
+    };
+    let line = Line::from(vec![
+        Span::styled(format!("  {marker} "), theme::gold()),
+        Span::styled(format!("{label}: "), label_style),
+        Span::styled(format!("‹ {value} ›"), value_style),
+    ]);
+    let hint_line = Line::from(Span::styled(format!("      {hint}"), theme::dim()));
+    f.render_widget(
+        Paragraph::new(vec![line, hint_line]).wrap(ratatui::widgets::Wrap { trim: true }),
+        area,
+    );
+}
+
+pub fn handle_key(app: &mut App, key: KeyEvent) {
+    let visible = rows_for(app);
+    let cur = visible.get(app.cursor).copied().unwrap_or(Row::Sudo);
+
+    // Up/Down navigation is common to all rows. The EncBlocked note is inert,
+    // so navigation steps over it (landing there would look like a lost cursor).
+    let is_inert = |i: usize| visible.get(i) == Some(&Row::EncBlocked);
+    match key.code {
+        KeyCode::Up | KeyCode::Esc => {
+            let mut n = app.cursor.saturating_sub(1);
+            if is_inert(n) {
+                n = n.saturating_sub(1);
+            }
+            app.cursor = n;
+            return;
+        }
+        KeyCode::Down => {
+            let mut n = (app.cursor + 1).min(visible.len() - 1);
+            if is_inert(n) {
+                n = (n + 1).min(visible.len() - 1);
+            }
+            app.cursor = n;
+            return;
+        }
+        _ => {}
+    }
+
+    // Text rows (passphrase, bootid) accept typing.
+    match cur {
+        Row::EncPass => match key.code {
+            KeyCode::Char(c) => {
+                if app.config.luks_passphrase.chars().count() < 128 {
+                    app.config.luks_passphrase.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                app.config.luks_passphrase.pop();
+            }
+            KeyCode::Enter => enter_step(app),
+            _ => {}
+        },
+        Row::BootId => match key.code {
+            KeyCode::Char(c) if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' => {
+                if app.config.bootloader_id.chars().count() < 32 {
+                    app.config.bootloader_id.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                app.config.bootloader_id.pop();
+            }
+            KeyCode::Enter => enter_step(app),
+            _ => {}
+        },
+        // Choice rows toggle with Left/Right/Space; Enter steps to the next row
+        // (and only advances the page from the LAST row — like a normal
+        // installer). Left moves BACKWARD through multi-state rows (bootloader),
+        // Right/Space forward — so the arrows are never a one-way street.
+        _ => match key.code {
+            KeyCode::Right | KeyCode::Char(' ') => toggle(app, cur, true),
+            KeyCode::Left => toggle(app, cur, false),
+            KeyCode::Enter => enter_step(app),
+            _ => {}
+        },
+    }
+}
+
+/// Enter steps the cursor to the next visible row; on the LAST row it tries to
+/// advance to the next screen (subject to validation). This matches the
+/// installer-wide convention: Enter = next field, then next page.
+fn enter_step(app: &mut App) {
+    let visible = rows_for(app);
+    if app.cursor + 1 < visible.len() {
+        app.cursor += 1;
+    } else {
+        advance(app);
+    }
+}
+
+fn advance(app: &mut App) {
+    if app.config.bootloader_id.trim().is_empty() {
+        app.config.bootloader_id = "Artix".into();
+    }
+    // Block advancing if encryption is on but no passphrase was set — UNLESS
+    // key-only USB mode is active, where a passphrase is intentionally absent
+    // (a throwaway key is minted internally and removed afterwards). This must
+    // mirror `enc_ok` in handle_key, or the screen silently refuses to advance.
+    let key_only = app.config.usb_key_only && !app.config.usb_key_device.is_empty();
+    if app.config.encrypt_disk && app.config.luks_passphrase.is_empty() && !key_only {
+        return;
+    }
+    // Block the incompatible combo: encrypted /boot needs GRUB.
+    if app.config.encrypt_disk
+        && app.config.encrypt_scope == "full"
+        && app.config.bootloader != Bootloader::Grub
+    {
+        return;
+    }
+    app.goto_next();
+}
+
+fn toggle(app: &mut App, row: Row, forward: bool) {
+    match row {
+        Row::Sudo => app.config.passwordless_sudo = !app.config.passwordless_sudo,
+        Row::Escalation => app.config.use_doas = !app.config.use_doas,
+        Row::Chaotic => app.config.chaotic_aur = !app.config.chaotic_aur,
+        Row::OsProber => app.config.os_prober = !app.config.os_prober,
+        Row::SecureBoot => app.config.prepare_secureboot = !app.config.prepare_secureboot,
+        Row::Mirrors => app.config.optimize_mirrors = !app.config.optimize_mirrors,
+        Row::Encrypt => app.config.encrypt_disk = !app.config.encrypt_disk,
+        Row::UsbKey => {
+            // Refresh the removable-device list on every press so a stick
+            // plugged in while on this screen shows up immediately. The
+            // install disk itself is excluded even if it's removable.
+            app.usb_devices = crate::system::disk::list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|d| d.removable && d.path != app.config.disk)
+                .collect();
+            let mut cycle: Vec<String> = vec![String::new()];
+            cycle.extend(app.usb_devices.iter().map(|d| d.path.clone()));
+            let i = cycle
+                .iter()
+                .position(|p| *p == app.config.usb_key_device)
+                .unwrap_or(0);
+            let n = if forward {
+                (i + 1) % cycle.len()
+            } else {
+                (i + cycle.len() - 1) % cycle.len()
+            };
+            app.config.usb_key_device = cycle[n].clone();
+            // Picking a stick as the key retracts any plan to use it as an
+            // ordinary extra disk. The Additional-disks screen hides the key
+            // stick, but a mountpoint chosen BEFORE the key was picked would
+            // still be sitting in extra_disks — and build_plan reads that list
+            // directly, so it would format the stick out from under the key.
+            // Drop the entry (and anything on its partitions) here, where the
+            // decision is actually made.
+            if !app.config.usb_key_device.is_empty() {
+                let key = app.config.usb_key_device.clone();
+                app.config
+                    .extra_disks
+                    .retain(|d| d.disk != key && !d.disk.starts_with(&key));
+            }
+            // The USB key unlocks ROOT in the initramfs; GRUB's own prompt
+            // for an encrypted /boot would defeat it, so force root-only.
+            if !app.config.usb_key_device.is_empty() {
+                app.config.encrypt_scope = "root".into();
+            } else {
+                // No stick: key-only mode is meaningless; reset it so the
+                // dangerous flag can't survive invisibly.
+                app.config.usb_key_only = false;
+            }
+        }
+        Row::UsbMode => {
+            app.config.usb_key_only = !app.config.usb_key_only;
+            if app.config.usb_key_only {
+                app.config.luks_passphrase.clear();
+            }
+        }
+        Row::EncScope => {
+            // "full" (encrypted /boot) only works with GRUB. With another
+            // bootloader, lock the scope to root-only.
+            if app.config.bootloader == Bootloader::Grub {
+                app.config.encrypt_scope = if app.config.encrypt_scope == "full" {
+                    "root".into()
+                } else {
+                    "full".into()
+                };
+                // Encrypted /boot means GRUB prompts before the initramfs ever
+                // runs — the USB auto-unlock key would be pointless, so the
+                // two options are mutually exclusive. Clear the whole USB-key
+                // state (device AND key-only mode) so no stale flag survives
+                // invisibly under full-disk, where the rows aren't shown.
+                if app.config.encrypt_scope == "full" {
+                    app.config.usb_key_device.clear();
+                    app.config.usb_key_only = false;
+                }
+            } else {
+                app.config.encrypt_scope = "root".into();
+            }
+        }
+        Row::Bootloader => {
+            // Cycle grub ↔ refind ↔ limine ↔ efistub in BOTH directions:
+            // Right advances, Left reverses. EFISTUB boots the kernel directly
+            // via a UEFI boot entry (Artix kernels are already EFI stubs — no
+            // extra package, no systemd, unlike UKI which needs systemd-stub).
+            // It's UEFI-only and, like rEFInd/Limine, cannot decrypt /boot.
+            // Unlike UKI, EFISTUB IS compatible with snapshot rollback: kernel,
+            // initramfs and cmdline stay separate files, so we register extra
+            // UEFI entries for the rescue pair (rollback + rescue), mirroring
+            // the GRUB/rEFInd/Limine flow.
+            // The cycle order shown on this screen. Typed, so adding a variant
+            // to Bootloader without adding it here is a compile error rather
+            // than a bootloader silently missing from the picker.
+            const ORDER: [Bootloader; 4] = [
+                Bootloader::Grub,
+                Bootloader::Refind,
+                Bootloader::Limine,
+                Bootloader::Efistub,
+            ];
+            let i = ORDER
+                .iter()
+                .position(|b| *b == app.config.bootloader)
+                .unwrap_or(0);
+            let n = if forward {
+                (i + 1) % ORDER.len()
+            } else {
+                (i + ORDER.len() - 1) % ORDER.len()
+            };
+            app.config.bootloader = ORDER[n];
+            // If we moved away from GRUB, an encrypted /boot is no longer
+            // possible, so force the scope back to root-only.
+            if app.config.bootloader != Bootloader::Grub && app.config.encrypt_scope == "full" {
+                app.config.encrypt_scope = "root".into();
+            }
+            // Secure Boot prep is EFISTUB-only; if we moved off EFISTUB, drop it
+            // so a hidden flag can't linger from a previous choice.
+            if app.config.bootloader != Bootloader::Efistub {
+                app.config.prepare_secureboot = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Display-manager cycle order. ids are stored in config; SDDM first (the
+/// default for graphical desktops), then the greetd greeters (Arch Wiki set
+/// available as repo packages), then none (boot to TTY).
+// Only greeters available in the OFFICIAL Artix repositories are offered, so
+// every choice installs cleanly without the AUR. Confirmed in repos:
+// greetd-tuigreet (world) and greetd-regreet (galaxy). NOT in repos (AUR-only,
+// so deliberately excluded): greetd-gtkgreet, greetd-wlgreet — and agreety,
+// which was dropped earlier for being a getty-replacement that doesn't switch
+// to greetd's VT. SDDM is the full DM; "none" boots to a TTY.
+pub const DM_ORDER: [&str; 4] = ["sddm", "tuigreet", "regreet", "none"];
+
+/// UI label for a display-manager id.
+pub fn dm_label(id: &str) -> &'static str {
+    match id {
+        "sddm" => "SDDM",
+        "tuigreet" => "greetd + tuigreet",
+        "regreet" => "greetd + ReGreet (cage)",
+        _ => "—",
+    }
+}
+
+pub fn footer_hint(app: &App) -> String {
+    t(app.lang, "opt.footer")
+}
