@@ -1,0 +1,63 @@
+---
+# buildiso profile for the Artix TUI installer live ISO.
+#
+# Build it on any machine:
+#
+#     sh scripts/build-iso.sh
+#
+# which compiles the installer, copies this profile into the artools workspace
+# and runs `buildiso`. See iso-profile/README.md for doing it by hand.
+#
+# The live session autologins as `artix` and that user's ~/.bash_profile starts
+# the installer on tty1 (root-overlay/home/artix/.bash_profile ->
+# usr/bin/installer-start). There is no display manager and no desktop: the
+# image is a text console, which is the environment this installer is built for.
+live-session:
+  user: artix
+  password: artix
+  autologin: true
+  use-xlibre: false
+  services:
+    - acpid
+    - bluetoothd
+    - cronie
+    - cupsd
+    - syslog-ng
+    - NetworkManager
+    - seatd
+    # These two are not in any package — root-overlay/etc/dinit.d/ carries them.
+    # buildiso links whatever the overlay put in place, so the overlay is what
+    # makes them resolve; drop the files and the build silently skips both.
+    - installer-console
+    - nopasswd
+  user-services: []
+rootfs:
+  packages:
+    - mkinitcpio-nfs-utils
+    - squashfs-tools
+    - artix-grub-live
+    - parted
+    - gptfdisk
+    # NOTE: ttf-nerd-fonts-symbols{,-mono} used to be here and were removed.
+    # They are TrueType, and a Linux virtual console cannot load TrueType at
+    # all — it takes PSF console fonts and nothing else. On an image whose only
+    # interface is a text console that was 4.8 MB of files nothing could read.
+    # The fonts the installer actually uses are carried in
+    # root-overlay/usr/share/kbd/consolefonts/.
+    - terminus-font
+    - kbd
+    - artools-base
+    # Wi-Fi testing in a VM (mode screen -> "Wi-Fi test"): hostapd fakes an
+    # access point on a mac80211_hwsim radio, iw enumerates the radios.
+    - hostapd
+    - iw
+    - dnsmasq
+    - smartmontools
+  packages-init:
+    dinit:
+      - turnstile-dinit
+      - syslog-ng-dinit
+      - networkmanager-dinit
+      - cups-dinit
+      - artix-live-dinit
+      - seatd-dinit

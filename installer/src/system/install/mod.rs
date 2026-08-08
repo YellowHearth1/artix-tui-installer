@@ -121,8 +121,70 @@ pub fn build_plan(app: &App) -> Vec<Action> {
                 cc.manual_esp_mount = "/boot".into();
             }
             cc.os_prober = false; // no neighbour to find
+                                  // AN ENCRYPTED /home BECOMES AN EXTRA DISK, here, before anything
+                                  // is planned. That machinery already does LUKS format, keyfile,
+                                  // crypttab and mount, and it is already covered by tests; growing a
+                                  // second crypto path for the /home slot would mean maintaining two
+                                  // implementations of the same delicate sequence on a partition that
+                                  // holds somebody's files.
+                                  //
+                                  // Only in the solo layout: encryption is off anyway on a disk
+                                  // shared with another OS (see the branch below).
+            if cc.manual_home_encrypt && !cc.manual_home.is_empty() {
+                let fs = if cc.manual_home_fs.is_empty() {
+                    "ext4".to_string()
+                } else {
+                    cc.manual_home_fs.clone()
+                };
+                cc.extra_disks.retain(|d| d.mountpoint != "/home");
+                cc.extra_disks.push(crate::app::ExtraDisk {
+                    disk: cc.manual_home.clone(),
+                    mountpoint: "/home".into(),
+                    fs,
+                    format: true,
+                    whole_disk: false,
+                    noatime: false,
+                    compress: cc.manual_home_compress,
+                    encrypt: true,
+                    ..Default::default()
+                });
+            }
         } else {
+            // The SHARED disk is never encrypted — that is the whole point of
+            // the restriction, and it stays.
             cc.encrypt_disk = false;
+            // But a /home on a disk of its OWN is a different disk, and one
+            // that holds nothing else. Refusing to encrypt it protects nobody
+            // and costs the user the one partition they most want protected.
+            //
+            // The condition is deliberately narrow: a separate drive, named
+            // explicitly, that is not the root's. Whether anything ELSE lives
+            // on it is checked in the editor against the real scan, which the
+            // plan does not have.
+            let home_disk = cc.manual_home_disk.clone();
+            let root_disk = cc.manual_disk.clone();
+            if home_disk.is_empty() || (!root_disk.is_empty() && home_disk == root_disk) {
+                cc.manual_home_encrypt = false;
+            }
+            if cc.manual_home_encrypt && !cc.manual_home.is_empty() {
+                let fs = if cc.manual_home_fs.is_empty() {
+                    "ext4".to_string()
+                } else {
+                    cc.manual_home_fs.clone()
+                };
+                cc.extra_disks.retain(|d| d.mountpoint != "/home");
+                cc.extra_disks.push(crate::app::ExtraDisk {
+                    disk: cc.manual_home.clone(),
+                    mountpoint: "/home".into(),
+                    fs,
+                    format: true,
+                    whole_disk: false,
+                    noatime: false,
+                    compress: cc.manual_home_compress,
+                    encrypt: true,
+                    ..Default::default()
+                });
+            }
             cc.bootloader = Bootloader::Grub;
             cc.os_prober = true;
         }
@@ -260,7 +322,10 @@ pub fn build_plan(app: &App) -> Vec<Action> {
             MIRROR_OPTIMIZE_SCRIPT
         );
         plan.push(act("sh", &["-c", &write_cmd]));
-        let mut args = vec!["/tmp/optmirrors.sh"];
+        // The timezone the user already chose is how the script works out which
+        // country is theirs, so their own country's block can lead the list.
+        let home_tz = format!("--home-tz={}", c.timezone);
+        let mut args = vec!["/tmp/optmirrors.sh", home_tz.as_str()];
         if !c.optimize_mirrors {
             args.push("--no-rank");
         }
@@ -390,25 +455,35 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     ));
     plan.push(act("sh", &["-c", "pacman -Sy --noconfirm"]));
 
-    // 1c) Ban XLibre in the LIVE pacman.conf. Artix ships an `xlibre` package
-    //     group (the XLibre X-server fork + its xf86 driver replacements);
-    //     xlibre-xserver *provides* xorg-server, so without this pacman could
-    //     offer XLibre as a provider. We block it two ways for full coverage:
-    //       IgnorePkg = xlibre-*   (glob — every xlibre-* package, incl. the
-    //                               -beta/-devel variants that aren't in the group)
-    //       IgnoreGroup = xlibre   (the whole group, incl. any member that might
-    //                               not match the xlibre-* prefix)
-    //     This keeps the live/basestrap pass on genuine X.Org. Idempotent: only
-    //     inserted if xlibre isn't already mentioned.
-    plan.push(act(
-        "sh",
-        &[
-            "-c",
-            "grep -q 'xlibre' /etc/pacman.conf || \
-             { awk '/^\\[options\\]/{print; print \"IgnorePkg = xlibre-*\"; print \"IgnoreGroup = xlibre\"; next} {print}' \
-             /etc/pacman.conf > /tmp/pacman.conf.xl && cp /tmp/pacman.conf.xl /etc/pacman.conf && rm -f /tmp/pacman.conf.xl; }",
-        ],
-    ));
+    // 1c) Pin the X server provider in the LIVE pacman.conf — but only when we
+    //     are installing our own X set.
+    //
+    //     Artix's `xlibre` group provides `xorg-server`, and pacman pulls it in
+    //     as the provider even when xorg-server is named explicitly. The two
+    //     cannot coexist, so without this the basestrap transaction breaks. Two
+    //     directives for full coverage:
+    //       IgnorePkg = xlibre-*   (glob — every variant, incl. -beta/-devel that
+    //                               are not in the group)
+    //       IgnoreGroup = xlibre   (the group, incl. members not matching the glob)
+    //
+    //     Skipped when the user unticked "xorg": nothing X-shaped is named then,
+    //     so there is no set of ours to protect — and the pin would instead make
+    //     basestrap unable to satisfy a desktop's x11win-server dependency from
+    //     anywhere, failing the install outright. See the target-side counterpart
+    //     below, which additionally STRIPS the lines.
+    //
+    //     Idempotent: only inserted if not already mentioned.
+    if c.extra_packages.iter().any(|x| x == "xorg") {
+        plan.push(act(
+            "sh",
+            &[
+                "-c",
+                "grep -q 'xlibre' /etc/pacman.conf || \
+                 { awk '/^\\[options\\]/{print; print \"IgnorePkg = xlibre-*\"; print \"IgnoreGroup = xlibre\"; next} {print}' \
+                 /etc/pacman.conf > /tmp/pacman.conf.xl && cp /tmp/pacman.conf.xl /etc/pacman.conf && rm -f /tmp/pacman.conf.xl; }",
+            ],
+        ));
+    }
 
     // 2) basestrap base + chosen packages.
     //    basestrap's own option parsing (see artools source) is the key detail:
@@ -449,20 +524,52 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     );
     plan.push(act_interactive("sh", &["-c", &basestrap_retry]));
 
-    // 2b) Ban XLibre on the TARGET. basestrap has just created
-    //     /mnt/etc/pacman.conf; block the `xlibre` group + every xlibre-*
-    //     package there. This does double duty: during phase 2 (interactive
-    //     pacman runs inside the chroot and reads THIS file) it stops XLibre
-    //     from being offered as a provider for xorg-server / the xf86 driver ABI
-    //     — so there's no xorg-vs-xlibre prompt — and on the finished system it
-    //     keeps XLibre out of every future upgrade. Two directives for full
-    //     coverage (group + xlibre-* glob, catching -beta/-devel/AUR builds).
-    //     Idempotent.
-    plan.push(chroot(
-        "grep -q 'xlibre' /etc/pacman.conf || \
-         { awk '/^\\[options\\]/{print; print \"IgnorePkg = xlibre-*\"; print \"IgnoreGroup = xlibre\"; next} {print}' \
-         /etc/pacman.conf > /tmp/pc.xl && cp /tmp/pc.xl /etc/pacman.conf && rm -f /tmp/pc.xl; }",
-    ));
+    // 2b) Pin the X server provider on the TARGET — but only when we are the
+    //     ones installing an X server.
+    //
+    //     basestrap has just created /mnt/etc/pacman.conf. This is NOT a policy
+    //     line — the install does not complete without it. Artix's default
+    //     provider for `xorg-server` is the fork, and it gets pulled in even when
+    //     xorg-server is named explicitly on the command line; the two cannot
+    //     coexist, so the transaction breaks. IgnorePkg + IgnoreGroup is what
+    //     makes naming our set actually mean anything.
+    //
+    //     Skipped when the user unticked "xorg", because then there is no set of
+    //     ours to protect: nothing X-shaped is named at all (see
+    //     `system_packages`), so there is nothing for a provider to collide with.
+    //     Writing the block anyway would leave a machine that cannot satisfy
+    //     x11win-server from anywhere — no server from us, and none allowed —
+    //     which is a broken system, not a neutral one.
+    //
+    //     Idempotent either way.
+    if c.extra_packages.iter().any(|x| x == "xorg") {
+        plan.push(chroot(
+            "grep -q 'xlibre' /etc/pacman.conf || \
+             { awk '/^\\[options\\]/{print; print \"IgnorePkg = xlibre-*\"; print \"IgnoreGroup = xlibre\"; next} {print}' \
+             /etc/pacman.conf > /tmp/pc.xl && cp /tmp/pc.xl /etc/pacman.conf && rm -f /tmp/pc.xl; }",
+        ));
+    } else {
+        // Unticked: actively STRIP the directives instead of merely not writing
+        // them. Not writing is not enough — `basestrap -C /etc/pacman.conf`
+        // hands the live config to the transaction, and the target can end up
+        // carrying the same lines. Left behind they would make the finished
+        // system refuse the very packages its owner unticked ours in order to
+        // install by hand.
+        //
+        // Two shapes to handle: our own dedicated lines (deleted outright) and a
+        // combined list someone may have written themselves (only the token is
+        // removed, and a directive left empty is dropped rather than saved as
+        // "IgnorePkg =", which pacman reads as a syntax oddity).
+        plan.push(chroot(
+            "sed -i -e '/^[[:space:]]*IgnorePkg[[:space:]]*=[[:space:]]*xlibre-\\*[[:space:]]*$/d' \
+                    -e '/^[[:space:]]*IgnoreGroup[[:space:]]*=[[:space:]]*xlibre[[:space:]]*$/d' \
+                    -e 's/[[:space:]]*xlibre-\\*//g' \
+                    -e 's/\\(IgnoreGroup[[:space:]]*=[^\\n]*\\)[[:space:]]xlibre\\b/\\1/g' \
+                    /etc/pacman.conf; \
+             sed -i -e '/^[[:space:]]*IgnorePkg[[:space:]]*=[[:space:]]*$/d' \
+                    -e '/^[[:space:]]*IgnoreGroup[[:space:]]*=[[:space:]]*$/d' /etc/pacman.conf",
+        ));
+    }
     // 2c) Faster downloads on the installed system AND during phase 2 (which
     //     reads this file inside the chroot): uncomment the stock
     //     ParallelDownloads (5) and Color lines in the target's pacman.conf.
@@ -475,15 +582,35 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     plan_fstab(&mut plan, c);
 
     // 4) Locale.
+    //
+    // en_US.UTF-8 is generated ALONGSIDE the chosen locale, always. Plenty of
+    // software falls back to it rather than to C when its own translation is
+    // missing, and some builds simply assume it exists; when it has never been
+    // generated those programs get a locale that does not resolve and misbehave
+    // in ways that look like unrelated bugs. It costs a few hundred kilobytes
+    // and it is not made the default — LANG stays whatever the user chose.
+    //
+    // Each line is appended only if it is not already there, so a locale that
+    // IS en_US.UTF-8, or a re-run of this step, does not stack duplicates in
+    // /etc/locale.gen.
     plan.push(chroot(&format!(
-        "echo '{} UTF-8' >> /etc/locale.gen && locale-gen && echo 'LANG={}' > /etc/locale.conf",
-        c.locale, c.locale
+        "for l in '{loc}' 'en_US.UTF-8'; do \
+           grep -q \"^$l UTF-8\\$\" /etc/locale.gen || echo \"$l UTF-8\" >> /etc/locale.gen; \
+         done; \
+         locale-gen && echo 'LANG={loc}' > /etc/locale.conf",
+        loc = c.locale
     )));
 
     // 5) Timezone.
+    // `hwclock --systohc` alone means UTC — that is its default, and it is
+    // right for a Linux-only machine. Beside Windows it is wrong: Windows keeps
+    // the RTC in local time, and each system "corrects" the other on every boot,
+    // so the clock walks by the timezone offset. The flag is written explicitly
+    // rather than left to a default, so the file says which was meant.
     plan.push(chroot(&format!(
-        "ln -sf /usr/share/zoneinfo/{} /etc/localtime && hwclock --systohc",
-        c.timezone
+        "ln -sf /usr/share/zoneinfo/{tz} /etc/localtime && hwclock --systohc {flag}",
+        tz = c.timezone,
+        flag = if c.rtc_utc { "--utc" } else { "--localtime" }
     )));
 
     // 6) Console keymap + a console font that covers EVERY language the
@@ -493,20 +620,23 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     //    with a TTY that could not draw its own text. The comment here used to
     //    claim ter-116n "covers Cyrillic/Latin"; it was never checked.
     //
-    //    LatArCyrHeb-16+ carries both (checked the same way, against the file
-    //    that ships in the image). It comes from `kbd`, which is in the base
-    //    package set, so it is there whether or not terminus-font is.
+    //    The font is the user's pick from the font screen, defaulting to
+    //    ter-v16n. Every option there was checked by reading its PSF Unicode
+    //    table: Ukrainian і ї є ґ, the Latin-1 accents, the arrows and the box
+    //    lines, all present. `ter-116n` — the old default — has the accents and
+    //    NOT ONE Cyrillic letter, and `UniCyr_8x16` is the exact mirror of that;
+    //    the "v" Terminus variants are the ones that carry everything.
     //    For Ukrainian-interface installs the console keymap is `ua-utf` from
     //    kbd: verified against its source, the PLAIN layer is Latin (so the
     //    initramfs LUKS prompt and commands type ASCII as usual) and Cyrillic
     //    sits on a locked group toggled by Right Ctrl / Right Alt
     //    (CtrlL_Lock/CtrlR_Lock on keycodes 97/100) — actual Ukrainian typing
     //    on the TTY instead of Latin-only, with zero passphrase risk.
-    let console_keymap = if c.lang == "uk" {
-        "ua-utf"
-    } else {
-        c.keymap.as_str()
-    };
+    // ONE rule, shared with the live console — see `keyboard::plan_keymap`.
+    // It used to be written out here only, and the live console loaded the raw
+    // `c.keymap` instead: a Ukrainian install typed its LUKS passphrase on one
+    // map and was asked for it at boot on another.
+    let console_keymap = crate::screens::keyboard::plan_keymap(&c.lang, &c.keymap);
     // Wrapper keymap with a STANDARD Backspace. Several stock maps (ua-utf
     // among them) put the BackSpace keysym (^H, 0x08) on keycode 14, while
     // us.map uses Delete (^?, 0x7f). crossterm-based TUIs — tuigreet, this
@@ -536,17 +666,41 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     // rather than writing a file that cannot load.
     plan.push(chroot(&format!(
         "km='{km}'; \
-         case \"$km\" in gb) km=uk ;; latam) km=la-latin1 ;; esac; \
+         case \"$km\" in {aliases}esac; \
          kmpath=$(find /usr/share/kbd/keymaps -name \"$km.map*\" 2>/dev/null | head -1); \
          [ -n \"$kmpath\" ] || kmpath=$(find /usr/share/kbd/keymaps -name 'us.map*' 2>/dev/null | head -1); \
          mkdir -p /etc/kbd; \
          printf '# Managed by the Artix installer - %s with a standard Backspace.\\ninclude \"%s\"\\nkeycode 14 = Delete Delete\\n' \
            \"$km\" \"$kmpath\" > /etc/kbd/artix-console.map",
-        km = console_keymap
+        km = console_keymap,
+        aliases = crate::screens::keyboard::alias_case_arms()
     )));
-    plan.push(chroot(
-        "printf 'KEYMAP=/etc/kbd/artix-console.map\\nFONT=LatArCyrHeb-16+\\n' > /etc/vconsole.conf",
-    ));
+    let font = if c.console_font.is_empty() {
+        "ter-v16n"
+    } else {
+        c.console_font.as_str()
+    };
+    // Three of the offered families are carried on the live image, not installed
+    // by a package (`kbd` and `terminus-font` are the only packages in Arch,
+    // Artix or Chaotic-AUR that ship console fonts at all). Naming one of those
+    // in the new system's vconsole.conf without carrying the FILE across would
+    // leave it asking for a font it does not have, and booting with the kernel
+    // default — the choice silently undone. So copy the file first, and only
+    // then name it. `cp` is given the live path because that is where the
+    // installer is running from; the destination is inside the target.
+    if let Some(file) = crate::screens::fontpick::vendored_file(font) {
+        plan.push(chroot("mkdir -p /usr/share/kbd/consolefonts"));
+        plan.push(act(
+            "cp",
+            &[
+                &format!("/usr/share/kbd/consolefonts/{file}"),
+                &format!("/mnt/usr/share/kbd/consolefonts/{file}"),
+            ],
+        ));
+    }
+    plan.push(chroot(&format!(
+        "printf 'KEYMAP=/etc/kbd/artix-console.map\\nFONT={font}\\n' > /etc/vconsole.conf"
+    )));
 
     // 6b) GRAPHICAL keyboard layout. Until now the keyboard step was decorative
     //     above the console: the chosen layouts lived in the config, were shown
@@ -565,7 +719,17 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     //     Electron apps read keycodes against us and misbehave without it.
     //     Appended LAST so it never displaces the user's own primary layout.
     let mut layouts: Vec<String> = c.xkb_layouts.clone();
-    if !layouts.iter().any(|l| l == "us") {
+    // ONLY WHEN THERE IS NO LATIN GROUP AT ALL. What those applications need is
+    // a Latin group to read keycodes against, and `gb` — or `de`, or any other
+    // Latin layout the user picked — already is one. Appending `us` regardless
+    // gave somebody who chose British English and Ukrainian THREE layouts, two
+    // of them English, and a Shift+Alt cycle that steps through a duplicate
+    // every time. Reported from a VM install, and it is exactly the kind of
+    // "helpful" extra that makes the result look broken.
+    if layouts
+        .iter()
+        .all(|l| crate::screens::keyboard::is_nonlatin(l))
+    {
         layouts.push("us".into());
     }
     let layout_csv = layouts.join(",");
@@ -586,6 +750,98 @@ pub fn build_plan(app: &App) -> Vec<Action> {
          || printf 'XKB_DEFAULT_LAYOUT={layout_csv}\\nXKB_DEFAULT_OPTIONS=grp:alt_shift_toggle\\n' \
               >> /etc/environment"
     )));
+
+    //     AND SDDM'S GREETER, which needs it a step earlier still.
+    //
+    //     The greeter reads the X server's XKB state when it starts, and on a
+    //     first boot that state is whatever the server came up with — so the
+    //     login screen showed a lone US flag and the other layouts only turned
+    //     up once something else had set them. Not fatal (the password still
+    //     types), but the person logging in should not have to poke at it.
+    //
+    //     Applied through DisplayCommand, which SDDM runs before the greeter.
+    //     The distribution's own Xsetup runs first when there is one, so this
+    //     adds to it rather than replacing it.
+    if c.display_manager.eq_ignore_ascii_case("sddm") {
+        plan.push(write_target_file(
+            "/mnt/etc/sddm/Xsetup-artix",
+            &format!(
+                "#!/bin/sh\n\
+                 # Managed by the Artix installer: give the greeter the same\n\
+                 # layouts the session will use, before it reads the XKB state.\n\
+                 [ -x /usr/share/sddm/scripts/Xsetup ] && /usr/share/sddm/scripts/Xsetup\n\
+                 if command -v setxkbmap >/dev/null 2>&1; then\n\
+                 \tsetxkbmap -layout '{layout_csv}' -option grp:alt_shift_toggle 2>/dev/null\n\
+                 fi\n\
+                 exit 0\n"
+            ),
+        ));
+        plan.push(chroot("chmod 0755 /etc/sddm/Xsetup-artix"));
+        plan.push(write_target_file(
+            "/mnt/etc/sddm.conf.d/10-artix-keyboard.conf",
+            "# Managed by the Artix installer.\n             [X11]\n             DisplayCommand=/etc/sddm/Xsetup-artix\n",
+        ));
+    }
+
+    //     AND A THIRD PLACE, because the GNOME-family desktops read NEITHER of
+    //     the two above.
+    //
+    //     Cinnamon and MATE set the layout themselves from gsettings, after X
+    //     has started — so xorg.conf.d is applied, then overwritten. The
+    //     symptom is exact and was reported that way: the layouts appear in the
+    //     display manager (which does read xorg.conf.d) and are gone inside the
+    //     session, where `setxkbmap -query` answers `us,us` — the fallback
+    //     cinnamon-settings-daemon uses when `sources` is empty, which is its
+    //     shipped default.
+    //
+    //     Both schema ids were read out of the packages themselves rather than
+    //     recalled: `org.cinnamon.desktop.input-sources` with `sources` of type
+    //     a(ss) (cinnamon-desktop), and `org.mate.peripherals-keyboard-xkb.kbd`
+    //     with `layouts` of type as (libmatekbd).
+    //
+    //     Written as a system-wide dconf default, so it is what a NEW user gets
+    //     and not something forced on a user who has since chosen otherwise.
+    //     Keys for a schema that is not installed are simply never read — dconf
+    //     compiles the database without consulting schemas — so this costs
+    //     nothing on the desktops it does not apply to.
+    let sources = layouts
+        .iter()
+        .map(|l| format!("('xkb','{l}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let quoted = layouts
+        .iter()
+        .map(|l| format!("'{l}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    plan.push(write_target_file(
+        "/mnt/etc/dconf/db/local.d/00-input-sources",
+        &format!(
+            "# Managed by the Artix installer: the keyboard layouts chosen during\n\
+             # installation, as the system-wide default for desktops that set the\n\
+             # layout from gsettings instead of reading xorg.conf.d.\n\
+             [org/cinnamon/desktop/input-sources]\n\
+             sources=[{sources}]\n\
+             xkb-options=['grp:alt_shift_toggle']\n\
+             \n\
+             [org/gnome/desktop/input-sources]\n\
+             sources=[{sources}]\n\
+             xkb-options=['grp:alt_shift_toggle']\n\
+             \n\
+             [org/mate/desktop/peripherals/keyboard/kbd]\n\
+             layouts=[{quoted}]\n"
+        ),
+    ));
+    //     The profile is what makes the database above be consulted at all:
+    //     without it dconf reads only the per-user store and the system default
+    //     is inert. Written only when absent, so a profile someone has edited
+    //     is left alone.
+    plan.push(chroot(
+        "mkdir -p /etc/dconf/profile && \
+         [ -f /etc/dconf/profile/user ] \
+         || printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user; \
+         command -v dconf >/dev/null 2>&1 && dconf update || true",
+    ));
 
     // 7) Hostname + hosts file. The Artix install guide requires /etc/hosts to
     //     carry the loopback entries AND a 127.0.1.1 line for the machine's own
@@ -713,6 +969,86 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     // The whole block is best-effort: a trailing `true` keeps a transient
     // network/keyserver failure from aborting the install (the user can redo it
     // later), and the append is guarded so a re-run never duplicates the stanza.
+    // AURIS — the Artix User Repository of Init Scripts.
+    //
+    // Not another software repository: it carries the s6/OpenRC/runit/dinit
+    // service files that upstream packages do not ship. On a distro defined by
+    // its init system, a package without a service file is a package that does
+    // not run, so this fills a gap Chaotic-AUR does not.
+    //
+    // The server URL is the one the Artix wiki documents, and it was checked
+    // against the live endpoint: `.../arch/$repo/$arch` resolves to
+    // `.../arch/auris/x86_64/auris.db` and returns the database. `SigLevel =
+    // Required` is kept as documented — an unsigned or untrusted package is
+    // then REFUSED rather than installed, which is the safe way to fail.
+    //
+    // THE KEY HAS TO BE IMPORTED FIRST, and this block did not do it. Adding a
+    // `SigLevel = Required` repository whose key is unknown does not disable
+    // that repository — it POISONS pacman: every later `-Sy` reports
+    //
+    //     error: auris: key "74E5…0B9F" is unknown
+    //     error: database 'auris' is not valid (invalid or corrupted database)
+    //
+    // and refuses to synchronise ANY database. The package phase then failed,
+    // retried, failed again, and the install died at `artix-chroot exited with
+    // code 1` — with the log blaming a signature, three steps away from the
+    // stanza that caused it. A repository is not "enabled" by writing its
+    // stanza; it is enabled by trusting its key.
+    //
+    // So this follows the four documented steps — fetch the key, read its
+    // fingerprint, add it, locally sign it — and only writes the stanza once
+    // they have all worked. The fingerprint is checked against the published
+    // one rather than trusted blindly: this is a repository that describes
+    // itself as the wild west, and a key served from a compromised endpoint is
+    // exactly what a pinned fingerprint is for. A key that does not match means
+    // AURIS stays off and the log says why, which is the failure worth having.
+    //
+    // And if any of it fails, the stanza is REMOVED again. That is the part
+    // that turns a failed optional extra back into a failed optional extra
+    // instead of a failed install.
+    //
+    // One chroot call for the whole thing: `/tmp` is a fresh tmpfs on every
+    // artix-chroot invocation, so the key file must be written and used inside
+    // the same call.
+    if c.auris {
+        plan.push(chroot(
+            "echo '>>> AURIS: checking server reachability (15s timeout)...'; \
+             if ! curl -fsS --connect-timeout 15 --max-time 40 \
+                 'https://auris.artixlinux.org/api/packages/auris/arch/auris/x86_64/auris.db' \
+                 -o /dev/null 2>&1; then \
+               echo '!!! AURIS server UNREACHABLE - skipping it. Install continues.'; \
+             else \
+               echo '>>> Fetching the AURIS signing key...'; \
+               if curl -fsS --connect-timeout 15 --max-time 40 \
+                    'https://auris.artixlinux.org/api/packages/auris/arch/repository.key' \
+                    -o /tmp/auris.key; then \
+                 fpr=$(gpg --show-keys --with-colons /tmp/auris.key 2>/dev/null \
+                       | awk -F: '/^fpr:/ {print $10; exit}'); \
+                 if [ \"$fpr\" != '74E5750C4A3C00F037070EF2357B525A97500B9F' ]; then \
+                   echo \"!!! AURIS key fingerprint is $fpr, not the published \
+74E5750C4A3C00F037070EF2357B525A97500B9F - NOT trusting it. AURIS stays off.\"; \
+                 elif pacman-key --add /tmp/auris.key && \
+                      pacman-key --lsign-key 74E5750C4A3C00F037070EF2357B525A97500B9F && \
+                      { grep -q '^\\[auris\\]' /etc/pacman.conf || \
+                        printf '\\n[auris]\\nSigLevel = Required\\nServer = https://auris.artixlinux.org/api/packages/auris/arch/$repo/$arch\\n' \
+                        >> /etc/pacman.conf; } && \
+                      echo '>>> Syncing package databases...' && \
+                      pacman -Sy --noconfirm; then \
+                   echo '>>> AURIS enabled.'; \
+                 else \
+                   echo '!!! AURIS setup failed - removing its repository so it cannot break the rest of the install.'; \
+                   sed -i '/^\\[auris\\]/,+2d' /etc/pacman.conf; \
+                   pacman -Sy --noconfirm || true; \
+                 fi; \
+               else \
+                 echo '!!! AURIS key could not be downloaded - AURIS stays off. Install continues.'; \
+               fi; \
+               rm -f /tmp/auris.key; \
+             fi; \
+             true",
+        ));
+    }
+
     if c.chaotic_aur {
         plan.push(chroot(
             // GUARD 1 — reachability gate. A quick HEAD with a hard
@@ -773,8 +1109,10 @@ pub fn build_plan(app: &App) -> Vec<Action> {
             let flag = if c.optimize_mirrors { "" } else { " --no-rank" };
             let combined = format!(
                 "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-                 sh /tmp/optmirrors.sh --chaotic{}",
-                MIRROR_OPTIMIZE_SCRIPT, flag
+                 sh /tmp/optmirrors.sh --chaotic --home-tz={tz}{}",
+                MIRROR_OPTIMIZE_SCRIPT,
+                flag,
+                tz = c.timezone
             );
             plan.push(chroot(&combined));
         }
@@ -794,9 +1132,11 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         let flag = if c.optimize_mirrors { "" } else { " --no-rank" };
         let combined = format!(
             "cat > /tmp/optmirrors.sh <<'MIRROPT_EOF'\n{}\nMIRROPT_EOF\n\
-             sh /tmp/optmirrors.sh --arch{}\n\
+             sh /tmp/optmirrors.sh --arch --home-tz={tz}{}\n\
              sh /tmp/optmirrors.sh --no-rank",
-            MIRROR_OPTIMIZE_SCRIPT, flag
+            MIRROR_OPTIMIZE_SCRIPT,
+            flag,
+            tz = c.timezone
         );
         plan.push(chroot(&combined));
     }
@@ -840,8 +1180,17 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     // desktop (so X11 apps run under it). Installed FIRST, as explicitly-named
     // targets, so the x11win-server virtual dep (pulled by SDDM and the
     // desktops) resolves to genuine X.Org and never XLibre (ABI conflicts).
-    let any_x11 = des.iter().any(|d| d.supports_x11());
-    let any_wayland = des.iter().any(|d| d.supports_wayland());
+    //
+    // Unless the user unticked "xorg" on the packages step. That marker is on by
+    // default; turning it off makes this block name NOTHING — no server, no xf86
+    // drivers, not even Xwayland. Naming a specific X server explicitly is what
+    // makes any replacement unusable: the two provide the same things and pacman
+    // cannot hold both. With the marker off the desktop's own dependency on
+    // x11win-server resolves to whatever is present, and whoever wants something
+    // else installs it themselves without a fight.
+    let want_xorg = c.extra_packages.iter().any(|x| x == "xorg");
+    let any_x11 = des.iter().any(|d| d.supports_x11()) && want_xorg;
+    let any_wayland = des.iter().any(|d| d.supports_wayland()) && want_xorg;
     if any_x11 || any_wayland {
         let mut xpkgs: Vec<&str> = Vec::new();
         if any_x11 {
@@ -893,6 +1242,7 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     plan_initramfs_luks(&mut plan, c, uefi, luks_pass);
 
     // 9d) NVIDIA modeset + btrfs snapshots. See plan_gpu_and_snapshots.
+    plan_memory_tuning(&mut plan, c);
     plan_gpu_and_snapshots(&mut plan, c);
 
     // 9e) Generate the initramfs for the installed kernel(s). mkinitcpio -P
@@ -942,9 +1292,82 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     plan_firewall(&mut plan, c);
 
     // 12) dinit services + AUR phase. See plan_services.
+    plan_polkit_agent(&mut plan, c);
     plan_services(&mut plan, c);
 
+    // 13) A record of how this system was actually laid out, for recovery.
+    plan_install_manifest(&mut plan, c);
+
     plan
+}
+
+/// Leave a description of this install where recovery can find it later.
+///
+/// WHY. Recovery has to be told what each partition is, and the person telling
+/// it is by definition having a bad day: their machine will not boot and they
+/// are reading a partition table they last thought about months ago. Guessing
+/// from size and filesystem gets the common cases right and the important ones
+/// wrong — this installer puts the ESP at /boot for an encrypted root (the
+/// kernels have to live outside the LUKS container), while every other layout
+/// on earth puts it at /boot/efi. A guess that picks the wrong one reports a
+/// missing kernel, a missing initramfs and a missing bootloader, all three
+/// false, and points at repairs that would make things worse.
+///
+/// So the install writes down what it did. Recovery mounts the root, reads this
+/// file, and knows the answer instead of inferring it.
+///
+/// It is generated ON THE TARGET at install time, not composed here, because
+/// the UUIDs are only real once the filesystems exist. Missing or unreadable is
+/// not an error anywhere: this is a hint for a later repair, never something an
+/// install depends on.
+///
+/// A SECOND COPY GOES ON THE ESP, and that copy is the one that does the work.
+/// The /etc one lives inside the root filesystem — which on an encrypted system
+/// means recovery must unlock and mount everything before it can read the file
+/// that was supposed to tell it what to mount. The ESP is vfat and unencrypted
+/// by definition, so it can be read before anything is unlocked, which is when
+/// the answer is actually needed.
+fn plan_install_manifest(plan: &mut Vec<Action>, c: &InstallConfig) {
+    let version = env!("CARGO_PKG_VERSION");
+    let scope = if c.encrypt_disk {
+        c.encrypt_scope.as_str()
+    } else {
+        "none"
+    };
+    // `|| true` on the whole body: a system that installed fine must not fail
+    // at the last step because a convenience file could not be written.
+    let script = format!(
+        "set -e; mkdir -p /etc/artix-tui; \
+         {{ \
+           echo '# Written by the Artix TUI installer. Read by its recovery'; \
+           echo '# mode to learn how this system is laid out. Safe to delete;'; \
+           echo '# recovery then falls back to guessing.'; \
+           echo \"version={version}\"; \
+           echo \"installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; \
+           echo \"hostname=$(cat /etc/hostname 2>/dev/null)\"; \
+           echo \"encrypt_scope={scope}\"; \
+           echo \"bootloader={bl}\"; \
+           for sp in $(blkid -t TYPE=swap -o device 2>/dev/null); do \
+             su=$(blkid -o value -s UUID \"$sp\" 2>/dev/null); \
+             [ -n \"$su\" ] && echo \"swap|$su|$sp\"; \
+           done; \
+           for m in / /boot /boot/efi /home; do \
+             src=$(findmnt -no SOURCE --target \"$m\" 2>/dev/null) || continue; \
+             [ \"$(findmnt -no TARGET --target \"$m\" 2>/dev/null)\" = \"$m\" ] || continue; \
+             uuid=$(findmnt -no UUID --target \"$m\" 2>/dev/null); \
+             fs=$(findmnt -no FSTYPE --target \"$m\" 2>/dev/null); \
+             echo \"mount|$m|$uuid|$fs|$src\"; \
+           done; \
+           awk '!/^#/ && NF>=2 {{print \"crypt|\" $1 \"|\" $2}}' /etc/crypttab 2>/dev/null; \
+         }} > /etc/artix-tui/install.conf; \
+         chmod 0644 /etc/artix-tui/install.conf; \
+         for esp in /boot /boot/efi; do \
+           [ \"$(findmnt -no FSTYPE --target \"$esp\" 2>/dev/null)\" = vfat ] || continue; \
+           cp /etc/artix-tui/install.conf \"$esp/artix-tui-layout.conf\" 2>/dev/null || true; \
+         done",
+        bl = c.bootloader.display_name(),
+    );
+    plan.push(chroot(&format!("{{ {script}; }} || true")));
 }
 
 /// Step 10: install and configure the chosen bootloader, and (EFISTUB only,
@@ -968,6 +1391,57 @@ pub fn build_plan(app: &App) -> Vec<Action> {
 /// files shipped by whatever packages ended up installed. Also runs the AUR
 /// phase (paru as the user) and verifies afterwards which AUR packages
 /// actually landed — a failed build is non-fatal but must not be silent.
+/// The polkit authentication agent's autostart entry.
+///
+/// `polkit-gnome` ships the agent binary and NO autostart file, so installing it
+/// changes nothing on its own. Without an agent running, polkit still decides
+/// policy but has no way to ask for a password: a graphical action that needs
+/// authorisation just does nothing at all. Nothing is logged, and anything run
+/// through doas or sudo in a terminal keeps working, because there the terminal
+/// does the asking — which is exactly how it was reported, as "some programs
+/// work and some silently don't".
+///
+/// `NotShowIn` rather than `OnlyShowIn`: Plasma, GNOME and LXQt each bring their
+/// own agent and a second one is noise, while a session this installer does not
+/// know the name of — Pinnacle, or anything added later — is far likelier to
+/// need one than not. Naming who does NOT need it is the list that stays right.
+fn plan_polkit_agent(plan: &mut Vec<Action>, c: &InstallConfig) {
+    // Asked of the package list itself rather than of a second list of names:
+    // add the agent to a desktop above and this follows, with nothing to keep
+    // in step by hand. `desktops` holds the enum's Debug names — the same shape
+    // the desktop screen writes.
+    // Only for desktops given polkit-gnome, which ships NO autostart file of
+    // its own. MATE is deliberately not among them: mate-polkit is its own
+    // agent and carries its own autostart entry, so writing one here would be
+    // a second, foreign copy of something the package already does.
+    let installs_agent = Desktop::ALL.iter().any(|d| {
+        c.desktops.iter().any(|s| *s == format!("{d:?}")) && d.packages().contains(&"polkit-gnome")
+    });
+    if !installs_agent {
+        return;
+    }
+    plan.push(write_target_file(
+        "/mnt/etc/xdg/autostart/polkit-gnome-authentication-agent-1.desktop",
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=PolicyKit Authentication Agent\n\
+         Comment=Asks for the password when something needs authorisation\n\
+         Exec=/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1\n\
+         Terminal=false\n\
+         NoDisplay=true\n\
+         # Written by the Artix installer: polkit-gnome ships no autostart file\n\
+         # of its own, and these sessions already have an agent.\n\
+         NotShowIn=GNOME;KDE;LXQt;\n\
+         # NO Autostart-Phase, and Notify=false. The GNOME-family session\n\
+         # manager WAITS for anything in the Initialization phase to register\n\
+         # itself over DBus, and polkit-gnome never does — so the session sat on\n\
+         # a black screen for the full 30-second timeout before carrying on\n\
+         # (the session log says it failed to register before timeout). Default\n\
+         # phase starts the agent without blocking the session on it.\n\
+         X-GNOME-Autostart-Notify=false\n",
+    ));
+}
+
 fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
     // 12) Enable all dinit services in the installed system. Add the chosen
     //      display manager's service, and the chosen seat manager service.
@@ -1008,6 +1482,11 @@ fn plan_services(plan: &mut Vec<Action>, c: &InstallConfig) {
     ));
     services.push("syslog-ng".into());
     services.push("cronie".into());
+    // earlyoom's service file is written by plan_memory_tuning; the loop below
+    // only links what exists, so this is harmless when it is off.
+    if c.earlyoom {
+        services.push("earlyoom".into());
+    }
     // NVIDIA: enable nvidia-persistenced (shipped by nvidia-utils-dinit) so the
     // driver keeps device state initialized — recommended for NVIDIA GPUs.
     if any_proprietary_nvidia(&c.gpu) {
@@ -1806,10 +2285,21 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
             // entirely. doas.conf MUST be chmod 0400 and root-owned or doas
             // refuses to run. Rule order: last match wins, so a single line
             // for the wheel group is all we need.
+            // GRAPHICAL PROGRAMS RUN AS ROOT NEED THE DISPLAY HANDED OVER.
+            //
+            // doas clears the environment, so `doas geany` lost DISPLAY and
+            // XAUTHORITY and died with "cannot open display" — which reads
+            // exactly like a broken polkit agent and got reported as one. It is
+            // not polkit: nothing in that path involves polkit at all.
+            //
+            // Only the four variables a GUI actually needs are passed, not the
+            // whole environment (`keepenv`): PATH and the loader variables
+            // staying under root's control is the point of using doas.
+            let keep = "setenv { DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR }";
             let rule = if c.passwordless_sudo {
-                "permit nopass :wheel"
+                format!("permit nopass {keep} :wheel")
             } else {
-                "permit persist :wheel"
+                format!("permit persist {keep} :wheel")
             };
             plan.push(write_target_file(
                 "/mnt/etc/doas.conf",
@@ -1832,6 +2322,19 @@ fn plan_accounts(plan: &mut Vec<Action>, c: &InstallConfig, des: &[Desktop]) {
         } else {
             plan.push(chroot(
                 "sed -i 's/^# *%wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers",
+            ));
+        }
+        // Same display hand-over as the doas rule above, for the same reason:
+        // sudo resets the environment too, so `sudo geany` cannot reach the X
+        // server and fails with "cannot open display". A dedicated drop-in
+        // rather than an edit to /etc/sudoers, so a package update to that file
+        // never silently drops it. visudo -cf validates before it is installed;
+        // a malformed sudoers file locks every user out of root.
+        if !c.use_doas {
+            plan.push(chroot(
+                "printf 'Defaults env_keep += \"DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR\"\n' \
+                 > /etc/sudoers.d/11-display && chmod 440 /etc/sudoers.d/11-display && \
+                 { visudo -cf /etc/sudoers.d/11-display >/dev/null 2>&1 || rm -f /etc/sudoers.d/11-display; }",
             ));
         }
         // With seatd the user must be in the `seat` group so a compositor (or
@@ -2481,6 +2984,36 @@ fn plan_initramfs_luks(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool, lu
 }
 
 /// Step 9 (tail): NVIDIA DRM modeset (needed by Wayland compositors) and the
+/// Memory tuning for machines short of it: zswap on the kernel command line,
+/// earlyoom as a dinit service.
+///
+/// zswap goes on the COMMAND LINE because it is built into the kernel rather
+/// than a module — there is nothing to modprobe, and it has to be configured
+/// before userspace exists.
+///
+/// earlyoom needs a service written by hand: the package ships a systemd unit
+/// and nothing else, so on a systemd-free system it installs and never runs.
+fn plan_memory_tuning(plan: &mut Vec<Action>, c: &InstallConfig) {
+    // No swap device, no zswap: it is a compressed cache in front of swap, so
+    // without one the kernel parameters would be written into a system where
+    // they can never do anything. The options screen hides the row in that case,
+    // but the flag can survive a layout being changed AFTER it was ticked — the
+    // sanitiser is here, where the plan is actually built.
+    if c.zswap && c.has_swap() {
+        let frag = crate::system::mem::zswap_cmdline(true, &c.zswap_compressor, c.zswap_percent);
+        plan.push(chroot(&format!(
+            "sed -i 's#^GRUB_CMDLINE_LINUX_DEFAULT=\"#&{} #' /etc/default/grub",
+            frag.trim_end()
+        )));
+    }
+    if c.earlyoom {
+        plan.push(write_target_file(
+            "/mnt/etc/dinit.d/earlyoom",
+            &crate::system::mem::earlyoom_service(c.earlyoom_percent),
+        ));
+    }
+}
+
 /// btrfs snapshot layout.
 fn plan_gpu_and_snapshots(plan: &mut Vec<Action>, c: &InstallConfig) {
     if any_proprietary_nvidia(&c.gpu) {
@@ -3308,6 +3841,285 @@ mod tests {
     // future refactor cannot quietly bring it back: the plan is pure data, so
     // an install can be inspected without touching a disk.
 
+    /// Every shell script the plan hands to `sh -c` actually PARSES.
+    ///
+    /// CI shellcheck covers `assets/sh/*.sh` because those are files. The chroot
+    /// scripts are Rust string literals, so nothing looked at them until they
+    /// ran on a stranger's disk halfway through an install — and a stray quote
+    /// there is a syntax error at the worst possible moment. `sh -n` parses
+    /// without executing, which is exactly the amount of checking a build can
+    /// safely do.
+    #[test]
+    fn every_inline_shell_script_parses() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut a = install_app();
+        // Turn on the optional blocks so their scripts are in the plan too.
+        a.config.auris = true;
+        a.config.chaotic_aur = true;
+        a.config.encrypt_disk = true;
+        a.config.luks_passphrase = "hunter2".into();
+        let plan = build_plan(&a);
+
+        let mut checked = 0;
+        for act in &plan {
+            // `sh -c <script>` and `artix-chroot /mnt sh -c <script>` alike.
+            let Some(i) = act.args.iter().position(|s| s == "-c") else {
+                continue;
+            };
+            let Some(script) = act.args.get(i + 1) else {
+                continue;
+            };
+            let mut child = Command::new("sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("sh is available");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(script.as_bytes())
+                .expect("write");
+            let out = child.wait_with_output().expect("sh -n finished");
+            assert!(
+                out.status.success(),
+                "a plan script does not parse:\n{}\n---\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "only {checked} scripts checked — did the plan shrink?"
+        );
+    }
+
+    /// Every tool the shipped documentation tells people to run is installed.
+    ///
+    /// The log guide says `less ~/installer.log`; `less` was not in the base
+    /// list, so a fresh system answered with "command not found". Advice that
+    /// does not work on the machine it was written for is worse than none.
+    #[test]
+    fn the_documentation_only_names_tools_that_are_installed() {
+        let a = install_app();
+        let pkgs = crate::system::install::packages::base_packages(&a.config);
+        for tool in ["less", "nano"] {
+            assert!(
+                pkgs.iter().any(|p| p == tool),
+                "the docs tell people to run `{tool}` and nothing installs it"
+            );
+        }
+    }
+
+    /// The chosen layouts reach the DESKTOP, not just the display manager.
+    ///
+    /// Cinnamon and MATE set the layout from gsettings after X has started, so
+    /// xorg.conf.d is applied and then overwritten. Reported exactly that way:
+    /// "I only saw the layouts in the display manager menu, never in the system
+    /// itself" — and `setxkbmap -query` in the session answered `us,us`, the
+    /// fallback used when `sources` is empty, which is its shipped default.
+    ///
+    /// Both schema ids were read out of the packages: `sources` of type a(ss)
+    /// in cinnamon-desktop, `layouts` of type as in libmatekbd.
+    #[test]
+    fn the_chosen_layouts_reach_a_gsettings_desktop_too() {
+        let mut a = install_app();
+        a.config.xkb_layouts = vec!["gb".into(), "ua".into()];
+        let t = plan_text(&build_plan(&a));
+
+        // The two places that were already written.
+        assert!(t.contains("00-keyboard.conf"), "no X11 config");
+        assert!(t.contains("XKB_DEFAULT_LAYOUT=gb,ua"), "no wlroots default");
+        // NO THIRD LAYOUT: `gb` is already a Latin group, so nothing needs
+        // appending, and appending anyway gave two English layouts to cycle.
+        assert!(
+            !t.contains("gb,ua,us"),
+            "a duplicate English layout was appended:\n{t}"
+        );
+
+        // And the third, which is the one the desktop actually reads.
+        assert!(
+            t.contains("[org/cinnamon/desktop/input-sources]")
+                && t.contains("sources=[('xkb','gb'),('xkb','ua')]"),
+            "Cinnamon gets no layout and will fall back to us"
+        );
+        assert!(
+            t.contains("[org/mate/desktop/peripherals/keyboard/kbd]")
+                && t.contains("layouts=['gb','ua']"),
+            "MATE gets no layout"
+        );
+        // A system default is inert unless the profile points at the database.
+        assert!(
+            t.contains("system-db:local"),
+            "the dconf profile is missing, so the default is never read"
+        );
+        assert!(t.contains("dconf update"), "the database is never compiled");
+    }
+
+    /// A desktop with no authentication agent gets one, AND an autostart entry
+    /// so it actually runs.
+    ///
+    /// polkit itself is pulled in by every desktop and works — but polkit only
+    /// DECIDES. Something has to ask for the password, and Cinnamon, XFCE, MATE
+    /// and LXDE ship nothing that does: a graphical action needing
+    /// authorisation then does nothing at all, silently, while the same thing
+    /// through doas in a terminal works. Reported from a real Cinnamon install.
+    ///
+    /// `polkit-gnome` also ships NO autostart file, so installing it alone
+    /// changes nothing — which is why the two halves are tested together.
+    ///
+    /// MATE is the exception and is checked here too: mate-polkit IS its own
+    /// agent and DOES carry its own autostart entry, so the requirement there
+    /// is the package alone, with no file written by us.
+    #[test]
+    fn a_desktop_without_an_agent_gets_one_and_it_autostarts() {
+        for de in ["Cinnamon", "Xfce4", "Mate", "Lxde"] {
+            let mut a = install_app();
+            a.config.desktops = vec![de.to_string()];
+            let t = plan_text(&build_plan(&a));
+            let native = de == "Mate";
+            let agent = if native {
+                "mate-polkit"
+            } else {
+                "polkit-gnome"
+            };
+            assert!(
+                t.contains(agent),
+                "{de}: no authentication agent is installed"
+            );
+            if native {
+                // Its own package autostarts it; a second file from us would be
+                // a foreign duplicate of something already there.
+                assert!(
+                    !t.contains("/etc/xdg/autostart/polkit-gnome-authentication-agent-1.desktop"),
+                    "{de}: writes an autostart file it does not need"
+                );
+                continue;
+            }
+            assert!(
+                // The plan carries the IN-CHROOT path, not the /mnt one.
+                t.contains("/etc/xdg/autostart/polkit-gnome-authentication-agent-1.desktop"),
+                "{de}: the agent is installed but never starts"
+            );
+            assert!(
+                t.contains("NotShowIn=GNOME;KDE;LXQt;"),
+                "{de}: nothing stops a second agent in the sessions that have one"
+            );
+        }
+
+        // Plasma has polkit-kde-agent, LXQt has lxqt-policykit, GNOME has one
+        // inside gnome-shell: a second agent there is noise, not a fix.
+        for de in ["KdePlasma", "Lxqt"] {
+            let mut a = install_app();
+            a.config.desktops = vec![de.to_string()];
+            let t = plan_text(&build_plan(&a));
+            assert!(
+                !t.contains("polkit-gnome-authentication-agent-1.desktop"),
+                "{de} already has an agent and got a second one"
+            );
+        }
+
+        // And a headless install gets neither.
+        let mut none = install_app();
+        none.config.desktops.clear();
+        assert!(!plan_text(&build_plan(&none)).contains("polkit-gnome"));
+    }
+
+    /// AURIS is a signed repository, and its key has to be TRUSTED before its
+    /// stanza is written.
+    ///
+    /// Writing `[auris]` with `SigLevel = Required` and no imported key does not
+    /// leave AURIS disabled — it stops pacman refreshing ANY database:
+    ///
+    ///     error: auris: key "74E5…0B9F" is unknown
+    ///     error: database 'auris' is not valid (invalid or corrupted database)
+    ///
+    /// The install then died three steps later, in the package phase, with a log
+    /// that blamed a signature. So: fetch the key, check it against the
+    /// published fingerprint, add it, locally sign it — and only then write the
+    /// stanza. If any of that fails the stanza is removed again, because an
+    /// optional extra that fails must stay optional.
+    #[test]
+    fn auris_trusts_its_key_before_it_writes_its_stanza() {
+        let mut a = install_app();
+        a.config.auris = true;
+        let t = plan_text(&build_plan(&a));
+        let block = t
+            .lines()
+            .find(|l| l.contains("AURIS: checking server reachability"))
+            .expect("the AURIS block is missing");
+
+        let key_at = block
+            .find("pacman-key --add")
+            .expect("the key is never added");
+        let sign_at = block
+            .find("pacman-key --lsign-key")
+            .expect("the key is never locally signed");
+        let stanza_at = block
+            .find("[auris]\\nSigLevel")
+            .expect("no stanza is written");
+        assert!(
+            key_at < stanza_at && sign_at < stanza_at,
+            "the [auris] stanza is written before its key is trusted"
+        );
+        assert!(
+            block.contains("74E5750C4A3C00F037070EF2357B525A97500B9F"),
+            "the published fingerprint is not checked"
+        );
+        assert!(
+            block.contains("sed -i '/^\\[auris\\]/,+2d' /etc/pacman.conf"),
+            "a failed setup leaves the repository behind to break the install"
+        );
+
+        // And nothing at all when it was not asked for.
+        let mut off = install_app();
+        off.config.auris = false;
+        assert!(!plan_text(&build_plan(&off)).contains("[auris]"));
+    }
+
+    /// en_US.UTF-8 is generated whatever the interface language is.
+    ///
+    /// Software that has no translation of its own falls back to it rather than
+    /// to C, and some builds assume it simply exists; on a system where it was
+    /// never generated those programs misbehave in ways that look like unrelated
+    /// bugs. LANG still follows the user's choice — this only adds a locale, it
+    /// does not pick one.
+    #[test]
+    fn en_us_is_always_generated_alongside_the_chosen_locale() {
+        for locale in ["uk_UA.UTF-8", "es_MX.UTF-8", "en_US.UTF-8"] {
+            let mut a = install_app();
+            a.config.locale = locale.into();
+            let t = plan_text(&build_plan(&a));
+            let line = t
+                .lines()
+                .find(|l| l.contains("/etc/locale.gen"))
+                .unwrap_or_else(|| panic!("{locale}: nothing writes locale.gen"));
+            assert!(
+                line.contains("'en_US.UTF-8'"),
+                "{locale}: en_US.UTF-8 is not generated"
+            );
+            assert!(
+                line.contains(&format!("'{locale}'")),
+                "{locale}: the chosen locale is not generated"
+            );
+            assert!(
+                line.contains(&format!("LANG={locale}")),
+                "{locale}: LANG is not the chosen locale"
+            );
+            // Appended only when absent, so a locale that IS en_US, or a re-run,
+            // does not stack duplicate lines.
+            assert!(
+                line.contains("grep -q"),
+                "{locale}: appends unconditionally"
+            );
+        }
+    }
+
     /// The shared log helper lands before anything sources it.
     ///
     /// The boot services stub `log`/`warn` out when the library is missing, so
@@ -3667,6 +4479,326 @@ mod tests {
     /// The ESP must mount at /mnt/boot/efi (kernels stay on the root fs at
     /// /boot) AND grub-install must point --efi-directory at /boot/efi to
     /// match, or GRUB writes its EFI files to the wrong place and won't boot.
+    /// Every install leaves a record of its own layout for recovery to read.
+    ///
+    /// Recovery otherwise has to guess what each partition is from its size and
+    /// filesystem, and the guess is wrong for the layout this very installer
+    /// produces: a root-scope encrypted system keeps its kernels on the ESP
+    /// mounted at /boot, while everything else on earth puts the ESP at
+    /// /boot/efi. That single wrong guess makes the diagnosis report a missing
+    /// kernel, initramfs and bootloader, none of it true.
+    ///
+    /// It is composed ON THE TARGET, because the UUIDs only exist once the
+    /// filesystems do, and it can never fail the install.
+    /// A plain data disk can be encrypted too, not only /home.
+    ///
+    /// Same chain, reached from two places: the checkbox on the additional-disks
+    /// screen in automatic mode, and `e` on a partition with the Data role in
+    /// the manual editor. Both write `ExtraDisk.encrypt`, so one test covers the
+    /// thing that actually matters — that the flag reaches a LUKS container and
+    /// an unlock that survives a reboot.
+    #[test]
+    fn an_extra_data_disk_can_be_encrypted() {
+        let mut a = install_app();
+        a.config.extra_disks = vec![crate::app::ExtraDisk {
+            disk: "/dev/vdc1".into(),
+            mountpoint: "/mnt/data".into(),
+            fs: "btrfs".into(),
+            format: true,
+            encrypt: true,
+            ..Default::default()
+        }];
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("cryptsetup -q luksFormat") && t.contains("/dev/vdc1"),
+            "the data disk becomes a LUKS container"
+        );
+        assert!(
+            t.contains("cryptsetup-keys.d/"),
+            "its key is placed where the boot can find it"
+        );
+        // An existing partition kept as-is is never encrypted: that would mean
+        // destroying the data it was chosen for.
+        let mut b = install_app();
+        b.config.extra_disks = vec![crate::app::ExtraDisk {
+            disk: "/dev/vdc2".into(),
+            mountpoint: "/mnt/keep".into(),
+            fs: "ntfs".into(),
+            format: false,
+            encrypt: true,
+            ..Default::default()
+        }];
+        assert!(
+            !plan_text(&build_plan(&b)).contains("luksFormat /dev/vdc2"),
+            "a partition kept as-is is never reformatted"
+        );
+    }
+
+    /// A /home ON ITS OWN DISK CAN BE ENCRYPTED EVEN IN DUAL BOOT.
+    ///
+    /// The shared disk is never encrypted and that stays. But a second drive
+    /// holding nothing but the /home about to be created is entirely ours, and
+    /// refusing there protected nobody while costing the user the one partition
+    /// they most want protected. The editor additionally checks the real scan
+    /// for foreign partitions on that drive; the plan cannot see a scan, so it
+    /// checks the narrower thing it can: that the disk is named and is not the
+    /// root's.
+    #[test]
+    fn a_separate_home_disk_can_be_encrypted_alongside_another_os() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false; // sharing a disk with another OS
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_disk = "/dev/vdb".into();
+        a.config.manual_home_fs = "ext4".into();
+        a.config.manual_home_encrypt = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("cryptsetup -q luksFormat") && t.contains("/dev/vdb1"),
+            "a /home on its own disk is encrypted"
+        );
+        // And the shared disk itself is still never touched by LUKS.
+        assert!(
+            !t.contains("luksFormat /dev/vda"),
+            "the disk shared with another OS must never be encrypted"
+        );
+    }
+
+    /// The same disk carrying both root and /home is the SHARED disk, and it
+    /// keeps the old rule: no encryption at all.
+    #[test]
+    fn home_on_the_shared_disk_is_still_never_encrypted() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_home = "/dev/vda6".into();
+        a.config.manual_home_disk = "/dev/vda".into();
+        a.config.manual_home_encrypt = true;
+        assert!(
+            !plan_text(&build_plan(&a)).contains("luksFormat /dev/vda6"),
+            "a /home on the shared disk is never encrypted"
+        );
+    }
+
+    /// A data partition can be encrypted wherever it lives: only that ONE
+    /// partition is formatted, so a drive shared with another system is not put
+    /// at risk by it. This is the scratch/storage case — /mnt/test1 or a folder
+    /// under the user's home — and it needs no disk-exclusivity rule.
+    #[test]
+    fn a_data_partition_is_encryptable_even_beside_another_os() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false;
+        a.config.manual_disk = "/dev/vda".into();
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.extra_disks = vec![crate::app::ExtraDisk {
+            disk: "/dev/vdc1".into(),
+            mountpoint: "/mnt/test1".into(),
+            fs: "ext4".into(),
+            format: true,
+            encrypt: true,
+            ..Default::default()
+        }];
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("cryptsetup -q luksFormat") && t.contains("/dev/vdc1"),
+            "the scratch disk is encrypted"
+        );
+        assert!(
+            !t.contains("luksFormat /dev/vda"),
+            "and nothing else on the machine is"
+        );
+    }
+
+    /// /home CAN BE ENCRYPTED IN THE MANUAL EDITOR.
+    ///
+    /// It could not, and the reason was structural rather than deliberate: the
+    /// slot is a role while the crypto chain lived on the extra-disk side, so
+    /// the one partition people most expect to encrypt after root simply had no
+    /// option for it. Rather than grow a second LUKS path, the sanitiser hands
+    /// the slot to the machinery that already does this — and that machinery is
+    /// what these assertions look for.
+    #[test]
+    fn a_manual_home_can_be_encrypted_through_the_tested_chain() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = true;
+        a.config.manual_root = "/dev/vda2".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_home = "/dev/vdb1".into();
+        a.config.manual_home_fs = "ext4".into();
+        a.config.manual_home_encrypt = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("cryptsetup -q luksFormat") && t.contains("/dev/vdb1"),
+            "the /home partition is turned into a LUKS container"
+        );
+        assert!(
+            t.contains("/etc/cryptsetup-keys.d/crypt_home.key")
+                && t.contains("/etc/dinit.d/crypt-home"),
+            "and it opens itself on every boot from the key on the root"
+        );
+        // mkfs runs on the OPENED mapper, never on the raw partition — doing
+        // both would destroy the container that was just created.
+        assert!(
+            t.contains("/dev/mapper/crypt_home"),
+            "the filesystem goes inside the container"
+        );
+        // The plain path must NOT also format it: two mkfs on one partition
+        // would destroy the container that was just made.
+        assert!(
+            !t.contains("mkfs.ext4 -F /dev/vdb1"),
+            "the unencrypted path is skipped for it"
+        );
+    }
+
+    /// Encryption stays off on a disk shared with another OS — the same rule
+    /// the root already follows there. A /home flag that survived that branch
+    /// would quietly re-enable what the mode switch turns off.
+    #[test]
+    fn a_shared_disk_never_encrypts_home() {
+        let mut a = install_app();
+        a.config.partition_mode = PartitionMode::Manual;
+        a.config.manual_solo = false;
+        a.config.manual_root = "/dev/vda5".into();
+        a.config.manual_root_fs = "ext4".into();
+        a.config.manual_home = "/dev/vda6".into();
+        a.config.manual_home_encrypt = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("cryptsetup luksFormat /dev/vda6"),
+            "a shared disk is never encrypted"
+        );
+    }
+
+    /// Each desktop gets ITS OWN authentication agent where one exists.
+    ///
+    /// MATE was handed polkit-gnome, which is both a foreign agent and one that
+    /// ships no autostart entry — so the installer wrote its own on top. But
+    /// mate-polkit exists in the repos and carries
+    /// etc/xdg/autostart/polkit-mate-authentication-agent-1.desktop inside the
+    /// package. Verified with `pacman -F`, not assumed.
+    #[test]
+    fn a_desktop_with_its_own_polkit_agent_is_given_that_one() {
+        assert!(
+            Desktop::Mate.packages().contains(&"mate-polkit"),
+            "MATE gets mate-polkit"
+        );
+        assert!(
+            !Desktop::Mate.packages().contains(&"polkit-gnome"),
+            "and not the GNOME one"
+        );
+        // And no hand-written autostart file for it: the package has one.
+        let mut a = install_app();
+        a.config.desktops = vec!["Mate".into()];
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("polkit-gnome-authentication-agent-1.desktop"),
+            "MATE needs no autostart file from us"
+        );
+        // Cinnamon genuinely has none of its own — it depends on `polkit`, the
+        // daemon, and nothing that asks — so it still gets one.
+        let mut b = install_app();
+        b.config.desktops = vec!["Cinnamon".into()];
+        assert!(plan_text(&build_plan(&b)).contains("polkit-gnome-authentication-agent-1.desktop"));
+    }
+
+    /// The polkit agent must not hold the session on a black screen.
+    ///
+    /// The GNOME-family session manager WAITS for autostart entries in the
+    /// Initialization phase to register themselves over DBus, and polkit-gnome
+    /// never registers. With that phase set, Cinnamon sat on a black screen for
+    /// the full 30-second timeout on every single login before continuing —
+    /// "failed to register before timeout" in the session log, and a noticeably
+    /// slower boot reported by the person using it.
+    #[test]
+    fn the_polkit_agent_does_not_stall_the_session() {
+        let mut a = install_app();
+        a.config.desktops = vec!["Cinnamon".into()];
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("polkit-gnome-authentication-agent-1.desktop"),
+            "Cinnamon still gets an agent"
+        );
+        assert!(
+            !t.contains("X-GNOME-Autostart-Phase=Initialization"),
+            "the phase the session manager blocks on is not set"
+        );
+        assert!(
+            t.contains("X-GNOME-Autostart-Notify=false"),
+            "and the session is told explicitly not to wait for a registration"
+        );
+    }
+
+    /// A graphical program run as root must be able to reach the display.
+    ///
+    /// Both doas and sudo clear the environment, so `sudo geany` died with
+    /// "cannot open display" — which looks exactly like a missing polkit agent
+    /// and was reported as one, though polkit is not involved anywhere in that
+    /// path. Only the four variables a GUI needs are passed; handing over the
+    /// whole environment would give away the reason for using doas at all.
+    #[test]
+    fn a_graphical_program_run_as_root_can_reach_the_display() {
+        for doas in [true, false] {
+            let mut a = install_app();
+            a.config.use_doas = doas;
+            let t = plan_text(&build_plan(&a));
+            assert!(
+                t.contains("DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_RUNTIME_DIR"),
+                "display variables survive escalation (use_doas={doas})"
+            );
+            if doas {
+                assert!(t.contains("setenv {"), "doas passes them with setenv");
+                assert!(
+                    !t.contains("keepenv"),
+                    "the whole environment is NOT handed to root"
+                );
+            } else {
+                assert!(t.contains("env_keep"), "sudo passes them with env_keep");
+                assert!(
+                    t.contains("visudo -cf"),
+                    "a sudoers drop-in is validated before it can lock anyone out"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_install_records_its_layout_for_recovery() {
+        let mut a = install_app();
+        a.config.encrypt_disk = true;
+        a.config.encrypt_scope = "root".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("/etc/artix-tui/install.conf"),
+            "the manifest is written"
+        );
+        assert!(
+            t.contains("encrypt_scope=root"),
+            "it records how the disk is encrypted"
+        );
+        assert!(
+            t.contains("findmnt -no SOURCE --target"),
+            "the mount table is read on the target, not guessed here"
+        );
+        // A convenience file must never be able to fail a finished install.
+        let line = t
+            .lines()
+            .find(|l| l.contains("/etc/artix-tui/install.conf"))
+            .expect("the manifest step is in the plan");
+        assert!(
+            line.contains("|| true"),
+            "the manifest step cannot fail the install: {line}"
+        );
+    }
+
     #[test]
     fn manual_esp_at_boot_efi_mounts_and_installs_grub_there() {
         let mut a = install_app();
@@ -3885,6 +5017,43 @@ mod tests {
         }
     }
 
+    /// Mirrors are ranked by MEASURED DOWNLOAD SPEED, and the user's own country
+    /// leads the list.
+    ///
+    /// The first version timed a request for the small repo database, which
+    /// measures how fast a server says hello — not how fast it sends anything.
+    /// Measured on a real run: `mirror.rabisu.com` answered faster than every
+    /// other German mirror and then delivered essentially nothing, while a
+    /// mirror listed under the United States turned out to be a CDN serving from
+    /// a European node at 3.1 MiB/s. Ranking on the handshake put the useless one
+    /// first and looked, to the user, like the list was sorted at random.
+    #[test]
+    fn mirrors_are_ranked_by_real_speed_and_home_country_leads() {
+        let sh = MIRROR_OPTIMIZE_SCRIPT;
+        assert!(
+            sh.contains("speed_download"),
+            "ranking still measures the handshake instead of the download"
+        );
+        assert!(
+            sh.contains("zone.tab") && sh.contains("iso3166.tab"),
+            "the home country must come from tzdata's own tables, not a list of \
+             our own that would go stale"
+        );
+
+        // The timezone the user picked has to actually REACH the script — all
+        // three invocations, since the Arch and Chaotic lists are rebuilt in the
+        // chroot by separate calls.
+        let mut a = install_app();
+        a.config.timezone = "Europe/Kyiv".into();
+        a.config.chaotic_aur = true; // the third rebuild only exists with it on
+        let t = plan_text(&build_plan(&a));
+        assert_eq!(
+            t.matches("--home-tz=Europe/Kyiv").count(),
+            3,
+            "every mirrorlist rebuild needs the home country, not just one:\n{t}"
+        );
+    }
+
     /// The rebuilt mirrorlist keeps its COUNTRY headings.
     ///
     /// This is the point of the rewrite and it has been asked for repeatedly:
@@ -3904,12 +5073,14 @@ mod tests {
             "candidates are collected without their country — the headings \
              cannot be rebuilt from a bare URL"
         );
-        // The heading is printed per group, for both the live and the dead list.
+        // The heading is printed per group, in three places: the user's own
+        // country (printed first, ahead of the loop), the remaining countries,
+        // and the commented-out dead list.
         assert_eq!(
             sh.matches("## %s").count(),
-            2,
-            "country headings are not written for both the active and the \
-             commented-out sections"
+            3,
+            "country headings are not written for the home block, the rest and \
+             the commented-out section"
         );
         assert!(
             sh.contains("#Server = %s"),
@@ -3932,6 +5103,41 @@ mod tests {
     ///
     /// Written in two places because nothing reads both — xorg.conf.d for X11
     /// and Xwayland, XKB_DEFAULT_* for wlroots compositors, which never look at
+    /// A LATIN GROUP IS ADDED ONLY WHEN THERE IS NONE.
+    ///
+    /// Some applications (native Steam, a few Electron ones) read keycodes
+    /// against a Latin group and misbehave without one, so a purely Cyrillic
+    /// choice still gets `us` appended. But `gb` — or any other Latin layout —
+    /// already IS such a group, and appending `us` beside it gave a VM install
+    /// three layouts, two of them English, with Shift+Alt cycling through a
+    /// duplicate every time.
+    #[test]
+    fn a_latin_layout_is_only_added_when_the_user_has_none() {
+        let only_cyrillic = {
+            let mut a = install_app();
+            a.config.xkb_layouts = vec!["ua".into()];
+            plan_text(&build_plan(&a))
+        };
+        assert!(
+            only_cyrillic.contains("XKB_DEFAULT_LAYOUT=ua,us"),
+            "a Cyrillic-only choice was left with no Latin group at all"
+        );
+
+        for latin in ["gb", "de", "fr"] {
+            let mut a = install_app();
+            a.config.xkb_layouts = vec![latin.into(), "ua".into()];
+            let t = plan_text(&build_plan(&a));
+            assert!(
+                t.contains(&format!("XKB_DEFAULT_LAYOUT={latin},ua")),
+                "the chosen layouts are not written in order"
+            );
+            assert!(
+                !t.contains(&format!("{latin},ua,us")),
+                "`us` was appended even though {latin} is already a Latin group"
+            );
+        }
+    }
+
     /// xorg.conf.d and cannot ask logind on a dinit system.
     #[test]
     fn the_chosen_keyboard_layouts_reach_the_installed_system() {
@@ -3947,8 +5153,14 @@ mod tests {
             "Wayland compositors get no layout: they do not read xorg.conf.d"
         );
         assert!(
-            t.contains("ua,gb,us"),
+            t.contains("ua,gb"),
             "the picked layouts are not written in order:\n{t}"
+        );
+        // NO THIRD LAYOUT. `gb` is already a Latin group, so force-appending
+        // `us` only gave the user two English layouts to cycle through.
+        assert!(
+            !t.contains("ua,gb,us"),
+            "a duplicate English layout was appended anyway:\n{t}"
         );
     }
 
@@ -3987,6 +5199,131 @@ mod tests {
         }
     }
 
+    /// A font that came with the ISO rather than with a package must be COPIED
+    /// into the target, not merely named in its vconsole.conf.
+    ///
+    /// Spleen, cnxt and Solarize are not in any repository — they are carried on
+    /// the live image. Writing `FONT=spleen-16x32` into a system that has no such
+    /// file leaves it booting with the kernel default, so the whole point of
+    /// choosing a font is quietly lost the first time the machine restarts.
+    #[test]
+    fn a_font_carried_on_the_iso_is_copied_into_the_new_system() {
+        let carried = crate::screens::fontpick::default_font();
+        let mut a = install_app();
+        a.config.console_font = carried.into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains(&format!(
+                "cp /usr/share/kbd/consolefonts/{carried}.psfu.gz \
+                 /mnt/usr/share/kbd/consolefonts/{carried}.psfu.gz"
+            )),
+            "the vendored font was named but never carried across:\n{t}"
+        );
+        assert!(t.contains(&format!("FONT={carried}")));
+
+        // A packaged font is already in the target: copying it would only risk
+        // shadowing the package's own file.
+        let mut a = install_app();
+        a.config.console_font = "ter-v16n".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("cp /usr/share/kbd/consolefonts/ter-v16n"),
+            "a packaged font must not be copied over the package's own copy:\n{t}"
+        );
+    }
+
+    /// The font chosen on the font screen is the one the system boots with.
+    ///
+    /// A picker that changes only the installer's own console and forgets to
+    /// write the choice out would be a cruel joke: you would spend a minute
+    /// finding a readable font and then boot into the default.
+    #[test]
+    fn the_chosen_console_font_reaches_the_installed_system() {
+        let mut a = install_app();
+        a.config.console_font = "ter-v24b".into();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("FONT=ter-v24b"),
+            "the picked font never reached /etc/vconsole.conf:\n{t}"
+        );
+        // Empty config must not write "FONT=" with nothing after it.
+        a.config.console_font = String::new();
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("FONT=ter-v16n"),
+            "an empty choice did not fall back to the verified default"
+        );
+    }
+
+    /// The provider pin is WRITTEN with our X set and STRIPPED without it.
+    ///
+    /// It is not a policy line: Artix's default provider for xorg-server gets
+    /// pulled in even when xorg-server is named explicitly, and the two cannot
+    /// coexist, so without the pin the transaction breaks. That makes it
+    /// mandatory in the default path — and wrong to leave behind in the other
+    /// one, where it would produce a system that can satisfy x11win-server from
+    /// nowhere at all. Merely not writing it is not enough: `basestrap -C`
+    /// hands the live config to the transaction, so the lines can arrive on
+    /// their own and have to be removed.
+    #[test]
+    fn the_provider_pin_follows_the_xorg_choice() {
+        let mut a = install_app();
+        a.config.desktops = vec![format!("{:?}", crate::app::Desktop::Xfce4)];
+
+        a.config.extra_packages = vec!["xorg".into()];
+        let on = plan_text(&build_plan(&a));
+        assert!(
+            on.contains("IgnorePkg = xlibre-*") && on.contains("IgnoreGroup = xlibre"),
+            "the pin is missing — the install would break on the provider"
+        );
+
+        a.config.extra_packages = vec![];
+        let off = plan_text(&build_plan(&a));
+        assert!(
+            off.contains("IgnorePkg[[:space:]]*=[[:space:]]*xlibre"),
+            "nothing strips the pin from the target's pacman.conf:\n{off}"
+        );
+        assert!(
+            !off.contains("print \"IgnorePkg = xlibre-*\""),
+            "the pin is still being written while no X set is installed"
+        );
+    }
+
+    /// Unticking "xorg" leaves the X server slot free.
+    ///
+    /// Naming one X server explicitly is precisely what makes every alternative
+    /// uninstallable — they provide the same things and pacman will not hold
+    /// two. With the marker off the plan must name NO X package at all, so the
+    /// desktop's own x11win-server dependency resolves to whatever the user put
+    /// there, and the provider pin is not written into the installed system
+    /// either. And the word "xorg" itself must never reach pacman: in Artix it
+    /// is a group, not a package.
+    #[test]
+    fn unticking_xorg_names_no_x_package_at_all() {
+        let mut a = install_app();
+        a.config.desktops = vec![format!("{:?}", crate::app::Desktop::Xfce4)];
+
+        // Default: the curated X.Org set is named explicitly.
+        a.config.extra_packages = vec!["xorg".into()];
+        let on = plan_text(&build_plan(&a));
+        assert!(on.contains("xorg-server"), "the X.Org set is not installed");
+
+        // Unticked: nothing X-shaped is named, and the marker itself is not
+        // handed to pacman either.
+        a.config.extra_packages = vec![];
+        let off = plan_text(&build_plan(&a));
+        for named in ["xorg-server", "xf86-video-vesa", "xorg-xwayland"] {
+            assert!(
+                !off.contains(named),
+                "{named} is still named — a replacement server would conflict"
+            );
+        }
+        assert!(
+            !off.split_whitespace().any(|w| w == "xorg"),
+            "the word \"xorg\" reached pacman; in Artix that is a group"
+        );
+    }
+
     /// The console font must carry EVERY script the installer speaks.
     ///
     /// This was checked by reading the PSF Unicode tables of the fonts that
@@ -4002,13 +5339,96 @@ mod tests {
     #[test]
     fn the_console_font_covers_every_language_the_installer_speaks() {
         let t = plan_text(&build_plan(&install_app()));
+        // Whatever the chooser calls the default is what a plain install writes
+        // out. Naming a font here instead pinned the OLD default and hid the
+        // fact that the config and the chooser had drifted to different fonts.
+        let want = crate::screens::fontpick::default_font();
         assert!(
-            t.contains("FONT=LatArCyrHeb-16+"),
-            "the console font is not one that carries both Cyrillic and Latin-1"
+            t.contains(&format!("FONT={want}")),
+            "a plain install does not write the default font ({want}):\n{t}"
         );
         assert!(
             !t.contains("FONT=ter-116n"),
             "back on ter-116n, which has no Cyrillic at all"
+        );
+        // The default is carried on the ISO, so it must also be COPIED across —
+        // naming a font the new system does not have leaves it on the kernel
+        // default, which is the whole point of choosing one.
+        if crate::screens::fontpick::vendored_file(want).is_some() {
+            assert!(
+                t.contains(&format!("consolefonts/{want}.psfu.gz")),
+                "the default font is carried on the ISO but never copied into \
+                 the installed system:\n{t}"
+            );
+        }
+    }
+
+    /// Memory tuning reaches the installed system, and stays out of it when off.
+    ///
+    /// zswap is built INTO the kernel, so there is no module to configure — it
+    /// has to be on the command line or it does nothing at all. earlyoom ships
+    /// only a systemd unit, so on a systemd-free system the package alone is
+    /// inert; the service has to be written.
+    #[test]
+    fn memory_tuning_reaches_the_installed_system() {
+        let mut a = install_app();
+        a.config.zswap = true;
+        a.config.zswap_compressor = "lzo-rle".into();
+        a.config.zswap_percent = 25;
+        a.config.earlyoom = true;
+        a.config.earlyoom_percent = 8;
+        let t = plan_text(&build_plan(&a));
+
+        assert!(
+            t.contains("zswap.enabled=1") && t.contains("zswap.compressor=lzo-rle"),
+            "zswap never reached the kernel command line:\n{t}"
+        );
+        assert!(t.contains("zswap.max_pool_percent=25"));
+        assert!(
+            t.contains("/etc/dinit.d/earlyoom"),
+            "earlyoom was installed but never given a service to run from:\n{t}"
+        );
+        assert!(
+            t.contains("earlyoom -m 8 -s 8"),
+            "the free-memory threshold did not reach the service:\n{t}"
+        );
+
+        // Off: nothing at all, not a disabled setting.
+        let t = plan_text(&build_plan(&install_app()));
+        assert!(
+            !t.contains("zswap"),
+            "zswap appears in a plan that never asked for it"
+        );
+        assert!(
+            !t.contains("earlyoom"),
+            "earlyoom appears in a plan that never asked for it"
+        );
+    }
+
+    /// The hardware clock is written EXPLICITLY, and follows the user's choice.
+    ///
+    /// `hwclock --systohc` on its own means UTC. That is right for a Linux-only
+    /// machine and wrong beside Windows, which keeps the RTC in local time: the
+    /// two then correct each other on every boot and the clock walks by the
+    /// timezone offset. The GRUB menu asked this as `utc=` and that menu is now
+    /// hidden, so the installer has to ask it instead.
+    #[test]
+    fn the_hardware_clock_follows_the_choice_and_says_which() {
+        let mut a = install_app();
+        a.config.rtc_utc = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("hwclock --systohc --utc"),
+            "UTC was left to hwclock's default instead of being written down:\n{t}"
+        );
+
+        let mut a = install_app();
+        a.config.rtc_utc = false;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("hwclock --systohc --localtime"),
+            "a local-time clock was still written as UTC — the case this exists \
+             for is exactly the machine that also runs Windows:\n{t}"
         );
     }
 

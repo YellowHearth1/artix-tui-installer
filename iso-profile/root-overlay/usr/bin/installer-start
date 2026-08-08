@@ -1,0 +1,28 @@
+#!/bin/sh
+# Set the console font, then launch the installer.
+#
+# `tui-16b` is Terminus Bold at 8x16 with three glyphs added — `▀ ▄ ▌`, the
+# half blocks the donation QR code is drawn from. It is carried on this image
+# (usr/share/kbd/consolefonts), not installed by a package, and it is renamed
+# because Terminus is OFL-1.1 with a Reserved Font Name; the licence and the
+# provenance travel with it in usr/share/licenses/artix-tui-consolefonts.
+#
+# Why this one and not a packaged font: the interface needs Ukrainian і ї є ґ,
+# the Latin-1 accents Spanish needs, the arrows in every key hint AND the half
+# blocks, all at once. Of the 362 console fonts `kbd` and `terminus-font`
+# install, not one has all of it — checked by reading their PSF Unicode tables,
+# not assumed. The two fonts used here before were each missing half of it:
+# UniCyr_8x16 had Cyrillic and not one Spanish accent, ter-116n the reverse.
+#
+# The fallbacks are packaged fonts, in descending order of how much they get
+# right, so a broken or half-built image still starts something legible rather
+# than a console full of blanks.
+#
+# The user can change it from the mode menu -> "Choose console font", which
+# previews live and writes the pick into the installed system.
+setfont tui-16b 2>/dev/null \
+    || setfont ter-v16b 2>/dev/null \
+    || setfont ter-v16n 2>/dev/null \
+    || setfont LatGrkCyr-8x16 2>/dev/null \
+    || true
+exec /usr/bin/artix-tui-installer

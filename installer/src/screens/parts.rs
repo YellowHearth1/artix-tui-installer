@@ -349,6 +349,65 @@ fn set_data_mount(app: &mut App, dev: &str, mountpoint: &str) {
     });
 }
 
+/// Is this data partition set to be LUKS-encrypted?
+/// May the manual /home be encrypted on a disk SHARED with another OS?
+///
+/// Only when /home sits on a disk of its own. In dual boot the root disk is
+/// shared and stays untouched by LUKS (that restriction is deliberate and
+/// unchanged), but a second drive that holds nothing except the /home about to
+/// be created is entirely ours, and refusing to encrypt it protects nobody.
+///
+/// "Nothing except" is checked against the SCAN, not against intent: a disk
+/// carrying somebody else's partitions is not ours to encrypt, even if the
+/// only thing we plan to write there is one new /home. Being wrong in that
+/// direction destroys data that was never ours.
+pub(crate) fn home_disk_is_exclusively_ours(app: &App) -> bool {
+    let c = &app.config;
+    let home_disk = if !c.manual_home_disk.is_empty() {
+        c.manual_home_disk.clone()
+    } else {
+        return false;
+    };
+    // The root's disk is the shared one by definition here.
+    let root_disk = planned_disk_of(c, ROLE_ROOT, &c.manual_root);
+    if home_disk.is_empty() || home_disk == root_disk {
+        return false;
+    }
+    // Any partition already on that disk that we are not deleting means the
+    // drive belongs to somebody as well as us.
+    !app.parts_list
+        .iter()
+        .any(|p| p.parent == home_disk && !c.manual_deleted.iter().any(|d| d.path == p.path))
+}
+
+fn data_is_encrypted(c: &InstallConfig, dev: &str) -> bool {
+    c.extra_disks
+        .iter()
+        .any(|e| e.disk == dev && e.encrypt && e.format)
+}
+
+/// Turn encryption on or off for a data partition.
+///
+/// Only for one being FORMATTED: encrypting a partition whose contents are being
+/// kept means destroying those contents, and keeping them is the reason it is
+/// not being formatted. Returns whether anything changed, so the caller can say
+/// why when it did not.
+///
+/// The plan side of this already existed and is exercised by the extra-disks
+/// step — `ExtraDisk::encrypt` carries it through mkfs, crypttab and the keyfile
+/// that unlocks it at boot. What was missing was any way to ASK for it from the
+/// manual editor, and once the extra-disks step stopped appearing in manual mode
+/// there was no way to reach it at all.
+pub(crate) fn toggle_data_encryption(c: &mut InstallConfig, dev: &str) -> bool {
+    if let Some(e) = c.extra_disks.iter_mut().find(|e| e.disk == dev) {
+        if e.format {
+            e.encrypt = !e.encrypt;
+            return true;
+        }
+    }
+    false
+}
+
 fn clear_data_mount(c: &mut InstallConfig, dev: &str) {
     c.extra_disks.retain(|e| e.disk != dev);
 }
@@ -446,11 +505,65 @@ pub(crate) fn rest_bytes(app: &App, disk: &str) -> u64 {
         .saturating_sub(2 * 1024 * 1024)
 }
 
+/// The planned slot on `disk` that takes whatever is left, if there is one.
+///
+/// It is the reason a disk can be full while the screen shows plain numbers:
+/// such a slot's size is RESOLVED for display, not fixed, so anything else
+/// planned on the same disk comes out of it — and used to do so in silence.
+/// Reported from QEMU: creating a 4 GiB swap turned a 29 GiB root into 25 GiB
+/// with nothing said, and the row next to it already read "space is allocated".
+fn rest_slot_on(c: &InstallConfig, disk: &str) -> Option<String> {
+    planned_slots(c)
+        .into_iter()
+        .find(|p| p.disk == disk && p.mib == MANUAL_REST)
+        .map(|p| p.path)
+}
+
+/// "Root (/) (/dev/nvme0n1p2)" — which slot the user has to go and shrink.
+/// A refusal that does not name it just moves the guessing somewhere else.
+fn slot_name(app: &App, dev: &str) -> String {
+    match role_of(&app.config, dev) {
+        Some(role) => format!("{} ({dev})", role_label(app, role)),
+        None => dev.to_string(),
+    }
+}
+
+/// How much the size box may spend: what is free on the disk, PLUS whatever
+/// the slot being resized already holds (`own_mib`, zero when creating).
+///
+/// RESIZING GIVES ITS OWN SPACE BACK FIRST. `free_bytes` counts every planned
+/// slot as spent — including the very one being edited — so a 15 GiB root on a
+/// 30 GiB disk with 10 GiB left was refused 20 GiB, although 25 GiB were in
+/// fact available to it. The refusal even printed the free figure, which the
+/// user could see on screen and could see was not the whole story. The old size
+/// is occupied by nothing but the number about to be overwritten.
+///
+/// Zero still means "no limit known" and skips the check, so a rest-of-disk
+/// slot (`MANUAL_REST`, a sentinel, not a size) is never added in.
+fn size_budget_mib(free_mib: u32, own_mib: u32) -> u32 {
+    if own_mib == MANUAL_REST {
+        return free_mib;
+    }
+    free_mib.saturating_add(own_mib)
+}
+
 /// Space still available to plan INTO on `disk`.
 ///
 /// Zero once a rest-of-disk slot is planned there: it claims whatever is left,
 /// so there is nothing more to give. Reporting the raw remainder made a disk
 /// look untouched right after a partition had been spread across all of it.
+/// A size in MiB as the table shows it: whole GiB above a gigabyte, MiB below.
+/// Used for refusals, where the number has to read the same way it was typed.
+fn human_mib(mib: u32) -> String {
+    if mib >= 1024 && mib.is_multiple_of(1024) {
+        format!("{} GiB", mib / 1024)
+    } else if mib >= 1024 {
+        format!("{:.1} GiB", mib as f64 / 1024.0)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
 fn free_bytes(app: &App, disk: &str) -> u64 {
     if planned_slots(&app.config)
         .iter()
@@ -496,7 +609,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = build_rows(app);
     let cursor = app.cursor.min(rows.len().saturating_sub(1));
-    let mark = |row: usize| if cursor == row { "\u{25b8} " } else { "  " };
+    let mark = |row: usize| if cursor == row { "> " } else { "  " };
     let style = |row: usize| -> Style {
         if cursor == row {
             theme::selected()
@@ -612,10 +725,14 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         .iter()
                         .find(|x| &x.path == disk)
                         .map(|x| {
+                            // Formatted from the byte count, not lsblk's own
+                            // "30G" string: the units have to read the same here
+                            // as in every size the editor prints beside them.
+                            let sz = disk::human_size_fmt(x.size_bytes, !compact);
                             if compact {
-                                format!("{}  {}", x.path, x.size)
+                                format!("{}  {}", x.path, sz)
                             } else {
-                                format!("{}  {}  {}", x.path, x.size, x.model)
+                                format!("{}  {}  {}", x.path, sz, x.model)
                             }
                         })
                         .unwrap_or_else(|| disk.clone());
@@ -624,7 +741,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         theme::heading()
                     };
-                    let mut spans = vec![Span::styled(format!("{}\u{25a0} {dd}", mark(i)), hd)];
+                    let mut spans = vec![Span::styled(format!("{}# {dd}", mark(i)), hd)];
                     // The whole-disk WIPE selector rides on the header (solo
                     // only): the full reveal strip when the header is focused, a
                     // compact ⚠ badge when it is marked but not. In dual-boot the
@@ -646,7 +763,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         } else if idx > 0 {
                             spans.push(Span::styled(
                                 format!(
-                                    "   \u{26a0} \u{2039}{}\u{203a}",
+                                    "   [!] \u{2039}{}\u{203a}",
                                     wipe_strip_labels(app, disk)[idx]
                                 ),
                                 theme::warn(),
@@ -679,10 +796,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         let foreign = foreign_parts(app, disk);
                         if !foreign.is_empty() {
                             lines.push(Line::from(Span::styled(
-                                format!(
-                                    "      \u{26a0} {}",
-                                    t(app.lang, "parts.wipe_foreign_warn")
-                                ),
+                                format!("      [!] {}", t(app.lang, "parts.wipe_foreign_warn")),
                                 theme::warn(),
                             )));
                             if focused_here {
@@ -762,17 +876,17 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         // first broken rule ⚠).
         if !app.pmode_status.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!(" \u{26a0} {}", app.pmode_status),
+                format!(" [!] {}", app.pmode_status),
                 theme::warn(),
             )));
         } else {
             match &verdict {
                 Ok(()) => lines.push(Line::from(Span::styled(
-                    format!(" \u{2713} {}", t(app.lang, "parts.st_ready")),
+                    format!(" x {}", t(app.lang, "parts.st_ready")),
                     theme::ok(),
                 ))),
                 Err((key, dev)) => lines.push(Line::from(Span::styled(
-                    format!(" \u{26a0} {}", t(app.lang, key).replace("{dev}", dev)),
+                    format!(" [!] {}", t(app.lang, key).replace("{dev}", dev)),
                     theme::warn(),
                 ))),
             }
@@ -806,23 +920,23 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         crate::screens::disk::draw_fs_opts_modal(f, app, area, &fs);
     }
     if app.parts_modal_open {
-        draw_role_modal(f, app, area);
+        draw_role_modal(f, app);
     }
     if app.parts_create_open {
-        draw_create_modal(f, app, area);
+        draw_create_modal(f, app);
     }
     if app.parts_mount_open {
-        draw_mount_modal(f, app, area);
+        draw_mount_modal(f, app);
     }
     if app.parts_wipe_ack_open {
-        draw_wipe_ack_modal(f, app, area);
+        draw_wipe_ack_modal(f, app);
     }
     if app.parts_wipe_open {
-        draw_wipe_modal(f, app, area);
+        draw_wipe_modal(f, app);
     }
     // The "now" wipe overlay sits on top of everything, running or finished.
     if app.wipe_run_rx.is_some() || app.wipe_run_done.is_some() {
-        draw_wipe_run_overlay(f, app, area);
+        draw_wipe_run_overlay(f, app);
     }
 }
 
@@ -971,7 +1085,10 @@ fn part_line(app: &App, path: &str, is_new: bool, sty: RowStyle) -> Line<'static
             if !p.label.is_empty() {
                 d = format!("{d} \u{201c}{}\u{201d}", p.label);
             }
-            (p.size.clone(), d)
+            // From the byte count, not lsblk's own string: a row that reads
+            // "512M" beside a planned one reading "512 MiB" makes two units out
+            // of one, and the reader has to work out whether they mean the same.
+            (disk::human_size_fmt(p.size_bytes, !compact), d)
         }
         None => {
             // Always a concrete size, whatever the scenario. A rest-of-disk
@@ -984,12 +1101,12 @@ fn part_line(app: &App, path: &str, is_new: bool, sty: RowStyle) -> Line<'static
                 Some(p) if p.mib == MANUAL_REST => {
                     let b = rest_bytes(app, &p.disk);
                     if b > 0 {
-                        disk::human_size(b)
+                        disk::human_size_fmt(b, !compact)
                     } else {
                         t(app.lang, "parts.size_rest")
                     }
                 }
-                Some(p) => disk::human_size(p.mib as u64 * 1024 * 1024),
+                Some(p) => disk::human_size_fmt(p.mib as u64 * 1024 * 1024, !compact),
                 None => t(app.lang, "parts.size_rest"),
             };
             (size, t(app.lang, "parts.new_mark"))
@@ -998,11 +1115,13 @@ fn part_line(app: &App, path: &str, is_new: bool, sty: RowStyle) -> Line<'static
     // Left half: "▸ /dev/sda1      512M  vfat “SYSTEM”". On a narrow panel, an
     // ASSIGNED partition drops the descr column to make room for its fate — an
     // UNASSIGNED one keeps it (its label is how you spot the Windows volume).
+    // Spelled-out units need three more columns than "512M" did.
+    let szw = if compact { 8 } else { 11 };
     let drop_descr = compact && role.is_some();
     let left = if drop_descr {
-        format!("{mark}{path:<15} {size:>8}")
+        format!("{mark}{path:<15} {size:>szw$}")
     } else {
-        format!("{mark}{path:<15} {size:>8}  {descr}")
+        format!("{mark}{path:<15} {size:>szw$}  {descr}")
     };
     let mut spans = vec![Span::styled(left, st)];
 
@@ -1066,6 +1185,24 @@ fn part_line(app: &App, path: &str, is_new: bool, sty: RowStyle) -> Line<'static
             // with no filesystem) gets the same filesystem picker as root and
             // /home: it is about to be created, so every choice is open. A
             // preserved one shows only what it already carries.
+            // A partition being FORMATTED can be encrypted; one kept as-is
+            // cannot — the data on it would have to go first, and keeping it is
+            // exactly why it is not being formatted.
+            // THE MARK MUST SHOW FOR /home TOO. It was drawn only for data
+            // partitions, which keep the flag in `extra_disks`; /home keeps its
+            // own in `manual_home_encrypt`, so turning encryption on there
+            // produced one status line and then nothing — the table looked
+            // identical either way, and pressing `e` again to check would
+            // silently turn it back off. A setting you cannot see is a setting
+            // you cannot trust.
+            let encrypted = data_is_encrypted(c, path)
+                || (role_of(c, path) == Some(ROLE_HOME) && c.manual_home_encrypt);
+            if encrypted {
+                spans.push(Span::styled(
+                    format!("  [{}]", t(app.lang, "parts.enc_mark")),
+                    theme::warn(),
+                ));
+            }
             if data_is_formatted(c, path) {
                 spans.push(Span::styled("   ".to_string(), theme::accent()));
                 fs_spans(
@@ -1093,21 +1230,11 @@ fn part_line(app: &App, path: &str, is_new: bool, sty: RowStyle) -> Line<'static
     Line::from(spans)
 }
 
-/// Centered helper for the small modals below.
-fn modal_rect(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width.saturating_sub(4)).max(20);
-    let h = h.min(area.height.saturating_sub(2)).max(4);
-    Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    )
-}
+pub(crate) use crate::screens::widgets::modal_rect_fit;
 
 /// The role-assignment modal for an existing partition: none + the 4 roles.
 /// Mountpoint picker for a data partition: ready-made folders, or type a path.
-fn draw_mount_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_mount_modal(f: &mut Frame, app: &App) {
     let custom = app.parts_mount_cursor == MOUNT_TEMPLATES.len();
     let mut lines = vec![
         Line::from(Span::styled(format!(" {}", app.parts_target), theme::dim())),
@@ -1116,7 +1243,7 @@ fn draw_mount_modal(f: &mut Frame, app: &App, area: Rect) {
     for (i, m) in MOUNT_TEMPLATES.iter().enumerate() {
         let sel = i == app.parts_mount_cursor;
         lines.push(Line::from(Span::styled(
-            format!("{}{m}", if sel { " \u{25b8} " } else { "   " }),
+            format!("{}{m}", if sel { " > " } else { "   " }),
             if sel {
                 theme::selected()
             } else {
@@ -1126,8 +1253,8 @@ fn draw_mount_modal(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(Span::styled(
         format!(
-            "{}{}  {}\u{258f}",
-            if custom { " \u{25b8} " } else { "   " },
+            "{}{}  {}|",
+            if custom { " > " } else { "   " },
             t(app.lang, "parts.mount_custom"),
             app.parts_mount_input
         ),
@@ -1142,7 +1269,12 @@ fn draw_mount_modal(f: &mut Frame, app: &App, area: Rect) {
         format!(" {}", t(app.lang, "parts.hint_mount")),
         theme::mute(),
     )));
-    let rect = modal_rect(area, 60, lines.len() as u16 + 2);
+    let rect = modal_rect_fit(
+        f,
+        60.max(crate::screens::widgets::text_width(&lines)),
+        lines.len() as u16 + 2,
+        app.modal_zoom,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1245,18 +1377,18 @@ fn create_data_slot(app: &mut App, mp: &str) {
     app.parts_pending_mib = 0;
 }
 
-fn draw_role_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_role_modal(f: &mut Frame, app: &App) {
     let entries: Vec<String> = std::iter::once(t(app.lang, "parts.none"))
         .chain((0..ROLES).map(|r| role_label(app, r)))
         .collect();
-    let rect = modal_rect(area, 44, entries.len() as u16 + 4);
+    let rect = modal_rect_fit(f, 44, entries.len() as u16 + 4, app.modal_zoom);
     let mut lines = vec![Line::from(Span::styled(
         format!(" {}", app.parts_target),
         theme::dim(),
     ))];
     for (i, e) in entries.iter().enumerate() {
         let sel = i == app.parts_modal_cursor;
-        let pre = if sel { "\u{25b8} " } else { "  " };
+        let pre = if sel { "> " } else { "  " };
         lines.push(Line::from(Span::styled(
             format!("{pre}{e}"),
             if sel {
@@ -1275,7 +1407,7 @@ fn draw_role_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The create-partition wizard: stage 0 picks the role, stage 1 the size.
-fn draw_create_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_create_modal(f: &mut Frame, app: &App) {
     let avail = available_roles(app);
     let (title, mut lines) = if app.parts_create_stage == 0 {
         let mut ls: Vec<Line> = Vec::new();
@@ -1287,7 +1419,7 @@ fn draw_create_modal(f: &mut Frame, app: &App, area: Rect) {
         }
         for (i, r) in avail.iter().enumerate() {
             let sel = i == app.parts_create_role.min(avail.len().saturating_sub(1));
-            let pre = if sel { "\u{25b8} " } else { "  " };
+            let pre = if sel { "> " } else { "  " };
             ls.push(Line::from(Span::styled(
                 format!("{pre}{}", role_label(app, *r)),
                 if sel {
@@ -1308,10 +1440,7 @@ fn draw_create_modal(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(" > ".to_string(), theme::accent()),
                 Span::styled(app.parts_size_input.clone(), theme::normal()),
-                Span::styled(
-                    format!("\u{258f} {}", size_unit_label(app)),
-                    theme::accent(),
-                ),
+                Span::styled(format!("| {}", size_unit_label(app)), theme::accent()),
             ]),
         ];
         let title = if app.parts_resize_dev.is_empty() {
@@ -1327,12 +1456,28 @@ fn draw_create_modal(f: &mut Frame, app: &App, area: Rect) {
         (title, ls)
     };
     lines.push(Line::from(""));
+    // THE CAPTION MUST DESCRIBE THIS STAGE, not the next one. The footer was
+    // taught that and this box was not, so the role list — a plain up-down
+    // list — carried "digits — size · ←/→ — MiB/GiB" underneath it: an
+    // instruction for the step after the one being looked at.
     lines.push(Line::from(Span::styled(
-        format!(" {}", t(app.lang, "parts.hint_size")),
+        format!(
+            " {}",
+            if app.parts_create_stage == 0 {
+                t(app.lang, "parts.hint_role")
+            } else {
+                t(app.lang, "parts.hint_size")
+            }
+        ),
         theme::mute(),
     )));
     // Wide enough for the size hint, which now also names the MiB/GiB switch.
-    let rect = modal_rect(area, 68, lines.len() as u16 + 2);
+    let rect = modal_rect_fit(
+        f,
+        68.max(crate::screens::widgets::text_width(&lines)),
+        lines.len() as u16 + 2,
+        app.modal_zoom,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1357,7 +1502,7 @@ fn wipe_method_desc(app: &App, m: crate::app::WipeMethod) -> String {
 /// hand afterwards. So the modal's job is understanding, not permission — it
 /// names every partition that will be destroyed, says plainly if that kills the
 /// other system's ability to boot, and defaults to cancel.
-fn draw_wipe_ack_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_wipe_ack_modal(f: &mut Frame, app: &App) {
     let disk = app.parts_wipe_ack_disk.clone();
     let foreign = foreign_parts(app, &disk);
     let mut lines: Vec<Line> = vec![
@@ -1396,7 +1541,7 @@ fn draw_wipe_ack_modal(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
     {
         let sel = i == app.parts_wipe_ack_cursor;
-        let pre = if sel { "\u{25b8} " } else { "  " };
+        let pre = if sel { "> " } else { "  " };
         let style = if sel {
             if i == 1 {
                 theme::warn()
@@ -1430,7 +1575,7 @@ fn draw_wipe_ack_modal(f: &mut Frame, app: &App, area: Rect) {
             w.max(1).div_ceil(inner_w)
         })
         .sum();
-    let rect = modal_rect(area, W, rows as u16 + 2);
+    let rect = modal_rect_fit(f, W, rows as u16 + 2, app.modal_zoom);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1449,7 +1594,7 @@ fn draw_wipe_ack_modal(f: &mut Frame, app: &App, area: Rect) {
 /// on the header strip; this only asks the irreversible yes/no, defaulting to
 /// cancel. Nothing here touches a disk — it drives the state the key handler
 /// acts on.
-fn draw_wipe_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_wipe_modal(f: &mut Frame, app: &App) {
     let disk = app.parts_wipe_disk.clone();
     let method = app
         .config
@@ -1477,7 +1622,7 @@ fn draw_wipe_modal(f: &mut Frame, app: &App, area: Rect) {
     if !foreign.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!(" \u{26a0} {}", t(app.lang, "parts.wipe_foreign_warn")),
+            format!(" [!] {}", t(app.lang, "parts.wipe_foreign_warn")),
             theme::warn(),
         )));
         for (path, what) in &foreign {
@@ -1488,11 +1633,19 @@ fn draw_wipe_modal(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     lines.push(Line::from(""));
-    for (i, lab) in ["parts.wipe_cancel", "parts.wipe_do"].iter().enumerate() {
+    // Three outcomes, all of them spelled out. There used to be two — cancel and
+    // "erase now" — while the third, "erase during the install", existed only as
+    // a side effect of having picked a method with ←/→ and then NOT opening this
+    // dialog. It was the option most people want, and the only way to choose it
+    // was to not press the key that shows the choices.
+    for (i, lab) in ["parts.wipe_cancel", "parts.wipe_later", "parts.wipe_do"]
+        .iter()
+        .enumerate()
+    {
         let sel = i == app.parts_wipe_confirm_cursor;
-        let pre = if sel { "\u{25b8} " } else { "  " };
+        let pre = if sel { "> " } else { "  " };
         let style = if sel {
-            if i == 1 {
+            if i == 2 {
                 theme::warn()
             } else {
                 theme::selected()
@@ -1512,7 +1665,12 @@ fn draw_wipe_modal(f: &mut Frame, app: &App, area: Rect) {
     )));
 
     let title = t(app.lang, "parts.wipe_confirm_title");
-    let rect = modal_rect(area, 72, lines.len() as u16 + 2);
+    let rect = modal_rect_fit(
+        f,
+        72.max(crate::screens::widgets::text_width(&lines)),
+        lines.len() as u16 + 2,
+        app.modal_zoom,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1524,10 +1682,10 @@ fn draw_wipe_modal(f: &mut Frame, app: &App, area: Rect) {
 
 /// The "now" wipe progress overlay: a status line, the tail of the streamed
 /// output, and a dismiss hint once finished.
-fn draw_wipe_run_overlay(f: &mut Frame, app: &App, area: Rect) {
+fn draw_wipe_run_overlay(f: &mut Frame, app: &App) {
     let running = app.wipe_run_rx.is_some();
     let title = format!("{} {}", t(app.lang, "parts.wipe_title"), app.wipe_run_disk);
-    let rect = modal_rect(area, 78, 18);
+    let rect = modal_rect_fit(f, 78, 18, app.modal_zoom);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1606,6 +1764,18 @@ fn fs_for_target(app: &App, target: FsOptsTarget) -> String {
 
 /// The filesystem a data partition will carry: the one chosen for a partition
 /// being formatted, or the one already on it when it is mounted as-is.
+/// What the SCAN says is on this device right now — not what the plan intends.
+///
+/// Used to tell "formatting an empty partition" from "formatting one that holds
+/// something", which is the difference between a note and a warning.
+fn scan_fs_of(app: &App, dev: &str) -> String {
+    app.parts_list
+        .iter()
+        .find(|p| p.path == dev)
+        .map(|p| p.fstype.clone())
+        .unwrap_or_default()
+}
+
 fn data_fs_eff<'a>(c: &'a InstallConfig, dev: &str) -> &'a str {
     c.extra_disks
         .iter()
@@ -1903,6 +2073,43 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
             {
                 app.config.manual_esp_format = !app.config.manual_esp_format;
             }
+            // `f` on a DATA partition: format it, or keep it as it is.
+            //
+            // Without this, encryption was unreachable for the case it exists
+            // for. A data partition that already has a filesystem is mounted
+            // as-is (format=false), and both `e` (encrypt) and ←/→ (filesystem)
+            // refuse while that is true — so "encrypt the disk I keep junk on"
+            // could only be done by deleting the partition and making a new
+            // one. The answer is not to forbid it but to say what it costs:
+            // encryption rewrites the whole device, so whatever is on it goes.
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if role_of(&app.config, &path) == Some(ROLE_DATA) && !is_new =>
+            {
+                let dev = path.clone();
+                let had_fs = scan_fs_of(app, &dev);
+                if let Some(e) = app.config.extra_disks.iter_mut().find(|e| e.disk == dev) {
+                    e.format = !e.format;
+                    if !e.format {
+                        // Kept as-is cannot be encrypted, so the flag goes with
+                        // it rather than lingering as a promise the plan would
+                        // not keep.
+                        e.encrypt = false;
+                    }
+                    app.pmode_status = if e.format {
+                        if had_fs.is_empty() {
+                            t(app.lang, "parts.data_fmt_on")
+                        } else {
+                            format!(
+                                "{} {}",
+                                t(app.lang, "parts.data_fmt_on"),
+                                t(app.lang, "parts.data_fmt_erases")
+                            )
+                        }
+                    } else {
+                        t(app.lang, "parts.data_fmt_off")
+                    };
+                }
+            }
             // ESP row ←/→: toggle where the ESP mounts — /boot (kernels on the
             // ESP) or /boot/efi (kernels on root, only the bootloader on a small
             // reused ESP). The dual-boot control people look for.
@@ -1977,71 +2184,101 @@ fn handle_key_inner(app: &mut App, key: KeyEvent) {
                     toggle_deleted(app, &path);
                 }
             }
+            // LUKS on a data partition. Reachable only from here in manual mode:
+            // the extra-disks step, where this used to live, no longer appears
+            // once the editor is doing that job.
+            // No `e` here. Encryption is decided on the "Bootloader and
+            // encryption" step, beside the root's own — one word meaning one
+            // thing, in one place. A key that only says "this moved" is still a
+            // key people press and a line the hints have to carry; the mark in
+            // the table already reports what was chosen there, which is what a
+            // partition table is for.
             _ => {}
         },
+        // "+ Створити розділ" under a disk: opens the two-stage wizard (role,
+        // then size) for THAT disk. The disk travels with the wizard so a
+        // layout can be built across several drives at once.
         Row::Create { disk } => {
             if key.code == KeyCode::Enter {
-                // Creating pins the system disk to this one. New partitions can
-                // only live on one disk; if planned partitions already exist on
-                // ANOTHER disk, say so instead of silently moving them.
-                set_create_disk(app, &disk);
+                // THE ROW ALREADY SAID "space is allocated" — so the action has
+                // to mean it. Creating here used to open the wizard anyway and
+                // take the space out of the rest-of-disk slot without a word,
+                // which is how a 29 GiB root became 25 GiB the moment a swap
+                // was added. Enter never stays silent (rule 2), and a full disk
+                // is a decision for the user to make, not one to make for them.
+                if free_bytes(app, &disk) == 0 {
+                    if let Some(rest) = rest_slot_on(&app.config, &disk) {
+                        app.pmode_status = t(app.lang, "parts.err_disk_claimed")
+                            .replace("{part}", &slot_name(app, &rest));
+                        return;
+                    }
+                    if planned_slots(&app.config).iter().any(|p| p.disk == disk) {
+                        app.pmode_status = t(app.lang, "parts.err_disk_full");
+                        return;
+                    }
+                }
+                app.parts_create_disk = disk;
                 app.parts_create_role = 0;
                 app.parts_create_stage = 0;
+                app.parts_resize_dev.clear();
                 app.parts_size_input.clear();
-                app.parts_resize_dev.clear(); // creating, not resizing
+                app.parts_size_pristine = false;
                 app.parts_create_open = true;
             }
         }
+        // The Continue control at the foot of the screen: the same "next step"
+        // Enter performs, offered as a landable row so the way forward is
+        // visible rather than remembered.
         Row::Continue => {
-            if key.code == KeyCode::Enter && validate_app(app).is_ok() {
-                app.can_advance = true;
+            if key.code == KeyCode::Enter {
                 app.goto_next();
             }
-            // Not ready: the status line under the rows names the exact rule
-            // that failed — that IS the feedback.
         }
     }
 }
 
-/// Record which disk the create wizard is carving from. New partitions are no
-/// longer confined to a single disk, so this only remembers a target — it can
-/// never refuse.
-fn set_create_disk(app: &mut App, disk: &str) {
-    app.parts_create_disk = disk.to_string();
-    app.config.manual_disk = disk.to_string();
-    app.pmode_status.clear();
-}
-
+/// The role picker for an EXISTING partition: "leave alone" plus every role.
+///
+/// Choosing "data" does not finish the job — that role needs a mountpoint, so
+/// it hands over to the mount picker instead of silently assigning a partition
+/// with nowhere to go.
 fn role_modal_key(app: &mut App, key: KeyEvent) {
-    let len = ROLES + 1; // none + 4 roles
-    if nav::move_cursor(key.code, &mut app.parts_modal_cursor, len) {
+    if nav::move_cursor(key.code, &mut app.parts_modal_cursor, ROLES + 1) {
         return;
     }
     match key.code {
         KeyCode::Esc => app.parts_modal_open = false,
         KeyCode::Enter => {
-            let target = app.parts_target.clone();
-            let role = app.parts_modal_cursor.checked_sub(1);
-            // "Data" needs one more answer — WHERE. Detach any previous role
-            // first, then ask; nothing is stored until the picker is confirmed.
-            if role == Some(ROLE_DATA) {
-                assign_role(app, &target, None);
-                app.parts_modal_open = false;
+            let dev = app.parts_target.clone();
+            let sel = app.parts_modal_cursor;
+            app.parts_modal_open = false;
+            if sel == 0 {
+                assign_role(app, &dev, None);
+                clear_data_mount(&mut app.config, &dev);
+                return;
+            }
+            let role = sel - 1;
+            if role == ROLE_DATA {
+                app.parts_target = dev;
+                app.parts_mount_for_new = false;
                 app.parts_mount_cursor = 0;
                 app.parts_mount_input.clear();
                 app.parts_mount_open = true;
-                return;
+            } else {
+                assign_role(app, &dev, Some(role));
             }
-            assign_role(app, &target, role);
-            app.parts_modal_open = false;
         }
         _ => {}
     }
 }
 
+/// The two-stage creation wizard: which role, then how big.
+///
+/// Stage 0 walks `available_roles` — a role already filled is not offered, so
+/// the list shrinks as the layout is built and never proposes a second root.
 fn create_modal_key(app: &mut App, key: KeyEvent) {
+    let avail = available_roles(app);
     if app.parts_create_stage == 0 {
-        let avail = available_roles(app);
         if nav::move_cursor(key.code, &mut app.parts_create_role, avail.len().max(1)) {
             return;
         }
@@ -2063,6 +2300,7 @@ fn create_modal_key(app: &mut App, key: KeyEvent) {
                     ROLE_SWAP => "4".into(),
                     _ => String::new(),
                 };
+                app.parts_size_pristine = !app.parts_size_input.is_empty();
             }
             _ => {}
         }
@@ -2086,27 +2324,103 @@ fn create_modal_key(app: &mut App, key: KeyEvent) {
             // 500 and switching to MiB must mean 500 MiB.
             app.parts_size_mib = !app.parts_size_mib;
         }
-        KeyCode::Char(ch) if ch.is_ascii_digit() && app.parts_size_input.len() < 6 => {
-            app.parts_size_input.push(ch);
+        // THE FIRST DIGIT REPLACES THE SUGGESTION. Appending to it turned a
+        // typed 4 into 44 — a 44 GiB swap on a 30 GiB disk, accepted without a
+        // word — and would turn a typed 40 in the ESP box into 51240. Nobody
+        // types a number expecting it to be glued onto one they never chose.
+        // A DECIMAL POINT IS ACCEPTED, because half a gibibyte is a size people
+        // actually want. Refused before, the only way to ask for 25.5 GiB was to
+        // work out 26112 MiB by hand — and the user who tried typed 25500,
+        // which is 24.9 GiB, and had no way to see that it was not what they
+        // meant. A comma types the same character: on the layouts this installer
+        // ships, that is the key beside the full stop.
+        KeyCode::Char(ch) if ch.is_ascii_digit() || ch == '.' || ch == ',' => {
+            if app.parts_size_pristine {
+                app.parts_size_input.clear();
+                app.parts_size_pristine = false;
+            }
+            // One point only, and never as the first character: ".5" parses,
+            // but a box that opens with a lone dot reads as a stuck key.
+            if (ch == '.' || ch == ',')
+                && (app.parts_size_input.is_empty() || app.parts_size_input.contains('.'))
+            {
+                return;
+            }
+            if app.parts_size_input.len() < 8 {
+                app.parts_size_input.push(if ch == ',' { '.' } else { ch });
+            }
         }
+        // Backspace on an untouched suggestion clears it whole: deleting one
+        // digit from a number you never typed leaves a number you never chose.
         KeyCode::Backspace => {
-            app.parts_size_input.pop();
+            if app.parts_size_pristine {
+                app.parts_size_input.clear();
+                app.parts_size_pristine = false;
+            } else {
+                app.parts_size_input.pop();
+            }
         }
         KeyCode::Enter => {
             let role = app.parts_create_role;
-            let typed: u32 = app.parts_size_input.parse().unwrap_or(0);
+            let typed: f64 = app.parts_size_input.parse().unwrap_or(0.0);
             // An empty box means "all the space that's left", for every role.
             // It used to mean that only for root and /home; ESP and swap simply
             // returned, leaving the wizard open with nothing said — which reads
             // as the installer having made an empty partition rather than
             // having refused. Enter must never be silent.
-            let mib = if typed == 0 {
+            //
+            // MiB is the smallest unit the plan works in, so a fraction of one
+            // is rounded, not dropped. The ceiling stops short of MANUAL_REST,
+            // which is `u32::MAX` used as a marker — a size that landed exactly
+            // on it would silently mean "the rest of the disk" instead.
+            let to_mib = |v: f64| v.round().clamp(1.0, (u32::MAX - 1) as f64) as u32;
+            let mib = if typed <= 0.0 {
                 MANUAL_REST
             } else if app.parts_size_mib {
-                typed
+                to_mib(typed)
             } else {
-                typed.saturating_mul(1024)
+                to_mib(typed * 1024.0)
             };
+            // A SIZE THAT DOES NOT FIT IS REFUSED, not quietly written down.
+            //
+            // Nothing checked this: a 44 GiB swap was accepted on a 30 GiB disk
+            // and shown in the table as if it were real, with the remaining
+            // space reported as already spent — so the root could no longer be
+            // created and the reason was nowhere on screen. The plan would have
+            // failed much later, at sgdisk, with the disk already being written.
+            if mib != MANUAL_REST {
+                let disk = if !app.parts_resize_dev.is_empty() {
+                    planned_disk_of(&app.config, role, &app.parts_resize_dev)
+                } else {
+                    app.parts_create_disk.clone()
+                };
+                if !disk.is_empty() {
+                    let free_mib = (free_bytes(app, &disk) / (1024 * 1024)) as u32;
+                    let own_mib = if app.parts_resize_dev.is_empty() {
+                        0
+                    } else {
+                        planned_mib_of(&app.config, role, &app.parts_resize_dev)
+                    };
+                    // GROWING a slot on a disk whose remainder is already
+                    // claimed takes that space from the rest-of-disk slot —
+                    // the same silent shrink, one keystroke away by another
+                    // route. Shrinking stays free: it only gives space back.
+                    if let Some(rest) = rest_slot_on(&app.config, &disk) {
+                        if rest != app.parts_resize_dev && mib > own_mib {
+                            app.pmode_status = t(app.lang, "parts.err_disk_claimed")
+                                .replace("{part}", &slot_name(app, &rest));
+                            return;
+                        }
+                    }
+                    let free_mib = size_budget_mib(free_mib, own_mib);
+                    if free_mib > 0 && mib > free_mib {
+                        app.pmode_status = t(app.lang, "parts.err_size_too_big")
+                            .replace("{want}", &human_mib(mib))
+                            .replace("{free}", &human_mib(free_mib));
+                        return;
+                    }
+                }
+            }
             // Resizing an existing plan: change the number in place. A data
             // partition already has its mountpoint, so it must NOT be sent back
             // through the mountpoint picker as if it were new.
@@ -2705,22 +3019,30 @@ fn start_wipe_now(app: &mut App) {
     }
 }
 
-/// The "erase NOW" confirm: ←/→ toggles cancel/erase, Enter acts, Esc closes.
+/// The erase confirm: ↑/↓ picks cancel / during-install / now, Enter acts, Esc closes.
 /// The cursor defaults to cancel, so a careless Enter never erases a disk.
 fn wipe_modal_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => close_wipe_modal(app),
-        KeyCode::Left
-        | KeyCode::Right
-        | KeyCode::Up
-        | KeyCode::Down
-        | KeyCode::Char('h')
-        | KeyCode::Char('l')
-        | KeyCode::Char('j')
-        | KeyCode::Char('k') => app.parts_wipe_confirm_cursor ^= 1,
+        KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+            app.parts_wipe_confirm_cursor = (app.parts_wipe_confirm_cursor + 1) % 3
+        }
+        KeyCode::Up | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => {
+            app.parts_wipe_confirm_cursor = (app.parts_wipe_confirm_cursor + 2) % 3
+        }
         KeyCode::Enter => {
-            if app.parts_wipe_confirm_cursor == 1 {
-                start_wipe_now(app);
+            match app.parts_wipe_confirm_cursor {
+                // "No, cancel" answers the question on screen — ERASE EVERYTHING
+                // on this disk? — so it takes the mark back off. Leaving it set
+                // would mean the install still erased the disk after the user
+                // said no, which is the one outcome this dialog exists to avoid.
+                0 => {
+                    let disk = app.parts_wipe_disk.clone();
+                    set_disk_wipe(app, &disk, 0);
+                }
+                // Keep the mark: the plan erases it as its first step.
+                1 => {}
+                _ => start_wipe_now(app),
             }
             close_wipe_modal(app);
         }
@@ -2967,7 +3289,15 @@ pub fn footer_hint(app: &App) -> String {
         return t(app.lang, "parts.hint_modal");
     }
     if app.parts_create_open {
-        return t(app.lang, "parts.hint_size");
+        // The wizard has two stages and they take different keys. Both used to
+        // show the SIZE hint, so the role list — SWAP / /home / Data, a plain
+        // up-down list — was captioned "digits — size · ←/→ — MiB/GiB", which
+        // describes the step after this one.
+        return if app.parts_create_stage == 0 {
+            t(app.lang, "parts.hint_role")
+        } else {
+            t(app.lang, "parts.hint_size")
+        };
     }
     let rows = build_rows(app);
     let key = match rows.get(app.cursor.min(rows.len().saturating_sub(1))) {
@@ -2976,6 +3306,11 @@ pub fn footer_hint(app: &App) -> String {
         // filesystem — it earns its own hint so that control is discoverable.
         Some(Row::Part { path, .. }) if role_of(&app.config, path) == Some(ROLE_ESP) => {
             "parts.hint_esp"
+        }
+        // The Data role is the only one that can be encrypted from here, so it
+        // is the only row where saying so is useful.
+        Some(Row::Part { path, .. }) if role_of(&app.config, path) == Some(ROLE_DATA) => {
+            "parts.hint_data"
         }
         Some(Row::Part { path, .. })
             if matches!(
@@ -2994,6 +3329,13 @@ pub fn footer_hint(app: &App) -> String {
         {
             "parts.hint_fs"
         }
+        // A PLANNED data partition is the one people create for storage, and
+        // encrypting it is the whole reason to make it here rather than later.
+        // Its hint said nothing about `e`, so the feature existed and was
+        // invisible on exactly the row where it is most wanted.
+        Some(Row::Part {
+            path, is_new: true, ..
+        }) if role_of(&app.config, path) == Some(ROLE_DATA) => "parts.hint_new_data",
         Some(Row::Part { is_new: true, .. }) => "parts.hint_new",
         Some(Row::Part { .. }) => "parts.hint_part",
         Some(Row::Create { .. }) => "parts.hint_create",
@@ -3223,6 +3565,149 @@ fn parent_of(parts: &[Partition], dev: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A data partition that already holds something can still be encrypted —
+    /// after saying yes to formatting it.
+    ///
+    /// This was unreachable. Such a partition is mounted as-is (format=false),
+    /// and both `e` and ←/→ refuse while that holds, so "encrypt the disk I keep
+    /// junk on" could only be done by deleting the partition and making a new
+    /// one. The rule is not to forbid it but to say what it costs: encryption
+    /// rewrites the whole device, so what is on it goes.
+    /// The creation box must caption the stage it is SHOWING.
+    ///
+    /// It appended the size hint unconditionally, so the role list — SWAP,
+    /// /home, Data, a plain up-down list — was captioned "digits — size ·
+    /// ←/→ — MiB/GiB", which describes the step after this one. The footer had
+    /// already been fixed for exactly this; the box carried its own copy and
+    /// was missed, so the bug looked fixed and was not.
+    /// THE FIRST DIGIT REPLACES THE SUGGESTION IN THE SIZE BOX.
+    ///
+    /// Found by driving the installer: the swap box is pre-filled with "4", a
+    /// typed 4 produced 44, and a 44 GiB swap was written down on a 30 GiB disk
+    /// without a word. The ESP box holds "512", so a typed 40 would have made
+    /// 51240. The same mistake was found and fixed in the VM picker; this field
+    /// was a separate copy and kept it.
+    /// AN ENCRYPTED /home SAYS SO IN THE TABLE.
+    ///
+    /// The [ШИФР] mark was drawn only for data partitions, which keep the flag
+    /// in `extra_disks`. /home keeps its own in `manual_home_encrypt`, so
+    /// turning encryption on there produced a single status line and then
+    /// nothing: the row looked identical either way, and pressing `e` again to
+    /// find out would silently turn it back off. Found by driving the installer
+    /// and walking the cursor away and back.
+    #[test]
+    fn an_encrypted_home_is_marked_in_the_table() {
+        let src = std::fs::read_to_string("src/screens/parts.rs").expect("readable");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
+        assert!(
+            code.contains("c.manual_home_encrypt") && code.contains("parts.enc_mark"),
+            "the /home flag reaches the row that draws the mark"
+        );
+    }
+
+    #[test]
+    fn the_first_digit_replaces_the_suggested_size() {
+        let mut app = App::new();
+        app.parts_create_open = true;
+        app.parts_create_stage = 1;
+        app.parts_size_input = "4".into();
+        app.parts_size_pristine = true;
+        handle_key(&mut app, key(KeyCode::Char('8')));
+        assert_eq!(
+            app.parts_size_input, "8",
+            "the suggestion was extended, not replaced"
+        );
+        // Once typing has started, further digits append normally.
+        handle_key(&mut app, key(KeyCode::Char('0')));
+        assert_eq!(app.parts_size_input, "80");
+    }
+
+    /// Backspace on an untouched suggestion clears it whole. Deleting one digit
+    /// from a number nobody typed leaves a number nobody chose — "512" becomes
+    /// "51", which is a perfectly valid ESP size and completely wrong.
+    #[test]
+    fn backspace_on_an_untouched_suggestion_clears_it() {
+        let mut app = App::new();
+        app.parts_create_open = true;
+        app.parts_create_stage = 1;
+        app.parts_size_input = "512".into();
+        app.parts_size_pristine = true;
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.parts_size_input, "", "one digit was shaved off instead");
+    }
+
+    #[test]
+    fn the_creation_box_captions_the_stage_it_is_showing() {
+        let src = std::fs::read_to_string("src/screens/parts.rs").expect("readable");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let f = &code[code.find("fn draw_create_modal").expect("it exists")..];
+        let f = &f[..f.find("\nfn ").unwrap_or(f.len())];
+        assert!(
+            f.contains("parts.hint_role"),
+            "the role stage gets the role hint"
+        );
+        // Assembled from pieces on purpose: spelled out in full this literal
+        // looks like a real translation lookup to the i18n key scanner, which
+        // then fails on a key the code does not actually ask for.
+        let q = '"';
+        let unconditional = f.contains(&format!("t(app.lang, {q}parts.hint_size{q}))"));
+        assert!(
+            !unconditional,
+            "the size hint is no longer appended regardless of stage"
+        );
+    }
+
+    #[test]
+    fn a_kept_data_partition_can_be_formatted_and_then_encrypted() {
+        let mut c = crate::app::InstallConfig::default();
+        c.extra_disks.push(crate::app::ExtraDisk {
+            disk: "/dev/vdb1".into(),
+            mountpoint: "/mnt/data".into(),
+            fs: "ext4".into(),
+            format: false, // mounted as it is
+            ..Default::default()
+        });
+
+        // While it is kept, encryption is refused — nothing silently happens.
+        assert!(
+            !toggle_data_encryption(&mut c, "/dev/vdb1"),
+            "encryption was accepted for a partition that is not formatted"
+        );
+        assert!(!c.extra_disks[0].encrypt);
+
+        // Turn formatting on (what `f` does), and it becomes available.
+        c.extra_disks[0].format = true;
+        assert!(toggle_data_encryption(&mut c, "/dev/vdb1"));
+        assert!(c.extra_disks[0].encrypt);
+
+        // Turning formatting back off must take the encryption with it, or the
+        // plan would carry a promise it cannot keep.
+        c.extra_disks[0].format = false;
+        c.extra_disks[0].encrypt = false;
+        assert!(!toggle_data_encryption(&mut c, "/dev/vdb1"));
+    }
+
+    /// The create wizard has two stages and they take different keys. Both used
+    /// to be captioned with the SIZE hint, so the role list — a plain up-down
+    /// list of SWAP / /home / Data — was labelled "digits — size · ←/→ —
+    /// MiB/GiB", describing the step after the one on screen.
+    #[test]
+    fn the_create_wizard_captions_the_stage_it_is_actually_on() {
+        let mut app = App::new();
+        app.screen = crate::app::Screen::Disk;
+        app.config.partition_mode = crate::app::PartitionMode::Manual;
+        app.parts_create_open = true;
+
+        app.parts_create_stage = 0;
+        let role = footer_hint(&app);
+        assert_eq!(role, t(app.lang, "parts.hint_role"));
+
+        app.parts_create_stage = 1;
+        let size = footer_hint(&app);
+        assert_eq!(size, t(app.lang, "parts.hint_size"));
+        assert_ne!(role, size, "both stages carry the same caption");
+    }
+
     use super::*;
     use crate::app::{App, BootMode};
     use crossterm::event::KeyModifiers;
@@ -3808,19 +4293,18 @@ mod tests {
             !out.contains(&t(app.lang, "parts.size_rest")),
             "a partition still reports its size as \"rest of the disk\":\n{out}"
         );
+        // Either spelling of the unit: the panel decides which it can afford.
+        let shows = |n: &str, u: &str| out.contains(&format!("{n} {u}iB")) || out.contains(n);
         // The fixed one keeps its own size…
-        assert!(
-            out.contains("512M"),
-            "the fixed-size partition lost its size"
-        );
+        assert!(shows("512", "M"), "the fixed-size partition lost its size");
         // …and each rest-of-disk one shows what it will really get: the whole
         // of the 500G second disk, and the 240G first disk less the ESP.
         assert!(
-            out.contains("500G"),
+            shows("500", "G"),
             "the rest-of-disk /home does not show the space it takes:\n{out}"
         );
         assert!(
-            out.contains("239G"),
+            shows("239", "G"),
             "the rest-of-disk root does not account for the ESP beside it:\n{out}"
         );
     }
@@ -4220,13 +4704,17 @@ mod tests {
             .collect()
         };
 
+        // Either spelling of the unit — the wide "10 GiB" on a roomy panel, the
+        // cramped "10G" on a narrow one. What matters is WHOSE number it is.
+        let shows = |row: &str, n: &str| row.contains(&format!("{n} GiB")) || row.contains(n);
+
         let planned = row(&app, "/dev/vdb1", true);
         assert!(
-            planned.contains("10G"),
+            shows(&planned, "10"),
             "the planned row does not show its own 10 GiB: {planned}"
         );
         assert!(
-            !planned.contains("20G"),
+            !shows(&planned, "20"),
             "the planned row shows the size of the partition it replaces: {planned}"
         );
 
@@ -4235,7 +4723,7 @@ mod tests {
         app.parts_list = vec![sized("/dev/vdb1", 20)];
         let existing = row(&app, "/dev/vdb1", false);
         assert!(
-            existing.contains("20G"),
+            shows(&existing, "20"),
             "an existing partition must show its scanned size: {existing}"
         );
     }
@@ -4490,6 +4978,151 @@ mod tests {
         assert!(
             app.config.btrfs_subvolumes && app.config.btrfs_compress,
             "undo swallowed the filesystem options the user had set"
+        );
+    }
+
+    /// Reported from QEMU: a 30 GiB NVMe held a 512 MiB ESP, a 15 GiB root and
+    /// a 4 GiB swap, leaving 10.5 GiB free. Growing the ROOT to 20 GiB was
+    /// refused with "запрошено 20 GiB, а вільно лише 10.5 GiB" — the check
+    /// counted the root's own 15 GiB as somebody else's, so the one partition
+    /// being edited was the one it would not let you edit.
+    #[test]
+    fn resizing_a_slot_may_spend_the_space_that_slot_already_holds() {
+        let free = 10 * 1024 + 512; // 10.5 GiB left on the disk
+        let root = 15 * 1024; // what the root holds right now
+
+        assert_eq!(
+            size_budget_mib(free, root),
+            25 * 1024 + 512,
+            "a resize must be offered its own space back"
+        );
+        assert!(
+            20 * 1024 <= size_budget_mib(free, root),
+            "20 GiB fits in 15 + 10.5 and must be accepted"
+        );
+        assert!(
+            26 * 1024 > size_budget_mib(free, root),
+            "a size past the real total must still be refused"
+        );
+
+        // Creating something new gets no such credit.
+        assert_eq!(size_budget_mib(free, 0), free);
+
+        // A rest-of-disk slot carries a sentinel, not a size: adding it would
+        // overflow the budget to "anything goes".
+        assert_eq!(size_budget_mib(free, MANUAL_REST), free);
+    }
+
+    /// Reported from QEMU, and the reason a rest-of-disk slot needs saying out
+    /// loud: a disk held a 512 MiB ESP and a root taking whatever was left,
+    /// displayed as a plain "29G". Creating a 4 GiB swap turned that root into
+    /// 25G with nothing said — while the row beside the button already read
+    /// "space is allocated". The button ignored its own label.
+    ///
+    /// A full disk is the user's decision to unmake, so the refusal has to name
+    /// the slot to shrink, and shrinking it has to still work afterwards.
+    #[test]
+    fn a_claimed_disk_refuses_to_be_shrunk_behind_the_users_back() {
+        let mut app = App::new();
+        app.config.partition_mode = crate::app::PartitionMode::Manual;
+        app.config.manual_solo = true;
+        app.parts_scanned = true;
+        app.parts_list = vec![];
+
+        // An ESP, then a root that takes everything left of the disk.
+        app.parts_create_disk = "/dev/vda".into();
+        create_slot(&mut app, ROLE_ESP, 512);
+        app.parts_create_disk = "/dev/vda".into();
+        create_slot(&mut app, ROLE_ROOT, MANUAL_REST);
+        let root_dev = app.config.manual_root.clone();
+        let root_had = rest_bytes(&app, "/dev/vda");
+
+        // Enter on "+ Create" — where the swap came from.
+        app.cursor = build_rows(&app)
+            .iter()
+            .position(|r| matches!(r, Row::Create { disk } if disk == "/dev/vda"))
+            .expect("no create row for /dev/vda");
+        handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(
+            !app.parts_create_open,
+            "the create wizard opened on a disk with nothing left to give"
+        );
+        assert!(
+            app.pmode_status.contains(&root_dev),
+            "the refusal must name the slot to shrink, got {:?}",
+            app.pmode_status
+        );
+        assert_eq!(
+            rest_bytes(&app, "/dev/vda"),
+            root_had,
+            "the root was shrunk anyway"
+        );
+
+        // And the way out the message points at must work: Enter on the root
+        // opens its size box. Blocking that would leave a disk nobody can edit.
+        app.cursor = build_rows(&app)
+            .iter()
+            .position(|r| matches!(r, Row::Part { path, is_new: true } if *path == root_dev))
+            .expect("the planned root is not listed");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.parts_create_open && app.parts_create_stage == 1,
+            "the slot the refusal names cannot be resized"
+        );
+    }
+
+    /// Reported from QEMU: with 25.5 GiB free, the box refused 26 GiB and gave
+    /// no way to ask for 25.5 — the field took digits only. So the user switched
+    /// to MiB and typed 25500, which is 24.9 GiB, not 25.5, and nothing on
+    /// screen could have told them. Half a gibibyte is a size people want.
+    #[test]
+    fn a_size_can_be_typed_with_a_fraction() {
+        let mut app = App::new();
+        app.config.partition_mode = crate::app::PartitionMode::Manual;
+        app.config.manual_solo = true;
+        app.parts_scanned = true;
+        app.parts_list = vec![];
+
+        let open_box = |app: &mut App| {
+            app.parts_create_open = true;
+            app.parts_create_stage = 1;
+            app.parts_create_role = ROLE_HOME;
+            app.parts_create_disk = "/dev/vda".into();
+            app.parts_size_mib = false; // GiB
+            app.parts_size_input.clear();
+            app.parts_size_pristine = false;
+        };
+
+        open_box(&mut app);
+        for ch in ['2', '5', '.', '5'] {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.parts_size_input, "25.5", "the point was swallowed");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.config.manual_home_new_mib,
+            25 * 1024 + 512,
+            "25.5 GiB did not become 26112 MiB"
+        );
+
+        // A comma is the same key on the layouts this installer ships, and
+        // types the same character.
+        open_box(&mut app);
+        for ch in ['1', ',', '5'] {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.parts_size_input, "1.5", "a comma did not type a point");
+
+        // But not two points, and not one on its own: a box that opens with a
+        // lone dot reads as a stuck key rather than as a number.
+        open_box(&mut app);
+        for ch in ['.', '2', '.', '5', '.'] {
+            handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            app.parts_size_input, "2.5",
+            "the point guard let a stray in"
         );
     }
 
@@ -4834,9 +5467,8 @@ mod tests {
         );
     }
 
-    /// Enter on a marked header raises the "erase NOW" confirm, which defaults to
-    /// cancel — one careless Enter never erases a disk, and cancelling keeps the
-    /// disk's "later" mark intact.
+    /// Enter on a marked header raises the erase confirm, which defaults to
+    /// cancel — one careless Enter never erases a disk.
     #[test]
     fn a_now_wipe_confirm_defaults_to_cancel() {
         let mut app = App::new();
@@ -4864,10 +5496,95 @@ mod tests {
             app.wipe_run_rx.is_none() && app.wipe_run_done.is_none(),
             "a wipe was launched from the default confirm"
         );
+        // "No, cancel" answers the question in the title — ERASE ALL DATA? — so
+        // it takes the mark back off. It used to leave it on, which meant saying
+        // no to the dialog and having the install erase the disk anyway; the
+        // erase-during-install choice is now its own line instead.
+        assert!(
+            !app.config.manual_wipe.iter().any(|w| w.disk == "/dev/vdb"),
+            "cancelling left the disk marked for erasure anyway"
+        );
+    }
+
+    /// The middle option keeps the mark and runs nothing now.
+    ///
+    /// This is the choice most people want — erase the disk as part of the
+    /// install — and it had no line of its own. It happened only if you picked a
+    /// method with ←/→ and then never pressed Enter, so the way to choose it was
+    /// to avoid the key that shows the choices.
+    #[test]
+    fn the_middle_option_erases_during_the_install() {
+        let mut app = App::new();
+        app.config.partition_mode = crate::app::PartitionMode::Manual;
+        app.config.manual_solo = true;
+        app.parts_scanned = true;
+        app.parts_list = vec![part("/dev/vdb1", "/dev/vdb", "ext4")];
+        app.cursor = build_rows(&app)
+            .iter()
+            .position(|r| matches!(r, Row::DiskHeader { disk } if disk == "/dev/vdb"))
+            .unwrap();
+        handle_key(&mut app, key(KeyCode::Right)); // pick a method
+        handle_key(&mut app, key(KeyCode::Enter)); // -> the confirm
+        handle_key(&mut app, key(KeyCode::Down)); // cancel -> during install
+        assert_eq!(app.parts_wipe_confirm_cursor, 1);
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(!app.parts_wipe_open, "the confirm did not close");
+        assert!(
+            app.wipe_run_rx.is_none() && app.wipe_run_done.is_none(),
+            "the during-install option started erasing immediately"
+        );
         assert!(
             app.config.manual_wipe.iter().any(|w| w.disk == "/dev/vdb"),
-            "cancelling the now-confirm dropped the later mark"
+            "the during-install option did not keep the mark, so nothing would \
+             be erased at all"
         );
+    }
+
+    /// A data partition in the manual editor can be encrypted, and the choice
+    /// reaches the plan.
+    ///
+    /// The plan side always worked — `ExtraDisk::encrypt` carries LUKS through
+    /// mkfs, crypttab and the keyfile. It was only ever reachable from the
+    /// extra-disks step, and that step stopped appearing in manual mode once the
+    /// editor took over its job, so in manual mode there was no way to ask for it
+    /// at all.
+    #[test]
+    fn a_data_partition_can_be_encrypted_from_the_manual_editor() {
+        let mut c = manual_cfg();
+        c.extra_disks.push(crate::app::ExtraDisk {
+            disk: "/dev/vdb2".into(),
+            mountpoint: "/mnt/data".into(),
+            fs: "ext4".into(),
+            format: true,
+            ..Default::default()
+        });
+        assert!(!data_is_encrypted(&c, "/dev/vdb2"));
+        assert!(toggle_data_encryption(&mut c, "/dev/vdb2"));
+        assert!(data_is_encrypted(&c, "/dev/vdb2"));
+        assert!(toggle_data_encryption(&mut c, "/dev/vdb2"));
+        assert!(
+            !data_is_encrypted(&c, "/dev/vdb2"),
+            "it did not turn back off"
+        );
+    }
+
+    /// A partition kept AS-IS is refused: encrypting it means destroying what is
+    /// on it, and keeping that is the only reason it is not being formatted.
+    #[test]
+    fn a_preserved_partition_is_never_encrypted() {
+        let mut c = manual_cfg();
+        c.extra_disks.push(crate::app::ExtraDisk {
+            disk: "/dev/vdb3".into(),
+            mountpoint: "/mnt/photos".into(),
+            fs: "ext4".into(),
+            format: false,
+            ..Default::default()
+        });
+        assert!(
+            !toggle_data_encryption(&mut c, "/dev/vdb3"),
+            "a partition whose data is being kept was accepted for encryption"
+        );
+        assert!(!data_is_encrypted(&c, "/dev/vdb3"));
     }
 
     /// The happy dual-boot layout passes: reuse the vfat ESP, format root.

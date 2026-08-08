@@ -87,6 +87,39 @@ fn donate_qr(lang: crate::i18n::Lang) -> &'static [&'static str] {
     }
 }
 
+/// The same code drawn with FULL blocks only, for a font that has no half ones.
+///
+/// The compact form packs two module rows into every text row, using `▀ ▄ █`.
+/// Terminus — the default console font — has only `█`, so on it the code came
+/// out as a field of holes that no scanner could read.
+///
+/// This expands it back out: one text row per module row, and TWO columns per
+/// module so the modules stay square. A character cell is about twice as tall as
+/// it is wide, and a QR code with rectangular modules is one scanners refuse.
+/// The result is 74 columns by 38 rows instead of 37 by 19 — it needs a taller
+/// console, which is why the compact form is still preferred when the font can
+/// draw it.
+fn qr_full_blocks(rows: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        let mut top = String::new();
+        let mut bottom = String::new();
+        for ch in row.chars() {
+            let (t, b) = match ch {
+                '\u{2588}' => (true, true),  // █ both halves dark
+                '\u{2580}' => (true, false), // ▀ upper half
+                '\u{2584}' => (false, true), // ▄ lower half
+                _ => (false, false),
+            };
+            top.push_str(if t { "\u{2588}\u{2588}" } else { "  " });
+            bottom.push_str(if b { "\u{2588}\u{2588}" } else { "  " });
+        }
+        out.push(top);
+        out.push(bottom);
+    }
+    out
+}
+
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     // Content fills the top; the Continue button is pinned to the bottom so it
     // stays visible even if the content above is tall.
@@ -95,11 +128,32 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(0), Constraint::Length(11)])
         .split(area);
 
-    // The QR needs its own rows plus 7 lines of text above and 3 below. On a
-    // short terminal, drop the QR and keep the link so nothing important is
-    // pushed off-screen; the printed URL still gets the message across.
+    // The donation QR, in whichever form this console can actually show.
+    //
+    // Preferred: the compact half-block code, 19 rows. If the loaded font has no
+    // half blocks — Terminus, the default, does not — it is drawn with full
+    // blocks instead, which works on every font but needs twice the height and
+    // twice the width. Only if NEITHER fits is it dropped, and the printed link
+    // below still gets the message across.
+    //
+    // It used to be dropped outright on a font without half blocks, which meant
+    // the code was missing on the default console font: the one place it was
+    // most likely to be looked at.
     let qr = donate_qr(app.lang);
-    let show_qr = (v[0].height as usize) >= qr.len() + 10;
+    let panel_h = v[0].height as usize;
+    let panel_w = v[0].width as usize;
+    let compact_fits = panel_h >= qr.len() + 10
+        && crate::screens::fontpick::can_draw_half_blocks(&app.config.console_font);
+    let wide = qr_full_blocks(qr);
+    let wide_fits = panel_h >= wide.len() + 10 && panel_w >= wide[0].chars().count();
+    let qr_rows: Vec<String> = if compact_fits {
+        qr.iter().map(|r| (*r).to_string()).collect()
+    } else if wide_fits {
+        wide
+    } else {
+        Vec::new()
+    };
+    let show_qr = !qr_rows.is_empty();
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     lines.push(Line::from(Span::styled("[ OK ]", theme::ok())));
@@ -119,8 +173,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(""));
     if show_qr {
         let qr_style = Style::default().fg(Color::Black).bg(Color::White);
-        for row in qr {
-            lines.push(Line::from(Span::styled(*row, qr_style)));
+        for row in &qr_rows {
+            lines.push(Line::from(Span::styled(row.clone(), qr_style)));
         }
         lines.push(Line::from(""));
     }
@@ -171,7 +225,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     ))];
     for (i, o) in opts.iter().enumerate() {
         let sel = i == app.finish_cursor;
-        let prefix = if sel { "▸ " } else { "  " };
+        let prefix = if sel { "> " } else { "  " };
         let style = if sel {
             theme::selected()
         } else {
@@ -251,6 +305,64 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The full-block code carries the SAME modules as the compact one.
+    ///
+    /// It is the compact art re-drawn, so if the expansion is wrong the code
+    /// still looks like a QR and simply does not scan — the worst kind of bug to
+    /// find by eye. Decoding both back to a module grid is the check.
+    #[test]
+    fn the_wide_qr_is_the_same_code_as_the_compact_one() {
+        for rows in [QR_UK, QR_EN] {
+            let wide = qr_full_blocks(rows);
+            assert_eq!(wide.len(), rows.len() * 2, "one text row per module row");
+
+            for (r, row) in rows.iter().enumerate() {
+                for (c, ch) in row.chars().enumerate() {
+                    let (want_top, want_bottom) = match ch {
+                        '\u{2588}' => (true, true),
+                        '\u{2580}' => (true, false),
+                        '\u{2584}' => (false, true),
+                        _ => (false, false),
+                    };
+                    // Each module became two columns; either tells the truth.
+                    let dark = |line: &str| -> bool {
+                        line.chars().nth(c * 2) == Some('\u{2588}')
+                            && line.chars().nth(c * 2 + 1) == Some('\u{2588}')
+                    };
+                    assert_eq!(
+                        dark(&wide[r * 2]),
+                        want_top,
+                        "row {r} col {c}: upper module differs"
+                    );
+                    assert_eq!(
+                        dark(&wide[r * 2 + 1]),
+                        want_bottom,
+                        "row {r} col {c}: lower module differs"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A font without half blocks still gets a code, given the room for it.
+    ///
+    /// Terminus is the default and has no `▀ ▄`. Dropping the code there left it
+    /// missing on the console most people see it on.
+    #[test]
+    fn the_qr_survives_a_font_that_has_no_half_blocks() {
+        let wide = qr_full_blocks(QR_UK);
+        assert!(
+            wide.iter()
+                .all(|r| !r.contains('\u{2580}') && !r.contains('\u{2584}')),
+            "the fallback still uses half blocks, which is the whole problem"
+        );
+        assert!(
+            wide[0].chars().count() == QR_UK[0].chars().count() * 2,
+            "modules must stay square: two columns per module"
+        );
+    }
+
     use super::*;
 
     /// Decode the half-block art back into a module matrix:

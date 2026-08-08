@@ -58,7 +58,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 app.config.desktops.contains(&dname)
             };
             let (mark, mark_style) = if selected {
-                ("[✓] ", theme::ok())
+                ("[x] ", theme::ok())
             } else {
                 ("[ ] ", theme::mute())
             };
@@ -101,7 +101,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         })
-        .highlight_symbol(if de_panel_focused { "▎ " } else { "  " })
+        .highlight_symbol(if de_panel_focused { "> " } else { "  " })
         .highlight_spacing(HighlightSpacing::Always);
     let mut de_state = ListState::default();
     de_state.select(Some(app.cursor.min(opts.len().saturating_sub(1))));
@@ -117,7 +117,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|id| {
             let selected = *id == app.config.display_manager;
             let (mark, mark_style) = if selected {
-                ("[✓] ", theme::ok())
+                ("[x] ", theme::ok())
             } else {
                 ("[ ] ", theme::mute())
             };
@@ -146,7 +146,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         })
-        .highlight_symbol(if !de_panel_focused { "▎ " } else { "  " })
+        .highlight_symbol(if !de_panel_focused { "> " } else { "  " })
         // Always reserve the highlight-symbol column so every row's [ ]/[✓] mark
         // sits at the same x whether or not a row is highlighted.
         .highlight_spacing(HighlightSpacing::Always);
@@ -178,7 +178,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         let note = d.note();
         if !note.is_empty() {
             v.push(Line::from(Span::styled(
-                format!("  ⚠ {note}"),
+                format!("  [!] {note}"),
                 theme::warn(),
             )));
         }
@@ -217,14 +217,14 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Seat/login-manager modal, drawn last so it overlays everything.
     if app.seat_modal_open {
-        draw_seat_modal(f, app, area);
+        draw_seat_modal(f, app);
     }
 }
 
 /// A centered modal that forces an explicit seat/login-manager choice, with
 /// clear explanations. elogind (universal, recommended) is the default; seatd
 /// is the minimal Wayland-only option.
-fn draw_seat_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_seat_modal(f: &mut Frame, app: &App) {
     use ratatui::widgets::BorderType;
     use ratatui::widgets::{Block, Borders, Clear};
 
@@ -236,16 +236,12 @@ fn draw_seat_modal(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| desktop_from_cfg(s))
         .any(|d| d != Desktop::None && d.supports_x11());
-    let w = 64u16.min(area.width.saturating_sub(4));
-    let h = (if x11_session { 18 } else { 13 }).min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let modal = crate::screens::widgets::modal_rect_fit(
+        f,
+        64,
+        if x11_session { 18 } else { 13 },
+        app.modal_zoom,
+    );
 
     // Clear the area behind the modal so the list doesn't show through.
     f.render_widget(Clear, modal);
@@ -330,9 +326,9 @@ fn draw_seat_modal(f: &mut Frame, app: &App, area: Rect) {
     if x11_session {
         lines.push(Line::from(""));
         let (prefix, style) = if seatd_sel {
-            ("⚠ ", theme::warn()) // risky choice highlighted → bold warning
+            ("[!] ", theme::warn()) // risky choice highlighted → bold warning
         } else {
-            ("ⓘ ", theme::dim()) // elogind highlighted → gentle reminder
+            ("i ", theme::dim()) // elogind highlighted → gentle reminder
         };
         lines.push(Line::from(Span::styled(
             format!("{}{}", prefix, t(app.lang, "seat.x11_warn")),

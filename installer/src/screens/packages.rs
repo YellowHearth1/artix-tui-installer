@@ -108,10 +108,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|g| {
             let sel = gpu_selected(&app.config.gpu, *g);
-            format!("{} {}", if sel { "[✓]" } else { "[ ]" }, gpu_label(*g))
+            format!("{} {}", if sel { "[x]" } else { "[ ]" }, gpu_label(*g))
         })
         .collect();
-    widgets::select_list(f, gpu_inner, &gpu_items, app.gpu_cursor);
+    widgets::select_list_scrolled(f, gpu_inner, &gpu_items, app.gpu_cursor, app.marquee);
 
     // ── search box ──
     let title = if app.pkg_searching {
@@ -138,11 +138,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             },
         ),
         Span::styled(
-            if app.pkg_focus == FOCUS_PKG {
-                "▏"
-            } else {
-                ""
-            },
+            if app.pkg_focus == FOCUS_PKG { "|" } else { "" },
             theme::accent(),
         ),
     ]))
@@ -187,6 +183,16 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         &t(app.lang, "app.next"),
         true,
     );
+
+    // THE DIALOG GOES LAST, over the WHOLE screen — not last inside one of the
+    // rows above it. It used to be drawn at the end of `draw_results`, which is
+    // only the middle band, so the two paragraphs rendered afterwards painted
+    // straight over it: the selected-package list appeared INSIDE the logo
+    // picker, eating its left border and its choices. `Clear` cannot help with
+    // that, because the overwriting happens after `Clear` has already run.
+    if app.logo_modal_open {
+        draw_logo_modal(f, app);
+    }
 }
 
 fn draw_results(f: &mut Frame, app: &App, area: Rect) {
@@ -244,7 +250,7 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         .map(|p: &Pkg| {
             let checked = app.config.extra_packages.contains(&p.name);
             let (mark, mark_style, name_style) = if checked {
-                ("[✓] ", theme::ok(), theme::gold())
+                ("[x] ", theme::ok(), theme::gold())
             } else {
                 ("[ ] ", theme::mute(), theme::normal())
             };
@@ -286,7 +292,7 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
                 .bg(theme::SEL_BG)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )
-        .highlight_symbol("▎ ");
+        .highlight_symbol("> ");
     let mut st = ListState::default();
     if !rows_source.is_empty() {
         let sel = app.cursor.min(rows_source.len() - 1);
@@ -301,27 +307,43 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         st.select(Some(sel));
     }
     f.render_stateful_widget(list, inner[1], &mut st);
-
-    // The slayfetch logo picker renders on top of everything.
-    if app.logo_modal_open {
-        draw_logo_modal(f, app, area);
-    }
 }
 
 /// The slayfetch logo picker: a scrollable list of the embedded Artix + pride
 /// logo variants, the chosen one highlighted. Names only — the actual images
 /// ship in the README collage, so the user knows what each looks like.
-fn draw_logo_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_logo_modal(f: &mut Frame, app: &App) {
     use ratatui::widgets::Clear;
     let variants = crate::system::logos::variants();
-    let w = 46u16.min(area.width.saturating_sub(4)).max(24);
-    let h = 16u16.min(area.height.saturating_sub(2)).max(6);
-    let rect = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    // SIZED FROM ITS OWN CONTENT, because at the largest console font this box
+    // had four rows to work with and spent two of them on chrome: the user saw
+    // one flag name and the word "Esc", and could not tell it was a list.
+    //
+    // What it asks for is the whole list plus its title and hint. What it gets
+    // is clamped to the panel — and when the clamp bites, the ROWS are what
+    // survives: the hint drops first (Esc closes every dialog in this
+    // installer), so the shrinking box keeps showing choices for as long as it
+    // has any room at all.
+    let longest = variants
+        .iter()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    // THE TITLE AND THE HINT ARE CONTENT TOO. Sized from the flag names alone,
+    // the box was narrower than its own footer: the hint came out as
+    // "…· Esc –" and the key that closes the dialog was the part cut off.
+    let title_w = t(app.lang, "pkg.logo_title").chars().count() as u16 + 6;
+    let hint_w = t(app.lang, "pkg.logo_hint").chars().count() as u16 + 4;
+    let w = (longest + 8).max(title_w).max(hint_w).max(24);
+    // Tall enough for the whole list, but never touching the panel's edge: at
+    // full stretch the last row sat against the border with nothing under it.
+    // Four rows held back leave a clear margin above and below, and the list
+    // scrolls for whatever does not fit — which on a large console is nothing.
+    // Measured against the DISPLAY, because that is what the box is centred in
+    // now — the panel it was raised from is narrower and starts lower.
+    let room = f.area().height.saturating_sub(4).max(6);
+    let h = (variants.len() as u16 + 3).min(room);
+    let rect = crate::screens::widgets::modal_rect_fit(f, w, h, app.modal_zoom);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -340,7 +362,7 @@ fn draw_logo_modal(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|v| {
             let mut spans = vec![Span::styled(
-                if v == chosen { "\u{2713} " } else { "  " }.to_string(),
+                if v == chosen { "x " } else { "  " }.to_string(),
                 theme::accent(),
             )];
             spans.extend(flag_colored(v));
@@ -356,25 +378,38 @@ fn draw_logo_modal(f: &mut Frame, app: &App, area: Rect) {
                 .bg(theme::SEL_BG)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )
-        .highlight_symbol("\u{25b6} ");
+        .highlight_symbol("> ");
     let mut st = ListState::default();
     if !variants.is_empty() {
         let sel = app.logo_cursor.min(variants.len() - 1);
-        let view_h = inner.height.saturating_sub(1) as usize;
+        // The rows the list will really get — one fewer when the hint is drawn.
+        // Counting a row that is not there scrolled the cursor off the top on a
+        // short box, which is how a list of nine flags managed to show none.
+        let view_h = if inner.height >= 3 {
+            inner.height - 1
+        } else {
+            inner.height.max(1)
+        } as usize;
         let max_off = variants.len().saturating_sub(view_h);
         *st.offset_mut() = sel.saturating_sub(view_h / 2).min(max_off);
         st.select(Some(sel));
     }
-    // Reserve the last row for a hint.
-    let split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    f.render_stateful_widget(list, split[0], &mut st);
-    f.render_widget(
-        Paragraph::new(Span::styled(t(app.lang, "pkg.logo_hint"), theme::mute())),
-        split[1],
-    );
+    // The hint gets the last row only while there is one to spare. On a console
+    // squeezed down to a handful of cells the choices matter and the reminder
+    // that Esc closes things does not — it is the same on every dialog here.
+    if inner.height >= 3 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        f.render_stateful_widget(list, split[0], &mut st);
+        f.render_widget(
+            Paragraph::new(Span::styled(t(app.lang, "pkg.logo_hint"), theme::mute())),
+            split[1],
+        );
+    } else {
+        f.render_stateful_widget(list, inner, &mut st);
+    }
 }
 
 /// Paint a variant's name. Only the RAINBOW flag is coloured — its bright

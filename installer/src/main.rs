@@ -60,7 +60,50 @@ fn main() -> Result<()> {
     let mut app = App::new();
     let res = run(&mut terminal, &mut app);
     restore_terminal()?;
+    // Asked for on the way out, once the TUI is down and the terminal is the
+    // user's again — so any message the tools print is actually readable.
+    if app.pending_reboot || app.pending_firmware {
+        leave_to_firmware_or_reboot(&app);
+    }
     res
+}
+
+/// Reboot, optionally straight into the firmware's own setup menu.
+///
+/// `efibootmgr` cannot request that; the kernel can, through the EFI variable
+/// the firmware reads on the next start. On a BIOS machine there is no such
+/// variable, so this degrades to a plain reboot and says so rather than
+/// pretending it did something.
+fn leave_to_firmware_or_reboot(app: &App) {
+    use std::io::Write;
+    use std::process::Command;
+    let mut out = io::stdout();
+    if app.pending_firmware {
+        if std::path::Path::new("/sys/firmware/efi").exists() {
+            let _ = writeln!(out, ">> {}", t(app.lang, "ui.to_firmware"));
+            let _ = out.flush();
+            // ONLY the "show me your setup menu" bit — nothing here may
+            // touch the boot ORDER. This used to run `efibootmgr --bootnext 0`
+            // first, which forces the next start to boot entry 0000, whatever
+            // that happens to be. On a machine just installed to, that was not
+            // the new system: the firmware went somewhere else and the installed
+            // Artix looked as though it had never been added. An exit route must
+            // never redirect anybody's boot.
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    "                      printf '\\x07\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00'                        > /sys/firmware/efi/efivars/OsIndications-8be4df61-93ca-11d2-aa0d-00e098032b8c                        2>/dev/null || true",
+                ])
+                .status();
+        } else {
+            let _ = writeln!(out, ">> {}", t(app.lang, "ui.no_firmware_menu"));
+            let _ = out.flush();
+        }
+    } else {
+        let _ = writeln!(out, ">> {}", t(app.lang, "ui.rebooting"));
+        let _ = out.flush();
+    }
+    let _ = Command::new("reboot").status();
 }
 
 fn setup_terminal() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
@@ -94,7 +137,23 @@ fn run(
         }
         app.frame = app.frame.wrapping_add(1);
         terminal.draw(|f| draw(f, app))?;
+        // A FONT CHANGE RESIZES THE CONSOLE, so the previous frame is garbage.
+        //
+        // `setfont` with a taller or shorter glyph gives the VT a different
+        // number of rows and columns. ratatui asks the backend for the size each
+        // frame and lays out correctly for the new one — but the cells left over
+        // from the old, differently-shaped frame are still on the screen, and it
+        // only redraws what it believes changed. The result was a screen with
+        // the step rail halfway down it and background text showing through a
+        // dialog: two layouts on top of each other, neither wrong on its own.
+        //
+        // So the next frame is drawn from scratch. Once per keypress, not per
+        // frame — a full repaint of a console is visible if you do it always.
+        let font_before = app.config.console_font.clone();
         event::handle(app)?;
+        if app.config.console_font != font_before {
+            terminal.clear()?;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -102,8 +161,12 @@ fn run(
 }
 
 /// Guidance shown on the bare terminal before the recovery chroot shell opens,
-/// and after it exits. Bilingual, hardcoded (like the rollback tool) so it needs
-/// no i18n keys. Plain ASCII so it renders cleanly on any console.
+/// and after it exits. Hardcoded (like the rollback tool) so it needs no i18n
+/// keys. Plain ASCII so it renders cleanly on any console.
+///
+/// ALL THREE LANGUAGES. This was Ukrainian-or-English, which quietly meant
+/// "Spanish speakers get English" — in the one place where the reader is being
+/// told how to leave a chroot without breaking their system further.
 const REC_GUIDE_UK: &str = "
 ============================================================
   ВІДНОВЛЕННЯ — ви root у вашій встановленій системі
@@ -118,6 +181,23 @@ const REC_GUIDE_UK: &str = "
 
   НЕ запускайте тут  reboot  чи  shutdown  — це chroot, воно
   не спрацює. Просто вийдіть через  exit.
+============================================================
+
+";
+const REC_GUIDE_ES: &str = "
+============================================================
+  RECUPERACION — eres root en tu sistema instalado
+============================================================
+  La raiz de tu sistema instalado esta montada en /, eres root.
+  Repara lo que necesites: edita configuraciones, reinstala
+  paquetes, ejecuta grub-mkconfig, arregla fstab, etc.
+
+  Cuando termines, escribe  exit  (o Ctrl-D).
+  La herramienta desmontara ENTONCES el sistema instalado y
+  reiniciara el equipo (con unos segundos para cancelar).
+
+  NO ejecutes  reboot  ni  shutdown  aqui — esto es un chroot y
+  no funcionara. Sal simplemente con  exit.
 ============================================================
 
 ";
@@ -173,7 +253,15 @@ fn run_interactive_step(
         if recovery {
             // Tell the user exactly what they're in, how to leave, and that
             // rebooting from inside a chroot won't work.
-            let _ = write!(out, "{}", if uk { REC_GUIDE_UK } else { REC_GUIDE_EN });
+            let _ = write!(
+                out,
+                "{}",
+                match app.lang {
+                    crate::i18n::Lang::Uk => REC_GUIDE_UK,
+                    crate::i18n::Lang::Es => REC_GUIDE_ES,
+                    _ => REC_GUIDE_EN,
+                }
+            );
         } else if finish {
             // Same idea, but they're the freshly-created user doing final setup.
             let who = if app.config.username.trim().is_empty() {
@@ -181,7 +269,29 @@ fn run_interactive_step(
             } else {
                 app.config.username.clone()
             };
-            let g = if uk {
+            let g = if matches!(app.lang, crate::i18n::Lang::Es) {
+                format!(
+                    "
+============================================================
+  INSTALADO — eres {who} en tu sistema nuevo
+============================================================
+  Estas dentro del sistema instalado (chroot) como tu usuario.
+  Haz los ultimos pasos: aplica tus configuraciones, ejecuta
+  scripts, instala paquetes (sudo pacman -S ...). La red ya
+  funciona.
+
+  Cuando termines, escribe  exit  (o Ctrl-D). El instalador
+  desmontara ENTONCES las particiones de forma segura
+  (umount -R /mnt, cierra LUKS) y reiniciara el equipo — con
+  unos segundos para cancelar.
+
+  NO ejecutes  reboot  ni  shutdown  aqui — esto es un chroot y
+  no funcionara. Sal simplemente con  exit.
+============================================================
+
+"
+                )
+            } else if uk {
                 format!(
                     "
 ============================================================
@@ -402,7 +512,7 @@ fn draw_too_small(f: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = (0..pad).map(|_| Line::from("")).collect();
     lines.push(Line::from(Span::styled(
         format!(
-            "⚠  {} · {}",
+            "[!]  {} · {}",
             t(Lang::Uk, "ui.too_small"),
             t(Lang::En, "ui.too_small")
         ),
@@ -442,10 +552,15 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // Mode/Recovery live outside the numbered flow. Use an out-of-range
     // "current" so NONE of the install steps render as done/active — they all
     // show as pending, which reads correctly (no install step is in progress).
-    let current = match app.screen {
-        Screen::Mode | Screen::Recovery | Screen::WifiTest | Screen::TbwTest => usize::MAX,
-        s => s as usize,
-    };
+    // Position among the steps this run actually shows, not the raw enum index:
+    // a skipped step must not leave a gap in the rail or shift everything after
+    // it. Screens outside the wizard use an out-of-range "current" so no step
+    // renders as done or active — nothing is in progress there.
+    let steps = app.visible_steps();
+    let current = steps
+        .iter()
+        .position(|s| *s == app.screen)
+        .unwrap_or(usize::MAX);
     // Brand. The rail is narrow (12 cols), so keep this short. "ARTIX" centered,
     // with a small mark above it. Plain ASCII/geometric chars only, so it
     // renders on a bare console font too.
@@ -456,9 +571,9 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
-    let nums = [
-        "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15",
-    ];
+    // Numbered from the visible steps, so the rail is exactly as long as the
+    // wizard is for THIS user.
+    let nums: Vec<String> = (1..=steps.len()).map(|n| format!("{n:02}")).collect();
 
     // Spinner for the ACTIVE step. The bare Linux console font often lacks
     // fancy glyphs (diamonds, braille), which then show up as "*" or "?", so we
@@ -469,17 +584,17 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, num) in nums.iter().enumerate() {
         let (glyph, style) = if i < current {
-            ("●".to_string(), theme::step_done())
+            ("*".to_string(), theme::step_done())
         } else if i == current {
             (spin_ch.to_string(), theme::step_active())
         } else {
-            ("○".to_string(), theme::step_pending())
+            ("o".to_string(), theme::step_pending())
         };
         // Numbers only — no text labels. Keeps the rail narrow so the content
         // panel gets the space; the full step title lives in the panel header.
         lines.push(Line::from(vec![
             Span::styled(format!("  {glyph} "), style),
-            Span::styled((*num).to_string(), style),
+            Span::styled(num.clone(), style),
         ]));
     }
 
@@ -509,7 +624,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     });
     f.render_widget(block, area);
 
-    let hint = screens::footer_hint(app).unwrap_or_else(|| t(app.lang, "nav.hint"));
+    // The fallback footer promised "q — quit" on every screen. Since leaving is
+    // only possible from the first one, saying it elsewhere is a hint that
+    // lies — and the screen it lies on is usually the one where losing the
+    // session would cost the most.
+    let mut hint = screens::footer_hint(app).unwrap_or_else(|| {
+        if app.screen == crate::app::Screen::Language {
+            t(app.lang, "nav.hint_first")
+        } else {
+            t(app.lang, "nav.hint")
+        }
+    });
+    // A dialog can be resized, and nobody guesses that. Append it to the hint
+    // only WHILE one is open, so the line stays about what is actually in front
+    // of the user instead of listing a key that currently does something else.
+    if app.modal_open() {
+        hint.push_str(" · ");
+        hint.push_str(&t(app.lang, "nav.resize_modal"));
+    }
 
     // Each hint is a list of "KEY action" pairs joined by " · ". We render the
     // key part (everything up to the first run of spaces in a segment) in the
@@ -547,6 +679,7 @@ fn screen_title(app: &App) -> String {
         Screen::Recovery => return format!(" {} ", t(app.lang, "rec.title")),
         Screen::WifiTest => return format!(" {} ", t(app.lang, "wt.title")),
         Screen::TbwTest => return format!(" {} ", t(app.lang, "tbw.title")),
+        Screen::FontPick => return format!(" {} ", t(app.lang, "font.title")),
         _ => {}
     }
     let key = match app.screen {
@@ -567,13 +700,12 @@ fn screen_title(app: &App) -> String {
         Screen::Summary => "sum.title",
         Screen::Finish => "fin.title",
         // Handled above with an early return.
-        Screen::Mode | Screen::Recovery | Screen::WifiTest | Screen::TbwTest => unreachable!(),
+        Screen::Mode | Screen::Recovery | Screen::WifiTest | Screen::TbwTest | Screen::FontPick => {
+            unreachable!()
+        }
     };
-    format!(
-        " {} / 15  ·  {} ",
-        app.screen.step_number(),
-        t(app.lang, key)
-    )
+    let (pos, total) = app.step_position();
+    format!(" {pos} / {total}  ·  {} ", t(app.lang, key))
 }
 
 #[cfg(test)]
@@ -660,6 +792,82 @@ mod tests {
             "hardcoded UI strings — these belong in i18n/*.toml, reached with \
              t(lang, \"key\"):\n  {}",
             offenders.join("\n  ")
+        );
+    }
+
+    /// No glyph the console cannot draw may hide behind a `\u{...}` escape.
+    ///
+    /// The interface was swept once for characters no shipped console font has,
+    /// and every literal one was replaced. The escapes survived: `\u{26a0}` is
+    /// eight ASCII bytes in the source, so a scan for non-ASCII walks straight
+    /// past it — and the warning sign it spells printed as a stray digit on the
+    /// user's console for another release. Nine characters were hiding that way.
+    ///
+    /// `scripts/psf-patch.py --check` is the full test, against the real font
+    /// files; it cannot run here because those live on the ISO. This is the part
+    /// that can: a short list of characters known to be absent from every font
+    /// the installer offers.
+    #[test]
+    fn no_unavailable_glyph_hides_behind_an_escape() {
+        // Verified against all 362 console fonts on the image, plus the
+        // vendored ones: none of these is drawable, so each is a blank or a
+        // wrong glyph on a real console.
+        // Written as CODE POINTS, never as the characters or the escapes: a
+        // table spelled either way would match itself and fail on its own text.
+        const UNDRAWABLE: &[(u32, &str)] = &[
+            (0x26a0, "use [!]"),
+            (0x2713, "use x"),
+            (0x258f, "use |"),
+            (0x25b8, "use >"),
+            (0x25b6, "use >"),
+            (0x25a0, "use #"),
+            (0x25b2, "use ^ (LatGrkCyr has no triangles)"),
+            (0x25bc, "use v (LatGrkCyr has no triangles)"),
+            (0x258c, "use | (Terminus has no half blocks)"),
+        ];
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (lineno, line) in src.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                        continue; // a comment is for us, not for the console
+                    }
+                    for (code, advice) in UNDRAWABLE {
+                        // Both spellings: the escape and the character itself.
+                        let escaped = format!("\\u{{{code:04x}}}");
+                        let ch = char::from_u32(*code).expect("valid code point");
+                        if line.contains(&escaped) || line.contains(ch) {
+                            offenders.push(format!(
+                                "{}:{}: U+{code:04X} — {advice}",
+                                path.display(),
+                                lineno + 1,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "characters no console font can draw are still in the interface:\n{}",
+            offenders.join("\n")
         );
     }
 }

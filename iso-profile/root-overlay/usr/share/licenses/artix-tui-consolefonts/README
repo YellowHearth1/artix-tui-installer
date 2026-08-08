@@ -1,0 +1,51 @@
+Console fonts shipped on the live image in addition to `kbd` and `terminus-font`
+==============================================================================
+
+Why they are here
+-----------------
+The installer's interface draws Ukrainian Cyrillic, Latin-1 accents for Spanish
+and box-drawing at the same time. Of the 362 console fonts that `kbd` and
+`terminus-font` install, only two families can do all of that at once: Terminus
+(`ter-v*`) and `LatGrkCyr`. `terminus-font` looks like ten families but nine of
+them (`ter-c`, `ter-d`, `ter-g`, `ter-h`, `ter-i`, `ter-k`, `ter-m`, `ter-p`,
+`ter-u`) are ~262-glyph single-codepage subsets and cannot render a trilingual
+interface by design. No package in Arch, Artix or Chaotic-AUR ships any other
+console font — so the only way to offer a real choice is to carry these files.
+
+What was changed, and how
+-------------------------
+A Linux console font holds exactly 512 glyphs; that is the kernel's ceiling and
+every one of these was already at it. Missing characters were therefore added by
+REUSING glyph slots the interface never asks for, and each new glyph was built
+out of shapes the same font already draws — so nothing was drawn by hand and each
+font keeps its own weight and proportions. `scripts/psf-patch.py` in the project
+repository does this and is the exact provenance of these files:
+
+  tui-*
+      added ▀ ▄ ▌ (pure geometry: top, bottom and left half of the cell).
+
+Every file was verified with `psfgettable` from `kbd`: 512 mappings each, and
+the added codepoints present.
+
+Upstream and licences
+---------------------
+  tui-*           "Artix TUI" / "Artix TUI Bold" — Terminus Font by Dimitar
+                  Zhekov, OFL-1.1, WITH THREE GLYPHS ADDED and renamed.
+                  https://terminus-font.sourceforge.net/       LICENSE.terminus
+
+                  Terminus is OFL-1.1 with the Reserved Font Name "Terminus
+                  Font". Clause 3 forbids a modified version from carrying that
+                  name, so these copies are called something else. The change is
+                  three glyphs — `▀ ▄ ▌` — added because the donation QR code is
+                  half-block encoded and Terminus ships only `█ ░ ▒`; without
+                  them the code drew as a field of holes no scanner could read.
+                  Nothing else about the font was touched.
+
+
+These licences cover the font files in this directory only. The installer itself
+is Apache-2.0; see the project's own LICENSE.
+
+The packaged Terminus ships unchanged and is not offered by the installer; the
+renamed copies above are what the font screen lists. Where a font still cannot
+draw the half blocks, the installer falls back to a full-block QR code (twice the
+size, same modules) and only drops it when there is no room for either.

@@ -2,7 +2,7 @@
 
 # 🐧 Artix TUI Installer
 
-[🇺🇦 Українська](README.md) · **🇬🇧 English** · [🇲🇽 Español](README.es.md) | [ich0x](https://github.com/ich0x)
+[🇺🇦 Українська](README.md) · **🇬🇧 English** · [🇲🇽/🇪🇸 Español](README.es.md) | [ich0x](https://github.com/ich0x)
 
 ### An Artix Linux TUI installer — dinit, LUKS, btrfs rollback, Wayland. systemd-free.
 
@@ -61,7 +61,7 @@ segmented toggles, and a live scrollable install log.
 > machines, catch what breaks and push it back until it works properly. Every
 > release goes through the tests, `clippy` and a release build.
 >
-> What **cannot** be reproduced is the real hardware landscape: UEFI firmware
+> What **cannot** be reproduced is the range of real hardware: UEFI firmware
 > differs wildly between vendors, and there is RAID, hybrid graphics, unusual
 > controllers and laptops with their own ideas. Here is exactly where my testing
 > stops:
@@ -86,6 +86,41 @@ segmented toggles, and a live scrollable install log.
 >   Include the version (bottom-right of the first screen) and what happened.
 >   I do not have your hardware, so without your report I simply never find out
 >   it broke.
+---
+
+> ### 🌍 About the language I write in
+>
+> **I do not speak English and use a translator.** The English in this project —
+> this README, replies in issues, interface strings — goes through it, so some of
+> it may read awkwardly or not quite mean what was intended.
+>
+> Plain language helps. And if something reads badly, say so directly: no
+> offence taken, and fixing it beats leaving it.
+>
+> Ukrainian and Spanish can be written freely.
+
+---
+
+> ### 🖥️ TTY first
+>
+> This installer is **optimised for a plain text console (TTY)**, and that is
+> where it gets tested — on my modified Artix image, built from `base`. No
+> graphics drivers, no X and no Wayland are needed to install.
+>
+> **Why.** On the official Artix images that ship a desktop environment, friends
+> of mine ran into graphics trouble: the installer simply would not start, and
+> installing was impossible. A console has none of those dependencies — if the
+> machine can show text, the installer runs.
+>
+> You **can** run it in a graphical terminal (on an installed system with a
+> desktop), and it usually looks nicer there — but that is not the primary
+> environment, so **graphical glitches are possible**: panel corners, individual
+> characters or colours may not come out as intended. Bugs that only show in a
+> graphical terminal rank below anything broken in the TTY.
+>
+> The console font is not decoration here — it decides whether the interface is
+> visible at all, which is why choosing it is its own menu entry.
+
 ---
 
 > ### 🌐 Adding your language
@@ -188,8 +223,14 @@ segmented toggles, and a live scrollable install log.
   Wayland compositor), XFCE, Cinnamon, MATE, LXDE, or none.
 - **🎮 GPU drivers** — NVIDIA (open-dkms), NVIDIA 580xx (legacy), nouveau, AMD,
   Intel; nouveau is automatically blacklisted when a proprietary driver is chosen.
-- **🛟 System recovery mode** — mounts an existing install (unlocking LUKS if
-  needed), detects the bootloader, and opens a chroot shell to repair it.
+- **🛟 System recovery mode** — for when the system no longer boots. You say
+  **what each partition is** (root, `/boot`, `/boot/efi`, swap, `/home`, data);
+  a suggestion is already filled in, so usually you just confirm it. Then
+  "Diagnose" inspects the system and tells you **in your own language** what is
+  actually broken: no kernel, no initramfs, an fstab naming a disk that is gone.
+  The repairs are separate buttons — reinstall the bootloader, rebuild the
+  initramfs, regenerate fstab, fix permissions after a `chmod 777 /`. The chroot
+  is still there, as a last resort rather than the only one.
 - **🔁 AUR support** — `paru` is built from source (so it always matches the
   system's `libalpm`), then used to install the packages you selected.
 - **🧩 Automatic dinit service enablement** — any installed `*-dinit` package has
@@ -533,16 +574,52 @@ The rollback is **independent of the live kernel**: `/boot` keeps a frozen pair 
 
 ## 📀 ISO profile (`iso-profile/`, for artools `buildiso`)
 
-- `Packages-Root` / `Packages-Live` — packages for the live image (dinit only).
-- `profile.conf` — autologin/display-manager settings for the live session.
-- `live-overlay/usr/bin/installer-launch` — gives the TUI a real controlling
-  terminal on tty1 (`setsid -c`), with a fallback shell on failure.
-- `live-overlay/etc/dinit.d/installer.conf` — the autostart service that runs the
-  installer instead of a getty on tty1.
+**Everything needed to build your own live image**, on any machine with
+`artools`. The image is based on Artix **base**: a text console, no desktop and
+no graphics drivers.
+
+```sh
+sh scripts/build-iso.sh
+```
+
+One command: it builds the installer, runs the tests and `clippy`, copies this
+profile out to the artools workspace and runs `buildiso`. You do not create the
+profile by hand — the script deploys it on every run, so this repo stays the
+source of truth and cannot drift from the code that depends on it.
+
+**The image builds on any Linux** — Docker or Podman is the only requirement:
+
+```sh
+sh scripts/build-iso.sh --docker      # its daemon is already root
+sh scripts/build-iso.sh --podman      # asks for sudo: buildiso mounts a
+                                      # devtmpfs and loop-mounts the EFI image,
+                                      # neither of which a user namespace allows
+```
+
+No Artix, no `artools`, not even a Rust toolchain on the host: the build tooling
+lives in `vendor/artools/` (taken from the Artix packages, not from anyone's
+machine — its README explains why that distinction matters) and the installer is
+compiled inside the container. On Artix itself the same command without
+a flag builds directly. The engine is named on purpose: there is no
+auto-detection, because a build that quietly ran under the other one is exactly
+what keeping them apart is for.
+
+- `profile.yaml` — the image's packages and live-session settings (autologin as
+  `artix`, no display manager).
+- `live-overlay/home/artix/.bash_profile` — this is what starts the installer on
+  tty1. That is the whole autostart mechanism: no dinit service.
+- `live-overlay/usr/bin/installer-start` — sets the console font, then launches
+  the installer.
+- `live-overlay/usr/share/kbd/consolefonts/` — the fonts **no package
+  provides**; each one's origin and licence sit next to them in
+  `usr/share/licenses/`.
 - `grub-overrides/loopback.cfg` — boots straight into the installer.
 
-Drop the compiled binary at `live-overlay/usr/bin/artix-installer`, then run
-`sudo buildiso -p <profile>`.
+**The binary goes in `live-overlay`, not `root-overlay`.** This profile builds a
+live session, so the former is what reaches the image. A copy into `root-overlay`
+fails silently: the build succeeds and ships the previous binary.
+
+Details in [`iso-profile/README.md`](iso-profile/README.md).
 
 ---
 
@@ -558,6 +635,7 @@ installer/        Rust sources (ratatui TUI + install logic)
   src/assets/     embedded configs (kitty, fastfetch, waybar, wofi, pinnacle)
   i18n/           UI strings en.toml / uk.toml
 iso-profile/      artools buildiso profile + live-image overlay
+iso/              built images (never committed — only its README is)
 screenshots/      screenshots for the README (15 wizard steps)
 ```
 
@@ -566,68 +644,72 @@ screenshots/      screenshots for the README (15 wizard steps)
 ## 📸 Screenshots
 
 > **Note.** All screenshots were taken in a graphical terminal emulator on a machine with a desktop environment installed. On a bare TTY (e.g. right after booting the Artix base image) the interface looks much more modest: the kernel console offers only 16 colors and its own fixed font, so some of ratatui's effects — smooth shades, dimmed tones, rounded borders — are unavailable or simplified there. Functionally everything works the same.
+>
+> **The shots predate the step reorder**, so the old numbering (`/15`) and the old order are still visible inside the frames — the keyboard step used to be fourth, not second. The captions below describe the wizard as it is NOW; the shots will be retaken.
 
-A full walk-through of the wizard — all **15 steps**. The interface is available in Ukrainian, English and Spanish; the screenshots below are in English.
+A full walk-through of the wizard — all **16 steps**. The interface is available in Ukrainian, English and Spanish; the screenshots below are in English.
 
-**Step 1/15 — Language.** The installer and system language.
+**Step 1/16 — Language.** The installer and system language.
 
 ![Step 1 — Language](screenshots/en/01-language.png)
 
-**Step 2/15 — Timezone.** Search and pick your timezone.
+**Step 2/16 — Keyboard.** Multi-select layouts with a filter; the first ticked one becomes primary.
 
-![Step 2 — Timezone](screenshots/en/02-timezone.png)
+![Step 2 — Keyboard](screenshots/en/04-keyboard.png)
 
-**Step 3/15 — Network.** Skip (wired) or scan Wi-Fi: pick an adapter, a network, and enter the password.
+**Step 3/16 — Timezone.** Search and pick your timezone.
 
-![Step 3 — Network](screenshots/en/03-wifi.png)
+![Step 3 — Timezone](screenshots/en/02-timezone.png)
 
-**Step 4/15 — Keyboard.** Multi-select layouts with a filter; the first ticked one becomes primary.
+**Step 4/16 — Network.** Skip (wired) or scan Wi-Fi: pick an adapter, a network, and enter the password.
 
-![Step 4 — Keyboard](screenshots/en/04-keyboard.png)
+![Step 4 — Network](screenshots/en/03-wifi.png)
 
-**Step 5/15 — Kernel.** Linux, Linux Zen, Linux Hardened or Linux LTS.
+**Step 5/16 — Kernel.** Linux, Linux Zen, Linux Hardened or Linux LTS.
 
 ![Step 5 — Kernel](screenshots/en/05-kernel.png)
 
-**Step 6/15 — Desktop.** Multi-select desktops, toggle the session (Wayland/X11), and choose a login screen.
+**Step 6/16 — Desktop.** Multi-select desktops, toggle the session (Wayland/X11), and choose a login screen.
 
 ![Step 6 — Desktop](screenshots/en/06-desktop.png)
 
-**Step 7/15 — Packages.** GPU drivers + search and pick popular packages.
+**Step 7/16 — Packages.** GPU drivers + search and pick popular packages.
 
 ![Step 7 — Packages](screenshots/en/07-packages.png)
 
-**Step 8/15 — AUR.** Search the AUR and recommended packages (built via paru).
+**Step 8/16 — AUR.** Search the AUR and recommended packages (built via paru).
 
 ![Step 8 — AUR](screenshots/en/08-aur.png)
 
-**Step 9/15 — Disk & partitions.** UEFI/BIOS, disk selection, SWAP partition, root filesystem.
+**Step 9/16 — Partitioning mode.** Automatic (whole disk), alongside an existing OS, into free space you already have, or manual — with an «Artix only» / «Dual boot» switch.
 
-![Step 9 — Disk](screenshots/en/09-disk.png)
+**Step 10/16 — Disk & partitions.** UEFI/BIOS, disk selection, SWAP partition, root filesystem.
 
-**Step 10/15 — Bootloader & encryption.** GRUB / rEFInd / Limine / EFISTUB, os-prober, UEFI entry name, LUKS encryption.
+![Step 10 — Disk](screenshots/en/09-disk.png)
 
-![Step 10 — Bootloader](screenshots/en/10-bootloader.png)
+**Step 11/16 — Bootloader & encryption.** GRUB / rEFInd / Limine / EFISTUB, os-prober, UEFI entry name, LUKS encryption.
 
-**Step 11/15 — Extra disks.** Mount other disks and existing partitions (e.g. a Windows NTFS one — keeping its data).
+![Step 11 — Bootloader](screenshots/en/10-bootloader.png)
 
-![Step 11 — Storage](screenshots/en/11-storage.png)
+**Step 12/16 — Extra disks.** Mount other disks and existing partitions (e.g. a Windows NTFS one — keeping its data).
 
-**Step 12/15 — Accounts.** Hostname, user and passwords; account mode.
+![Step 12 — Storage](screenshots/en/11-storage.png)
 
-![Step 12 — Accounts](screenshots/en/12-accounts.png)
+**Step 13/16 — Accounts.** Hostname, user and passwords; account mode.
 
-**Step 13/15 — Install options.** sudo password, Chaotic-AUR repo, mirror optimization.
+![Step 13 — Accounts](screenshots/en/12-accounts.png)
 
-![Step 13 — Options](screenshots/en/13-options.png)
+**Step 14/16 — Install options.** sudo password, Chaotic-AUR repo, mirror optimization.
 
-**Step 14/15 — Review & install.** A summary of every choice before it starts.
+![Step 14 — Options](screenshots/en/13-options.png)
 
-![Step 14 — Summary](screenshots/en/14-summary.png)
+**Step 15/16 — Review & install.** A summary of every choice before it starts.
 
-**Step 15/15 — Finish.** A donation QR code for Ukraine's defense, plus a choice: reboot, power off, or enter the installed system for manual steps.
+![Step 15 — Summary](screenshots/en/14-summary.png)
 
-![Step 15 — Finish](screenshots/en/15-finish.png)
+**Step 16/16 — Finish.** A donation QR code for Ukraine's defense, plus a choice: reboot, power off, or enter the installed system for manual steps.
+
+![Step 16 — Finish](screenshots/en/15-finish.png)
 
 ---
 

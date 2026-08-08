@@ -8,11 +8,14 @@
 
 use super::*;
 
-/// The genuine X.Org server and the common X utility apps. Installed for X11
-/// desktops so the system uses real Xorg rather than Artix's new default
-/// XLibre (which can be flaky with some software). XLibre only replaces
-/// `xorg-server` + xf86 drivers, so pulling `xorg-server` explicitly pins the
-/// real server; the rest are standard X tools every X session expects.
+/// The X.Org server and the common X utility apps, installed for X11 desktops.
+///
+/// Named explicitly because Artix's default provider for `xorg-server` is a
+/// different fork, and the two cannot coexist — a replacement swaps out
+/// `xorg-server` plus the xf86 drivers, so pulling `xorg-server` by name is what
+/// pins this one. The rest are standard X tools every X session expects.
+///
+/// Skipped entirely when the user unticks "xorg" — see `system_packages`.
 pub(crate) const XORG_PACKAGES: &[&str] = &[
     "xorg-server",
     "xorg-server-common",
@@ -198,6 +201,13 @@ pub(crate) fn base_packages(c: &InstallConfig) -> Vec<String> {
         "networkmanager",
         "networkmanager-dinit",
         "nano",
+        // less: the pager pacman itself reaches for, and the one the
+        // documentation this installer WRITES tells people to use — the log
+        // guide says `less ~/installer.log`. It was not installed, so a fresh
+        // system answered that instruction with "command not found". Advice
+        // that does not work on the machine it was written for is worse than no
+        // advice.
+        "less",
         "geany",
         "geany-plugins",
         "grub",
@@ -595,6 +605,15 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     // Map it to the actual `fastfetch` package here (deduped, so picking both is
     // harmless) and let the plan swap the logo. Everything else passes through.
     for name in &c.extra_packages {
+        // "xorg" is a MARKER, not a package: ticked, it makes the plan name the
+        // real X.Org set explicitly (see plan_packages); unticked, no X package
+        // is named at all, so whatever the user installs takes the slot without
+        // a conflict. Either way pacman must never be handed the word itself —
+        // in Artix it is a group, and installing a group here would drag in a
+        // different set than the curated one.
+        if name == "xorg" {
+            continue;
+        }
         let real = if name == "slayfetch" {
             "fastfetch"
         } else {
@@ -607,6 +626,12 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     // Companion packages: some apps are split into a thin main package plus
     // separate plugin/codec packages, and are nearly useless without them. We
     // pull those in automatically so the app works out of the box.
+    // earlyoom, only when it was asked for. The package ships a systemd unit
+    // and nothing else, so the installer writes its dinit service itself —
+    // see `system::mem` and `plan_memory_tuning`.
+    if c.earlyoom {
+        p.push("earlyoom".into());
+    }
     if c.extra_packages.iter().any(|x| x == "vlc") {
         // Modern Artix splits VLC's codecs/outputs into vlc-plugins-*; the
         // `vlc-plugins-all` metapackage depends on base/extra/video-output/
@@ -663,6 +688,18 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     // needs a seat manager (seatd or elogind) to acquire input/DRM; without one
     // there'd be no working graphical session. We honour the user's choice.
     p.extend(c.seat_provider.packages().iter().map(|x| x.to_string()));
+    // The "xorg" marker, unticked: no X package is named ANYWHERE. Gating the
+    // curated set was not enough — a desktop declares its own X packages too
+    // (XFCE and Pinnacle both list xorg-xwayland), and those would have
+    // conflicted with a replacement server just as surely. One rule, applied after every
+    // source has had its say, is easier to trust than a gate at each of them.
+    //
+    // Dropping xorg-xwayland does mean a Wayland session loses X11-app support
+    // — which is the point: whoever unticked this installs their server's own
+    // xwayland instead, and could not have while ours was named.
+    if !c.extra_packages.iter().any(|x| x == "xorg") {
+        p.retain(|pkg| !pkg.starts_with("xorg-") && !pkg.starts_with("xf86-"));
+    }
     p.sort();
     p.dedup();
     p

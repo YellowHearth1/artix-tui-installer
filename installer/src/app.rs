@@ -36,14 +36,35 @@ pub enum Screen {
     Recovery = 17,
     WifiTest = 18,
     TbwTest = 19,
+    /// Console font chooser. On a bare TTY — this installer's first target — the
+    /// font decides whether the interface is legible and whether it can draw its
+    /// own text at all, so it is a first-class choice rather than a setting
+    /// buried somewhere.
+    FontPick = 20,
 }
 
 impl Screen {
+    /// How many `Screen` variants exist — the size of every per-screen array.
+    /// Counts the off-linear screens too, which `ALL` deliberately does not.
+    pub const COUNT: usize = Screen::FontPick as usize + 1;
+
     pub const ALL: [Screen; 16] = [
         Screen::Language,
+        // KEYBOARD SECOND, before anything asks you to type.
+        //
+        // It used to sit fourth, after the timezone filter and after the Wi-Fi
+        // password — two fields you type into on whatever layout the language
+        // screen guessed. Guessing right for the interface language is not the
+        // same as guessing right for the keyboard in front of you: plenty of
+        // Ukrainians use a German board, and people carry keyboards across
+        // borders. A Wi-Fi password typed on the wrong layout does not explain
+        // itself; it just fails to connect.
+        //
+        // So the order is now: what language do you read, what keyboard are you
+        // typing on, and only then anything that takes text.
+        Screen::Keyboard,
         Screen::Timezone,
         Screen::Wifi,
-        Screen::Keyboard,
         Screen::Kernel,
         Screen::Desktop,
         Screen::Packages,
@@ -58,28 +79,39 @@ impl Screen {
         Screen::Finish,
     ];
 
+    /// The step after this one, IN THE ORDER `ALL` DECLARES.
+    ///
+    /// Found by searching `ALL`, never by casting the variant to an index. It
+    /// used to cast — which quietly assumed the enum was declared in the same
+    /// order the wizard runs in. Moving the keyboard step ahead of the timezone
+    /// broke that assumption and Esc started walking FORWARD: on the keyboard
+    /// step (variant 3) `prev()` handed back `ALL[2]`, the timezone. Reported as
+    /// "I press Escape and it throws me onward instead of back".
+    ///
+    /// Screens outside `ALL` (Mode, Recovery, the font picker …) are their own
+    /// neighbours: they navigate explicitly and must never index into `ALL`.
     pub fn next(self) -> Screen {
-        // Mode/Recovery are outside ALL; navigating them is done explicitly by
-        // their screens, so next()/prev() just return self for them (never
-        // index ALL out of range).
-        if (self as usize) >= Screen::ALL.len() {
-            return self;
+        match Screen::ALL.iter().position(|s| *s == self) {
+            Some(i) if i + 1 < Screen::ALL.len() => Screen::ALL[i + 1],
+            _ => self,
         }
-        let i = (self as usize + 1).min(Screen::ALL.len() - 1);
-        Screen::ALL[i]
     }
 
+    /// The step before this one. See `next` — same rule, same trap.
     pub fn prev(self) -> Screen {
-        if (self as usize) >= Screen::ALL.len() {
-            return self;
+        match Screen::ALL.iter().position(|s| *s == self) {
+            Some(i) if i > 0 => Screen::ALL[i - 1],
+            _ => self,
         }
-        let i = (self as usize).saturating_sub(1);
-        Screen::ALL[i]
     }
 
-    /// Step number shown in the header, 1-based.
-    pub fn step_number(self) -> usize {
-        self as usize + 1
+    /// Screens outside the linear wizard: they are not in `ALL`, carry no step
+    /// number, and own their own back-navigation (Mode → Language, the rest →
+    /// Mode). The global "back" keys must defer to them — `prev()` has nowhere
+    /// to go from here, so handling it globally either does nothing visible or,
+    /// as it did for the font screen, walks off the end of a per-screen array.
+    pub fn is_off_linear(self) -> bool {
+        (self as usize) >= Screen::ALL.len()
     }
 }
 
@@ -215,6 +247,27 @@ pub enum PartitionMode {
     /// path (reused ESP, new root, os-prober on) — only the UI differs, filling
     /// the `manual_*` fields automatically instead of by hand.
     Alongside,
+}
+
+impl InstallConfig {
+    /// Will the installed system have a swap device at all?
+    ///
+    /// Asked because zswap is a compressed cache IN FRONT OF swap. With no swap
+    /// there is nothing behind the cache and nothing for it to do, so offering it
+    /// is offering a setting that cannot take effect.
+    ///
+    /// The answer comes from a different field per mode, and that is the trap:
+    /// `swap_gib` defaults to 4 and the manual editor never touches it, so a
+    /// manual layout with no swap partition still reads as "4 GiB of swap" if you
+    /// ask the auto field. Manual has to be asked about ITS swap — an existing
+    /// partition given the swap role, or one planned to be created.
+    pub fn has_swap(&self) -> bool {
+        if self.partition_mode == PartitionMode::Manual {
+            !self.manual_swap.is_empty() || self.manual_swap_new_mib > 0
+        } else {
+            self.swap_gib > 0
+        }
+    }
 }
 
 impl PartitionMode {
@@ -431,7 +484,28 @@ impl Desktop {
             // own, so labwc (the upstream-recommended wlroots compositor) plus
             // xorg-xwayland enable the optional Wayland session (startxfce4
             // --wayland); the default X11 session is unaffected.
-            Desktop::Xfce4 => &["xfce4", "xfce4-goodies", "labwc", "xorg-xwayland"],
+            // polkit-gnome: the AUTHENTICATION AGENT.
+            //
+            // `polkit` itself is pulled in by the desktop and runs — but polkit
+            // is only the daemon that decides. Something has to ASK, and this
+            // desktop ships nothing that does. The result is not an error
+            // message: graphical actions needing authorisation simply do
+            // nothing, while anything run through doas or sudo in a terminal
+            // works fine, because there the terminal does the asking. Reported
+            // exactly that way — "some programs from sudo don't work and don't
+            // bring up the polkit manager, and some are fine".
+            //
+            // Plasma has polkit-kde-agent, GNOME has one inside gnome-shell and
+            // LXQt has lxqt-policykit in its group; these four have nothing.
+            // The package ships no autostart entry either — see the
+            // /etc/xdg/autostart file written in install/mod.rs.
+            Desktop::Xfce4 => &[
+                "xfce4",
+                "xfce4-goodies",
+                "labwc",
+                "xorg-xwayland",
+                "polkit-gnome",
+            ],
             // Cinnamon is shipped as a single package in galaxy (not a group);
             // a file manager (nemo) makes it usable out of the box. The cinnamon
             // package already ships the experimental Wayland session (Muffin in
@@ -471,13 +545,53 @@ impl Desktop {
                 "gnome-screenshot",
                 "simple-scan",
                 "baobab",
+                // See the note above the other desktops: polkit runs, but
+                // nothing here asks for the password, so graphical
+                // authorisation silently does nothing.
+                "polkit-gnome",
             ],
             // MATE: group + extra, per the guide.
-            Desktop::Mate => &["mate", "mate-extra"],
+            // polkit-gnome: the AUTHENTICATION AGENT.
+            //
+            // `polkit` itself is pulled in by the desktop and runs — but polkit
+            // is only the daemon that decides. Something has to ASK, and this
+            // desktop ships nothing that does. The result is not an error
+            // message: graphical actions needing authorisation simply do
+            // nothing, while anything run through doas or sudo in a terminal
+            // works fine, because there the terminal does the asking. Reported
+            // exactly that way — "some programs from sudo don't work and don't
+            // bring up the polkit manager, and some are fine".
+            //
+            // Plasma has polkit-kde-agent, GNOME has one inside gnome-shell and
+            // LXQt has lxqt-policykit in its group; these four have nothing.
+            // The package ships no autostart entry either — see the
+            // /etc/xdg/autostart file written in install/mod.rs.
+            // MATE HAS ITS OWN AGENT, and it autostarts itself: mate-polkit
+            // ships etc/xdg/autostart/polkit-mate-authentication-agent-1.desktop
+            // inside the package. Handing MATE polkit-gnome instead was wrong on
+            // both counts — a foreign agent, plus an autostart file written by
+            // us that the desktop never needed. Checked against the repos with
+            // `pacman -F`, not from memory.
+            Desktop::Mate => &["mate", "mate-extra", "mate-polkit"],
             // LXQt group + a panel-friendly file manager.
             Desktop::Lxqt => &["lxqt", "pcmanfm-qt"],
             // LXDE group.
-            Desktop::Lxde => &["lxde"],
+            // polkit-gnome: the AUTHENTICATION AGENT.
+            //
+            // `polkit` itself is pulled in by the desktop and runs — but polkit
+            // is only the daemon that decides. Something has to ASK, and this
+            // desktop ships nothing that does. The result is not an error
+            // message: graphical actions needing authorisation simply do
+            // nothing, while anything run through doas or sudo in a terminal
+            // works fine, because there the terminal does the asking. Reported
+            // exactly that way — "some programs from sudo don't work and don't
+            // bring up the polkit manager, and some are fine".
+            //
+            // Plasma has polkit-kde-agent, GNOME has one inside gnome-shell and
+            // LXQt has lxqt-policykit in its group; these four have nothing.
+            // The package ships no autostart entry either — see the
+            // /etc/xdg/autostart file written in install/mod.rs.
+            Desktop::Lxde => &["lxde", "polkit-gnome"],
             // Pinnacle is an AUR package (pinnacle-comp), not in the repos,
             // so it has NO repo packages here — selecting it injects
             // pinnacle-comp into the AUR list and unpacks the bundled config.
@@ -546,7 +660,7 @@ impl Desktop {
         match self {
             Desktop::None => "None / minimal (no desktop)",
             Desktop::KdePlasma => "KDE Plasma",
-            Desktop::Gnome => "GNOME 50 (⚠ may be unstable)",
+            Desktop::Gnome => "GNOME 50 ([!] may be unstable)",
             Desktop::Xfce4 => "XFCE4",
             Desktop::Cinnamon => "Cinnamon",
             Desktop::Mate => "MATE",
@@ -792,7 +906,33 @@ pub struct InstallConfig {
     pub lang: String,     // "en" | "uk" — UI language
     pub locale: String,   // e.g. "uk_UA.UTF-8" — system locale
     pub timezone: String, // e.g. "Europe/Kyiv"
-    pub keymap: String,   // console keymap, e.g. "ua"
+    /// Is the machine's hardware clock kept in UTC?
+    ///
+    /// Linux alone: yes, and that is the default. Beside Windows: no — Windows
+    /// keeps the RTC in LOCAL time, and two systems disagreeing about it makes
+    /// the clock jump by the timezone offset every time you switch.
+    ///
+    /// The hidden GRUB menu offered this as `utc=`; it is here because that menu
+    /// is no longer shown, and the choice still has to exist somewhere.
+    pub rtc_utc: bool,
+    /// Compressed swap cache in RAM. Off by default: it is a real win on a
+    /// machine short of memory and a needless complication on one that is not.
+    pub zswap: bool,
+    pub zswap_compressor: String,
+    /// Share of RAM zswap may fill, as a PERCENTAGE — the same number then means
+    /// the same thing on a 2 GB netbook and a 32 GB desktop.
+    pub zswap_percent: u8,
+    /// Kill the biggest memory hog before the kernel's OOM killer would, while
+    /// the machine can still respond.
+    pub earlyoom: bool,
+    /// Free-memory percentage at which earlyoom acts.
+    pub earlyoom_percent: u8,
+
+    pub keymap: String, // console keymap, e.g. "ua"
+    /// Console font for the INSTALLED system's TTY, chosen on the font screen.
+    /// Defaults to the one the installer itself starts with; every option is
+    /// verified to draw all three interface languages.
+    pub console_font: String,
     pub xkb_layouts: Vec<String>,
     pub kernel: Kernel,
     pub desktops: Vec<String>, // serialized Desktop names (multi-select; empty = headless)
@@ -834,6 +974,15 @@ pub struct InstallConfig {
     /// maintained by the Garuda Linux team) by installing its key/keyring/
     /// mirrorlist and appending [chaotic-aur] to pacman.conf.
     pub chaotic_aur: bool,
+    /// AURIS — the Artix User Repository of Init Scripts.
+    ///
+    /// Init scripts for s6, OpenRC, runit and dinit that upstream does not ship,
+    /// contributed by users. On a distro whose whole point is the init system,
+    /// a missing service file is what stops a package from being usable at all,
+    /// so this is a different kind of repository from Chaotic-AUR: not "more
+    /// software", but "the piece that makes software work here".
+    pub auris: bool,
+
     /// If true, rank pacman mirrors by speed before installing (and copy the
     /// optimized lists to the target). Region is seeded from the chosen
     /// timezone, then mirrors are ranked by real connection speed.
@@ -1000,6 +1149,14 @@ pub struct InstallConfig {
     pub manual_data_new: Vec<DataPart>,
     #[serde(default)]
     pub manual_home_compress: bool,
+    /// LUKS-encrypt the manual /home slot.
+    ///
+    /// Expressed by handing the slot to the extra-disk machinery rather than by
+    /// growing a second crypto path here: that chain (LUKS format, keyfile,
+    /// crypttab entry, mount) is already written and already tested, and a
+    /// parallel implementation of it would be one more thing to get subtly
+    /// wrong on a disk that holds somebody's files.
+    pub manual_home_encrypt: bool,
     #[serde(default)]
     pub manual_home_discard: bool,
     /// Bootloader to install: "grub" (default), "refind", or "limine".
@@ -1042,8 +1199,15 @@ impl Default for InstallConfig {
         InstallConfig {
             lang: "uk".into(),
             locale: "uk_UA.UTF-8".into(),
-            timezone: "Europe/Kyiv".into(),
+            timezone: crate::screens::timezone::first_zone().into(),
+            rtc_utc: true,
+            zswap: false,
+            zswap_compressor: "zstd".into(),
+            zswap_percent: 20,
+            earlyoom: false,
+            earlyoom_percent: 10,
             keymap: "ua".into(),
+            console_font: crate::screens::fontpick::default_font().into(),
             xkb_layouts: vec!["ua".into(), "gb".into()],
             kernel: Kernel::Linux,
             desktops: Vec::new(),
@@ -1059,6 +1223,10 @@ impl Default for InstallConfig {
             // GUI. Untick zsh (and fish) to stay on bash.
             fastfetch_logo: String::new(),
             extra_packages: vec![
+                // Genuine X.Org, on by default. It is a MARKER, not a package
+                // name — see effective_packages. Untick it and the installer
+                // names no X package at all, leaving the choice to the user.
+                "xorg".into(),
                 "zsh".into(),
                 "kitty".into(),
                 "fastfetch".into(),
@@ -1089,6 +1257,7 @@ impl Default for InstallConfig {
             manual_home_new_mib: 0,
             passwordless_sudo: false,
             use_doas: false,
+            auris: false,
             chaotic_aur: false,
             optimize_mirrors: true,
             encrypt_disk: false,
@@ -1116,6 +1285,7 @@ impl Default for InstallConfig {
             manual_wipe: Vec::new(),
             manual_data_new: Vec::new(),
             manual_home_compress: false,
+            manual_home_encrypt: false,
             manual_home_discard: false,
             bootloader: Bootloader::Grub,
             display_manager: "sddm".into(),
@@ -1138,6 +1308,16 @@ pub struct App {
     pub lang: Lang,
     pub config: InstallConfig,
     pub should_quit: bool,
+    /// Leave the installer and reboot, rather than dropping to a shell.
+    ///
+    /// After an install the machine has to start the system that was just
+    /// written, and nothing offered a way there: the only exits were `q` on the
+    /// first screen and the power button.
+    pub pending_reboot: bool,
+    /// Reboot INTO the firmware setup. In a VM the ISO is still the boot
+    /// device, so reaching the boot order is the difference between testing the
+    /// installed system and reinstalling it again.
+    pub pending_firmware: bool,
     /// Per-screen UI state (list cursors etc.) lives in the screen modules,
     /// but a shared scratch index is handy for simple list screens.
     pub cursor: usize,
@@ -1185,7 +1365,13 @@ pub struct App {
     /// — you leave the desktop step on the login-screen row and come back to the
     /// desktop list. This remembers each screen's row so a step hands itself
     /// back the way you left it.
-    pub nav_cursor: [usize; 19],
+    /// One slot per `Screen`, indexed by `Screen as usize` — so it MUST cover
+    /// every variant, including the ones outside `ALL`. It was sized 19 by hand
+    /// while the enum grew to 21, and `Esc` on the font screen then indexed past
+    /// the end: that panic killed the process and dropped the user back to the
+    /// console, which reads as "the installer threw me out". `every_screen_has_a_nav_slot`
+    /// is what keeps the two in step now.
+    pub nav_cursor: [usize; Screen::COUNT],
     /// Scroll offset for the Summary review list. The list of choices is ~25
     /// lines and the panel on an 80x24 console shows ~11, so without this the
     /// user cannot read half of what they are about to commit to.
@@ -1250,6 +1436,14 @@ pub struct App {
     pub parts_create_stage: u8,
     pub parts_create_role: usize,
     pub parts_size_input: String,
+    /// The size box still holds the SUGGESTION and has not been typed into.
+    ///
+    /// The first digit must REPLACE that suggestion, not extend it: a swap box
+    /// pre-filled with "4" turned a typed 4 into 44, and an ESP box holding
+    /// "512" would turn a typed 40 into 51240. The same mistake was found and
+    /// fixed in the VM picker; the partition editor kept its own copy of the
+    /// field and was never corrected.
+    pub parts_size_pristine: bool,
     /// Unit the create-partition size box is currently in: MiB when true, GiB
     /// when false. Sizes are stored in MiB throughout, so this is purely how the
     /// number is read from the user — but without it a 512 MiB ESP was simply
@@ -1433,6 +1627,69 @@ pub struct App {
     /// incantation — that is exactly the state in which the user has no working
     /// sudo to look it up with.
     pub recovery_action: usize,
+    /// How much bigger (or smaller) the OPEN DIALOG is drawn, in steps of a few
+    /// cells. Each `+` adds one while a dialog is up, each `-` takes one away.
+    ///
+    /// THIS IS THE ONLY THING THOSE KEYS TOUCH WHILE A DIALOG IS OPEN. A Linux
+    /// VT has one font for the whole screen, so the letters inside a box cannot
+    /// be enlarged on their own — but the box can, and that is what was asked
+    /// for: the dialog resizing SEPARATELY, instead of the entire installer
+    /// around it growing and shrinking with it.
+    ///
+    /// Kept as a signed count of steps rather than absolute cells, so every
+    /// dialog keeps its own proportions and simply gets roomier; the clamping
+    /// to the panel lives in `widgets::modal_rect_fit`. It persists after the
+    /// dialog closes — it is a preference the user set, not a property of one
+    /// box.
+    pub modal_zoom: i16,
+    /// Font chooser: which family, which of its sizes, and which of the two
+    /// questions has focus.
+    ///
+    /// The size is ALSO what `+` and `-` move when no dialog is open — there is
+    /// no second notion of console font size any more. There used to be one, a
+    /// step count into a fixed ladder of another typeface entirely, and it meant
+    /// pressing `+` replaced the chosen font instead of enlarging it.
+    /// Show the password fields in clear text while the user asks for it.
+    ///
+    /// Typing a password blind is a guess about the keyboard layout, and the
+    /// layout is now something the user changes DURING the install — so a
+    /// mistyped LUKS passphrase would only surface at the next boot, when the
+    /// disk refuses to open and there is nothing left to fix it with.
+    ///
+    /// Off by default, and cleared on every screen change (`reset_screen_focus`)
+    /// so it can never be left on for the next person to walk past the screen.
+    /// Has the user actually chosen a keyboard layout, as opposed to being given
+    /// one by the language they picked?
+    ///
+    /// The language screen sets a sensible layout for each language, and must be
+    /// free to REPLACE that when the language changes — but never to overwrite a
+    /// deliberate choice. It used to tell the two apart by comparing the layout
+    /// list against every known default (`["gb"]`, `["gb","ua"]`, …). That list
+    /// was always one short: pick Spanish, then Ukrainian, and the Spanish
+    /// layout stayed, because `["es"]` was not on it. A flag cannot be one short.
+    pub keyboard_touched: bool,
+    /// Whether the timezone list was used during THIS visit to the screen.
+    ///
+    /// The list opens at the top rather than on the configured zone, so without
+    /// this a person who stepped through the screen without touching it would
+    /// have their earlier choice quietly replaced by whatever sorts first.
+    pub tz_touched: bool,
+    /// Horizontal scroll offset, in CHARACTERS, for a label too wide to fit.
+    ///
+    /// A list row that does not fit is clipped by ratatui without a word, so the
+    /// end of a long package description or timezone name simply does not exist
+    /// as far as the reader is concerned. Only the SELECTED row scrolls: a whole
+    /// list in motion is unreadable, and the row under the cursor is the one
+    /// being read.
+    pub marquee: usize,
+    /// Ticks since the last step. The tick is ~10 Hz (the input poll), and a
+    /// step every fifth one gives about two characters per half second — slow
+    /// enough to read, which is the whole point.
+    pub marquee_tick: u16,
+    pub show_secrets: bool,
+    pub font_family: usize,
+    pub font_size_idx: usize,
+    pub font_focus: usize,
     /// Writer to the interactive (PTY) child, so the user's typed answer can be
     /// sent back to pacman. Present only during an interactive step.
     pub pty_writer: Option<crate::system::runner::PtyWriter>,
@@ -1452,6 +1709,29 @@ pub struct App {
     pub recovery_focus: usize,
     /// Recovery: index of the selected block device (into the scanned list).
     pub recovery_disk_cursor: usize,
+    /// What each partition IS, parallel to the scanned partition list. Filled
+    /// once from `recovery::suggest_all` and the user's from then on — see the
+    /// role constants in `system/recovery.rs` for why recovery stopped trusting
+    /// the target's own /etc/fstab to answer this.
+    pub recovery_roles: Vec<usize>,
+    /// Whether the roles above were READ from the install's own record on the
+    /// ESP, or guessed from partition sizes. The two look identical on screen
+    /// and only one deserves to be trusted without checking.
+    pub recovery_has_record: bool,
+    /// The bootloader that record names, if any.
+    pub recovery_record_loader: String,
+    /// Where each partition given the "data" role gets mounted. Parallel to the
+    /// list, like the roles. Empty means "not chosen yet"; the mount step falls
+    /// back to the first preset. A free-text path lives here too — the presets
+    /// cover the common cases, but somebody who mounted a disk at
+    /// `/mnt/фотки-2019` needs to be able to say so, and a ring of four fixed
+    /// choices cannot express that.
+    pub recovery_data_path: Vec<String>,
+    /// The "where should this be mounted" picker: open, which row, and the
+    /// free-text field under the presets.
+    pub recovery_path_open: bool,
+    pub recovery_path_cursor: usize,
+    pub recovery_path_input: String,
     /// Recovery: unlock method cursor — 0 = none (unencrypted), 1 = passphrase,
     /// 2 = USB key file.
     pub recovery_unlock: usize,
@@ -1466,6 +1746,29 @@ pub struct App {
 }
 
 impl App {
+    /// Whether ANY modal window is currently open.
+    ///
+    /// One place, listing every flag, because the alternative is what the code
+    /// had: each screen knowing about its own dialogs and nothing knowing about
+    /// all of them. The size keys need exactly this answer — grow the dialog the
+    /// user is looking at, never the installer underneath it — and a flag left
+    /// out here would silently resize the wrong thing.
+    pub fn modal_open(&self) -> bool {
+        self.confirm_format_open
+            || self.disk_warn_modal_open
+            || self.fs_opts_modal_open
+            || self.logo_modal_open
+            || self.parts_create_open
+            || self.parts_disk_modal_open
+            || self.parts_modal_open
+            || self.parts_mount_open
+            || self.recovery_path_open
+            || self.parts_wipe_ack_open
+            || self.parts_wipe_open
+            || self.seat_modal_open
+            || self.storage_opts_modal_open
+    }
+
     pub fn new() -> Self {
         // Auto-detect the firmware mode the live system actually booted in:
         // /sys/firmware/efi exists only under UEFI. This makes the Disk step
@@ -1484,6 +1787,8 @@ impl App {
             lang: Lang::Uk,
             config,
             should_quit: false,
+            pending_reboot: false,
+            pending_firmware: false,
             cursor: 0,
             seat_modal_open: false,
             seat_modal_cursor: 0,
@@ -1498,7 +1803,7 @@ impl App {
             log_scroll: 0,
             log_follow: true,
             summary_scroll: 0,
-            nav_cursor: [0; 19],
+            nav_cursor: [0; Screen::COUNT],
             log_last_down: None,
             log_live: false,
             tz_query: String::new(),
@@ -1531,6 +1836,7 @@ impl App {
             parts_create_stage: 0,
             parts_create_role: 0,
             parts_size_input: String::new(),
+            parts_size_pristine: false,
             parts_create_disk: String::new(),
             parts_resize_dev: String::new(),
             parts_mount_open: false,
@@ -1605,6 +1911,15 @@ impl App {
             install_retry_at: None,
             pending_interactive: None,
             recovery_action: 0,
+            modal_zoom: 0,
+            keyboard_touched: false,
+            tz_touched: false,
+            marquee: 0,
+            marquee_tick: 0,
+            show_secrets: false,
+            font_family: crate::screens::fontpick::default_pos().0,
+            font_size_idx: crate::screens::fontpick::default_pos().1,
+            font_focus: 0,
             pty_writer: None,
             prompt_active: false,
             prompt_text: String::new(),
@@ -1612,6 +1927,13 @@ impl App {
             mode_cursor: 0,
             recovery_focus: 0,
             recovery_disk_cursor: 0,
+            recovery_roles: Vec::new(),
+            recovery_has_record: false,
+            recovery_record_loader: String::new(),
+            recovery_data_path: Vec::new(),
+            recovery_path_open: false,
+            recovery_path_cursor: 0,
+            recovery_path_input: String::new(),
             recovery_unlock: 0,
             recovery_passphrase: String::new(),
             recovery_status: String::new(),
@@ -1642,15 +1964,107 @@ impl App {
         self.reset_screen_focus();
     }
 
+    /// Go to a screen that is not the next or previous step — the mode menu, the
+    /// font chooser, recovery, and back again.
+    ///
+    /// It exists because assigning `app.screen` directly LOOKS like navigation
+    /// and is not: it skips the cursor bookkeeping in `switch_screen`, so the
+    /// arriving screen inherits whatever row the departing one was on and the
+    /// leaving screen forgets where it was.
+    ///
+    /// That is not theoretical. Language and the mode menu both jumped by
+    /// assignment, so choosing a language a second time walked
+    /// Timezone → Language → Mode → Timezone carrying the LANGUAGE list's cursor
+    /// into a 400-entry timezone list. `reset_screen_focus` never ran, so the
+    /// cursor was never parked back on the chosen zone: the timezone the user
+    /// picked was still in the config, but the highlight sat somewhere else and
+    /// the next arrow key committed a different zone over it. It read as "it
+    /// forgot my timezone", because in every way that shows on screen, it had.
+    pub fn goto(&mut self, to: Screen) {
+        self.switch_screen(to);
+    }
+
     /// Does this step have anything to ask? A step with nothing to decide is
     /// walked past in both directions — an empty screen reads as broken rather
-    /// than absent. Only the extra-disks step can empty out (manual mode gives
-    /// every drive a role, so nothing is left over).
-    fn step_has_content(&self, s: Screen) -> bool {
+    /// than absent.
+    pub(crate) fn step_has_content(&self, s: Screen) -> bool {
         match s {
-            Screen::Storage => crate::screens::storage::has_candidates(self),
+            // Extra disks. In MANUAL partitioning this step has nothing left to
+            // offer: the partition editor already mounts existing partitions and
+            // creates new ones on any drive, through the "Data" role, and it
+            // writes them to the very same `extra_disks` list this screen edits.
+            // Showing both meant two screens editing one list — a second chance
+            // to give the same partition a different mountpoint, and a step whose
+            // only honest answer was "I already did this".
+            //
+            // In AUTO mode it still earns its place: there the disk step claims
+            // one drive and says nothing about the others.
+            // ONLY the mode that actually HAS the editor may skip this step.
+            //
+            // It was skipped for the whole "manual family", which includes
+            // Alongside — and Alongside never shows the partition editor (see
+            // screens/disk.rs, which forwards only for Manual). So that mode
+            // lost both screens at once and a second drive could not be mounted
+            // anywhere at all. The reasoning was sound for manual partitioning
+            // and was applied to a mode it does not describe.
+            Screen::Storage => {
+                self.config.partition_mode != PartitionMode::Manual
+                    && crate::screens::storage::has_candidates(self)
+            }
             _ => true,
         }
+    }
+
+    /// The steps this run will actually show, in order.
+    ///
+    /// Not every screen in `ALL` is a step for everyone: extra disks is skipped
+    /// in manual partitioning, and in auto mode when there is nothing left over.
+    /// The rail and the header both count from THIS, so "9 / 15" means the ninth
+    /// of the fifteen you will really see — and moves to "9 / 16" for someone who
+    /// does get the extra-disks step.
+    ///
+    /// Both used to be written out by hand: a rail of literal "01".."15" and a
+    /// header of `/ 15`, while `ALL` had sixteen entries. So the count was wrong
+    /// for everybody, and wrong in a way no test could notice — three separate
+    /// places each holding their own idea of how long the wizard is.
+    pub fn visible_steps(&self) -> Vec<Screen> {
+        Screen::ALL
+            .iter()
+            .copied()
+            .filter(|s| self.step_has_content(*s))
+            .collect()
+    }
+
+    /// Where the current screen sits among the visible steps: (1-based, total).
+    /// Position 0 means "not a numbered step" — the mode menu and its siblings.
+    pub fn step_position(&self) -> (usize, usize) {
+        let steps = self.visible_steps();
+        let pos = steps
+            .iter()
+            .position(|s| *s == self.screen)
+            .map_or(0, |i| i + 1);
+        (pos, steps.len())
+    }
+
+    /// Advance the marquee, and reset it when the cursor moves.
+    ///
+    /// Steps by TWO characters rather than one. Asked for, and right: with
+    /// Arabic, Japanese or Chinese a single character is often a whole word, so
+    /// one-at-a-time crawls while two keeps context arriving at a readable rate.
+    pub fn tick_marquee(&mut self) {
+        const TICKS_PER_STEP: u16 = 5;
+        const STEP: usize = 2;
+        self.marquee_tick = self.marquee_tick.wrapping_add(1);
+        if self.marquee_tick.is_multiple_of(TICKS_PER_STEP) {
+            self.marquee += STEP;
+        }
+    }
+
+    /// Put a label back to its start. Called whenever the cursor moves, so a row
+    /// is always read from the beginning rather than joined halfway.
+    pub fn reset_marquee(&mut self) {
+        self.marquee = 0;
+        self.marquee_tick = 0;
     }
 
     pub fn goto_prev(&mut self) {
@@ -1681,10 +2095,14 @@ impl App {
     /// What must still be cleared: MODALS. A modal left flagged open would
     /// render over the screen the moment it is drawn.
     fn reset_screen_focus(&mut self) {
+        // A revealed password must never survive the screen it belongs to.
+        self.show_secrets = false;
         self.fs_opts_target = FsOptsTarget::Root;
         self.fs_opts_data_dev.clear();
         self.seat_modal_open = false;
         self.storage_opts_modal_open = false;
+        self.recovery_path_open = false;
+        self.recovery_path_input.clear();
         self.parts_modal_open = false;
         self.parts_modal_cursor = 0;
         self.parts_target.clear();
@@ -1717,20 +2135,22 @@ impl App {
         self.parts_undo.clear();
         self.pmode_status.clear();
 
-        // Point the cursor at the value the config ALREADY holds, so what's
-        // highlighted is what's actually going to be installed.
+        // The timezone list opens AT THE TOP, with an empty filter, every time.
         //
-        // The timezone screen defaults to Europe/Kyiv but its list is
-        // alphabetical, so a cursor parked at 0 highlights Africa/Abidjan.
-        // Screens used to paper over this by assigning config.timezone from
-        // the cursor while drawing — which meant the first repaint silently
-        // REPLACED the default. Now that drawing decides nothing, the cursor
-        // has to start in the right place instead.
+        // It used to park the cursor on the zone the config already held. That
+        // sounds helpful and was not: the config changes as you move through the
+        // list, so every re-entry landed somewhere else, and switching language
+        // between visits made it look arbitrary — "щоразу в іншому місці".
+        // A list of 567 entries is not browsed anyway; it is searched.
+        //
+        // The choice already made is NOT lost by this. `tz_touched` says whether
+        // the list was actually used this visit, and Enter only re-commits when
+        // it was — so walking through the step keeps whatever was chosen before,
+        // and the screen prints it above the list so it is never invisible.
         if self.screen == Screen::Timezone {
             self.tz_query.clear();
-            if let Some(i) = crate::screens::timezone::index_of(&self.config.timezone) {
-                self.cursor = i;
-            }
+            self.cursor = 0;
+            self.tz_touched = false;
         }
     }
 
@@ -1777,5 +2197,255 @@ impl App {
             }
         }
         self.log.push(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nav_cursor` is indexed by `Screen as usize`, so a variant living past its
+    /// end panics the moment you navigate away from that screen. That is not a
+    /// cosmetic failure: the panic kills the process, the terminal is left as-is
+    /// and the user lands back at the console login, which looks exactly like
+    /// "the installer threw me out". It shipped that way for the font screen.
+    ///
+    /// The match below is exhaustive on purpose. Adding a `Screen` stops this
+    /// file compiling until the new variant is written in, and writing it in is
+    /// what makes you confirm `COUNT` still covers it.
+    /// A MODE WITHOUT THE EDITOR MUST KEEP THE ADDITIONAL-DISKS STEP.
+    ///
+    /// The step was skipped for the whole "manual family", which includes
+    /// Alongside — and Alongside never shows the partition editor, so that
+    /// mode lost both screens at once and a second drive could not be mounted
+    /// anywhere. The justification ("the editor already does this") was true
+    /// of manual partitioning only.
+    #[test]
+    fn only_the_mode_that_has_the_editor_skips_the_extra_disks_step() {
+        let mut a = App::new();
+        a.config.extra_disks = vec![ExtraDisk {
+            disk: "/dev/vdb1".into(),
+            mountpoint: "/mnt/data".into(),
+            fs: "ext4".into(),
+            format: true,
+            ..Default::default()
+        }];
+        a.config.partition_mode = PartitionMode::Manual;
+        assert!(
+            !a.step_has_content(Screen::Storage),
+            "manual partitioning has the editor, so the step is redundant there"
+        );
+        a.config.partition_mode = PartitionMode::Alongside;
+        assert!(
+            a.step_has_content(Screen::Storage) || !crate::screens::storage::has_candidates(&a),
+            "Alongside has no editor — taking the step away leaves nowhere to mount a disk"
+        );
+    }
+
+    #[test]
+    fn every_screen_has_a_nav_slot() {
+        let every = [
+            Screen::Language,
+            Screen::Timezone,
+            Screen::Wifi,
+            Screen::Keyboard,
+            Screen::Kernel,
+            Screen::Desktop,
+            Screen::Packages,
+            Screen::Aur,
+            Screen::PartitionMode,
+            Screen::Disk,
+            Screen::Security,
+            Screen::Storage,
+            Screen::User,
+            Screen::Options,
+            Screen::Summary,
+            Screen::Finish,
+            Screen::Mode,
+            Screen::Recovery,
+            Screen::WifiTest,
+            Screen::TbwTest,
+            Screen::FontPick,
+        ];
+        for s in every {
+            match s {
+                Screen::Language
+                | Screen::Timezone
+                | Screen::Wifi
+                | Screen::Keyboard
+                | Screen::Kernel
+                | Screen::Desktop
+                | Screen::Packages
+                | Screen::Aur
+                | Screen::PartitionMode
+                | Screen::Disk
+                | Screen::Security
+                | Screen::Storage
+                | Screen::User
+                | Screen::Options
+                | Screen::Summary
+                | Screen::Finish
+                | Screen::Mode
+                | Screen::Recovery
+                | Screen::WifiTest
+                | Screen::TbwTest
+                | Screen::FontPick => {}
+            }
+            assert!(
+                (s as usize) < Screen::COUNT,
+                "{s:?} = {} is past nav_cursor (COUNT = {})",
+                s as usize,
+                Screen::COUNT
+            );
+        }
+        // The indexing itself, from and to every screen: this is the operation
+        // that panicked, so exercise it rather than only the arithmetic.
+        for s in every {
+            let mut app = App::new();
+            app.screen = s;
+            app.switch_screen(Screen::Mode);
+            app.switch_screen(s);
+        }
+    }
+
+    /// The step counter tells the truth, and it is computed in ONE place.
+    ///
+    /// It used to be three: `ALL` with sixteen entries, a rail of hand-written
+    /// "01".."15", and a header that said `/ 15`. So every user was told the
+    /// wizard was fifteen steps long while walking through sixteen, and the
+    /// number under the cursor did not match the number in the header. No test
+    /// could catch it, because none of the three knew about the others.
+    #[test]
+    fn the_step_counter_matches_the_steps_actually_shown() {
+        // Auto mode with spare disks: every step in ALL is shown.
+        let mut app = App::new();
+        app.config.partition_mode = PartitionMode::Auto;
+        let steps = app.visible_steps();
+        assert_eq!(
+            steps.len(),
+            Screen::ALL.len(),
+            "auto mode should show the whole wizard"
+        );
+
+        // Walking it: the position must climb by exactly one each time and end
+        // on the last step, never past the total.
+        for (i, s) in steps.iter().enumerate() {
+            app.screen = *s;
+            let (pos, total) = app.step_position();
+            assert_eq!(pos, i + 1, "{s:?} reported the wrong position");
+            assert_eq!(total, steps.len());
+            assert!(pos <= total, "{s:?}: {pos} of {total} is off the end");
+        }
+
+        // Manual mode drops the extra-disks step, and the total drops with it.
+        let mut app = App::new();
+        app.config.partition_mode = PartitionMode::Manual;
+        let manual = app.visible_steps();
+        assert!(
+            !manual.contains(&Screen::Storage),
+            "manual mode still counts a step it skips"
+        );
+        assert_eq!(manual.len(), Screen::ALL.len() - 1);
+        app.screen = Screen::Finish;
+        let (pos, total) = app.step_position();
+        assert_eq!(pos, total, "the last step must read as the last");
+
+        // Off the wizard entirely: no number at all rather than a wrong one.
+        app.screen = Screen::FontPick;
+        assert_eq!(app.step_position().0, 0);
+    }
+
+    /// Walking the wizard with next()/prev() must reproduce `ALL`, forwards and
+    /// backwards.
+    ///
+    /// They used to cast the variant to an index, which assumed the enum was
+    /// DECLARED in the order the wizard RUNS in. Moving the keyboard step ahead
+    /// of the timezone broke that silently: on the keyboard step Esc handed back
+    /// the timezone — walking forward instead of back — and every test still
+    /// passed, because they all went through `visible_steps`, which iterates
+    /// `ALL` honestly.
+    #[test]
+    fn stepping_forward_and_back_follows_the_declared_order() {
+        // Forward from the first step reproduces ALL.
+        let mut walked = vec![Screen::ALL[0]];
+        let mut s = Screen::ALL[0];
+        for _ in 1..Screen::ALL.len() {
+            s = s.next();
+            walked.push(s);
+        }
+        assert_eq!(walked, Screen::ALL.to_vec(), "next() does not follow ALL");
+        assert_eq!(s.next(), s, "next() ran off the end");
+
+        // And backwards is exactly the reverse.
+        let mut back = vec![s];
+        for _ in 1..Screen::ALL.len() {
+            s = s.prev();
+            back.push(s);
+        }
+        back.reverse();
+        assert_eq!(back, Screen::ALL.to_vec(), "prev() does not follow ALL");
+        assert_eq!(s.prev(), s, "prev() ran off the start");
+
+        // Every step's neighbours agree with each other.
+        for w in Screen::ALL.windows(2) {
+            assert_eq!(w[0].next(), w[1]);
+            assert_eq!(w[1].prev(), w[0]);
+        }
+
+        // Screens outside ALL are their own neighbours: they navigate
+        // explicitly, and indexing ALL from them is how the font picker once
+        // walked off the end of an array.
+        for off in [
+            Screen::Mode,
+            Screen::Recovery,
+            Screen::FontPick,
+            Screen::WifiTest,
+        ] {
+            assert_eq!(off.next(), off, "{off:?} indexed into ALL");
+            assert_eq!(off.prev(), off, "{off:?} indexed into ALL");
+        }
+    }
+
+    /// No screen may navigate by assigning `app.screen`.
+    ///
+    /// Assignment looks like navigation and is not: it skips `switch_screen`, so
+    /// the arriving screen keeps the departing screen's cursor and the departing
+    /// screen forgets its own. That is how choosing a language twice appeared to
+    /// erase the timezone — see `App::goto`.
+    ///
+    /// Tests assign freely; they are placing a screen, not travelling to one.
+    #[test]
+    fn no_screen_navigates_by_assigning_the_field() {
+        let mut checked = 0;
+        let mut offenders = Vec::new();
+        let entries = std::fs::read_dir("src/screens").expect("src/screens is readable");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            // Everything past `#[cfg(test)]` is test code and exempt.
+            let live = match src.find("#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+            for (n, line) in live.lines().enumerate() {
+                if line.contains(".screen = ") && line.contains("Screen::") {
+                    offenders.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            offenders.is_empty(),
+            "navigate with app.goto(...), not by assigning app.screen — \
+             assignment skips the cursor bookkeeping: {}",
+            offenders.join(", ")
+        );
+        assert!(
+            checked >= 10,
+            "only {checked} screens scanned — did the path move?"
+        );
     }
 }

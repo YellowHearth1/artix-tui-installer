@@ -83,6 +83,13 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([
             Constraint::Length(3), // search box
             Constraint::Min(0),    // list
+            // THREE lines live here: the chosen zone, the clock switch, and the
+            // sentence explaining what the switch is for. It was 2, so that
+            // sentence — the one that says a machine with Windows beside it
+            // needs local time or the clock jumps by the timezone offset — was
+            // silently clipped on every console size there is. ratatui truncates
+            // without a word, so nothing anywhere said it was missing.
+            Constraint::Length(3), // hardware clock: value, switch, why
             Constraint::Length(3), // actions
         ])
         .spacing(1)
@@ -104,7 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::normal()
             },
         ),
-        Span::styled("▏", theme::accent()),
+        Span::styled("|", theme::accent()),
     ]))
     .block(
         Block::default()
@@ -125,21 +132,73 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         );
         app.can_advance = false;
     } else {
-        widgets::select_list(f, rows[1], &items, app.cursor);
+        widgets::select_list_scrolled(f, rows[1], &items, app.cursor, app.marquee);
         app.can_advance = true;
         // NOT `app.config.timezone = list[cursor]` — see commit_choice().
         // Painting a screen must not decide anything.
     }
 
+    // Hardware clock. The hidden GRUB menu used to ask this as `utc=`; it has to
+    // live somewhere, and it belongs next to the timezone it interacts with.
+    let (label, desc) = if app.config.rtc_utc {
+        ("tz.clock_utc", "tz.clock_utc_desc")
+    } else {
+        ("tz.clock_local", "tz.clock_local_desc")
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            // What is CHOSEN, spelled out. The list opens at the top rather than
+            // on the chosen zone, so without this line the choice would be
+            // invisible — and a setting you cannot see is one you cannot trust
+            // was kept.
+            Line::from(vec![
+                Span::styled(format!("  {}  ", t(app.lang, "tz.chosen")), theme::dim()),
+                Span::styled(app.config.timezone.clone(), theme::accent()),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("  {}  ", t(app.lang, "tz.clock")), theme::dim()),
+                Span::styled(format!("< {} >", t(app.lang, label)), theme::selected()),
+            ]),
+            Line::from(Span::styled(
+                format!("  {}", t(app.lang, desc)),
+                theme::mute(),
+            )),
+        ]),
+        rows[2],
+    );
+
     widgets::action_row(
         f,
-        rows[2],
+        rows[3],
         &t(app.lang, "app.back"),
         &t(app.lang, "app.next"),
         app.can_advance,
     );
 }
 
+/// The zone a fresh install starts on: the first of the list, and nothing more
+/// than that.
+///
+/// It used to be `Europe/Kyiv`, written into the config as a literal. That is
+/// the author's zone, and this installer is trilingual and aimed at people
+/// arriving from other distributions — a Spaniard was being handed Kyiv. It is
+/// not only a clock, either: the mirror ranking takes the timezone as its hint
+/// about where you are.
+///
+/// Derived rather than written down, so it cannot drift from the list it is
+/// supposed to be the first of.
+pub fn first_zone() -> &'static str {
+    all_zones()
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Africa/Abidjan")
+}
+
+/// Where a given zone sits in the unfiltered list — used only by the tests now
+/// that the list opens at the top rather than on the configured zone. Kept
+/// because it is what those tests assert AGAINST: that the default really is
+/// entry zero, and that nothing parks the cursor anywhere else.
+#[cfg(test)]
 /// Where a given zone sits in the unfiltered list — so the cursor can be parked
 /// on the zone the config already holds, instead of on whatever sorts first.
 pub fn index_of(zone: &str) -> Option<usize> {
@@ -165,24 +224,37 @@ fn commit_choice(app: &mut App) {
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     let len = filtered(&app.tz_query).len();
     // Movement is the shared nav component; a move re-commits, so the config
-    // always matches what's highlighted on screen.
+    // always matches what's highlighted on screen — and marks the list as USED,
+    // which is what lets a bare Enter keep an earlier choice instead of
+    // replacing it with whatever the top of the list happens to be.
     if super::nav::move_cursor(key.code, &mut app.cursor, len) {
+        app.tz_touched = true;
         commit_choice(app);
         return;
     }
     match key.code {
+        // ←/→ flips the hardware clock. Not a list row: it is a second question
+        // about the same thing, and burying it in a 400-entry timezone list is
+        // how it would never be found.
+        KeyCode::Left | KeyCode::Right => app.config.rtc_utc = !app.config.rtc_utc,
         KeyCode::Char(c) => {
             app.tz_query.push(c);
             app.cursor = 0;
+            app.tz_touched = true;
         }
         KeyCode::Backspace => {
             app.tz_query.pop();
             app.cursor = 0;
+            app.tz_touched = true;
         }
         KeyCode::Enter if len > 0 => {
             // Commit BEFORE leaving: goto_next() is the last chance to record
-            // what the cursor was pointing at.
-            commit_choice(app);
+            // what the cursor was pointing at — but ONLY if the list was used.
+            // The screen opens at the top now, so an untouched Enter would
+            // otherwise trade the zone you chose last time for Africa/Abidjan.
+            if app.tz_touched {
+                commit_choice(app);
+            }
             app.goto_next();
             return;
         }
@@ -190,9 +262,116 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // Every movement and every edit of the filter re-commits, so the config
     // always matches what's highlighted on screen.
-    commit_choice(app);
+    if app.tz_touched {
+        commit_choice(app);
+    }
 }
 
 pub fn footer_hint(app: &App) -> String {
     t(app.lang, "tz.footer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::i18n::Lang;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// THE CLOCK EXPLANATION MUST ACTUALLY BE ON SCREEN.
+    ///
+    /// Three lines are drawn into this area — the chosen zone, the UTC/local
+    /// switch, and the sentence saying why the switch matters — and the area
+    /// was two rows tall. ratatui truncates in silence, so the sentence was
+    /// never visible on any console size, and nothing reported it. It is the
+    /// one line that tells somebody with Windows on the same machine that
+    /// their clock will otherwise jump by the timezone offset.
+    #[test]
+    fn the_hardware_clock_explanation_is_not_clipped_away() {
+        for utc in [true, false] {
+            let mut app = App::new();
+            app.config.rtc_utc = utc;
+            let mut term = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            term.draw(|f| draw(f, &mut app, f.area())).expect("draw");
+            let text: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            // Looked up rather than written out: the assertion must follow the
+            // translation, not a copy of it that can drift.
+            let key = if utc {
+                "tz.clock_utc_desc"
+            } else {
+                "tz.clock_local_desc"
+            };
+            let desc = crate::i18n::t(Lang::Uk, key);
+            let needle: String = desc.chars().take(12).collect();
+            assert!(
+                text.contains(&needle),
+                "the clock explanation is not on screen (rtc_utc={utc})"
+            );
+        }
+    }
+
+    use crate::app::Screen;
+    use crossterm::event::KeyEvent;
+
+    /// The list opens AT THE TOP with an empty filter, every single time.
+    ///
+    /// It used to open on the zone already configured, which sounds helpful and
+    /// was not: the config moves as you move, so each re-entry landed somewhere
+    /// else and it read as arbitrary. 567 entries are searched, not browsed.
+    #[test]
+    fn the_list_always_opens_at_the_top() {
+        let mut app = App::new();
+        app.config.timezone = "Europe/Madrid".into();
+        app.cursor = 300;
+        app.tz_query = "mad".into();
+        app.goto(Screen::Timezone);
+        assert_eq!(app.cursor, 0, "the list did not open at the top");
+        assert!(app.tz_query.is_empty(), "a stale filter survived");
+    }
+
+    /// Walking through the step without touching the list KEEPS the zone chosen
+    /// earlier. With the cursor at the top, a bare Enter would otherwise trade
+    /// it for whatever sorts first — the same "it forgot my timezone" in a new
+    /// costume.
+    #[test]
+    fn stepping_through_untouched_keeps_the_chosen_zone() {
+        let mut app = App::new();
+        app.goto(Screen::Timezone);
+        app.config.timezone = "Europe/Madrid".into();
+        app.goto(Screen::Language);
+        app.goto(Screen::Timezone);
+        assert_eq!(app.cursor, 0);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.config.timezone, "Europe/Madrid",
+            "a bare Enter replaced the zone that was already chosen"
+        );
+    }
+
+    /// And touching it DOES choose: a move commits what is highlighted.
+    #[test]
+    fn moving_the_cursor_chooses() {
+        let mut app = App::new();
+        app.config.timezone = "Europe/Madrid".into();
+        app.goto(Screen::Timezone);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down));
+        assert_ne!(app.config.timezone, "Europe/Madrid");
+        assert!(app.tz_touched);
+    }
+
+    /// The default names no country: it is the first of the list, derived from
+    /// the list itself. It was `Europe/Kyiv` — the author's zone, handed to a
+    /// Spaniard, and used as the hint for ranking mirrors as well.
+    #[test]
+    fn the_default_zone_is_simply_the_first_one() {
+        let app = App::new();
+        assert_eq!(app.config.timezone, first_zone());
+        assert_eq!(index_of(&app.config.timezone), Some(0));
+    }
 }

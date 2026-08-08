@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             (theme::border_dim(), theme::normal())
         };
         let mut lines = vec![Line::from(vec![
-            Span::styled(if active { "▎ " } else { "  " }, theme::accent()),
+            Span::styled(if active { "> " } else { "  " }, theme::accent()),
             Span::styled(label(app, *k), ts),
             Span::styled(format!("   {}", desc(app, *k)), theme::dim()),
         ])];
@@ -130,7 +130,7 @@ fn draw_tight(f: &mut Frame, app: &App, area: Rect) {
             theme::normal()
         };
         lines.push(Line::from(vec![
-            Span::styled(if active { "▎ " } else { "  " }, theme::accent()),
+            Span::styled(if active { "> " } else { "  " }, theme::accent()),
             Span::styled(label(app, *k), ts),
             Span::styled(format!("   {}", desc(app, *k)), theme::dim()),
         ]));

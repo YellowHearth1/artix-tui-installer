@@ -1,0 +1,425 @@
+#!/bin/bash
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+LIBDIR=${LIBDIR:-'/usr/share/artools/lib'}
+DATADIR=${DATADIR:-'/usr/share/artools'}
+SYSCONFDIR=${SYSCONFDIR:-'/etc/artools'}
+
+# shellcheck source=src/lib/iso/util.sh
+source "${LIBDIR}"/iso/util.sh
+# shellcheck source=src/lib/base/message.sh
+source "${LIBDIR}"/base/message.sh
+# shellcheck source=src/lib/base/chroot.sh
+source "${LIBDIR}"/base/chroot.sh
+# shellcheck source=src/lib/iso/mount.sh
+source "${LIBDIR}"/iso/mount.sh
+# shellcheck source=src/lib/iso/services.sh
+source "${LIBDIR}"/iso/services.sh
+# shellcheck source=src/lib/iso/calamares.sh
+source "${LIBDIR}"/iso/calamares.sh
+# shellcheck source=src/lib/iso/config.sh
+source "${LIBDIR}"/iso/config.sh
+# shellcheck source=src/lib/iso/firmware.sh
+source "${LIBDIR}"/iso/firmware.sh
+# shellcheck source=src/lib/iso/dracut.sh
+source "${LIBDIR}"/iso/dracut.sh
+# shellcheck source=src/lib/iso/initcpio.sh
+source "${LIBDIR}"/iso/initcpio.sh
+# shellcheck source=src/lib/iso/grub.sh
+source "${LIBDIR}"/iso/grub.sh
+# shellcheck source=src/lib/iso/squash.sh
+source "${LIBDIR}"/iso/squash.sh
+# shellcheck source=src/lib/iso/iso.sh
+source "${LIBDIR}"/iso/iso.sh
+# shellcheck source=src/lib/iso/profile.sh
+source "${LIBDIR}"/iso/profile.sh
+# shellcheck source=src/lib/iso/trap.sh
+source "${LIBDIR}"/iso/trap.sh
+
+clean_up_chroot(){
+    local path mnt="$1"
+    msg2 "Cleaning [%s]" "${mnt##*/}"
+
+    path=$mnt/boot
+    if [[ -d "$path" ]]; then
+        find "$path" -name 'initramfs*.img' -delete &> /dev/null
+    fi
+    path=$mnt/var/lib/pacman/sync
+    if [[ -d $path ]];then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/cache/pacman/pkg
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/log
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+    path=$mnt/var/tmp
+    if [[ -d $path ]];then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+    path=$mnt/tmp
+    if [[ -d $path ]];then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+    # shellcheck disable=2035
+    find "$mnt" -name '*.pacnew' -name '*.pacsave' -name '*.pacorig' -delete
+    if [[ -f "$mnt/boot/grub/grub.cfg" ]]; then
+        rm "$mnt"/boot/grub/grub.cfg
+    fi
+    if [[ -f "$mnt/etc/machine-id" ]]; then
+        rm "$mnt"/etc/machine-id
+    fi
+}
+
+copy_overlay(){
+    local src="$1" dest="$2"
+    if [[ -e "$src" ]];then
+        msg2 "Copying [%s] ..." "${src##*/}"
+        cp -LR "$src"/* "$dest"
+    fi
+}
+
+make_rootfs() {
+    if [[ ! -e "${work_dir}"/rootfs.lock ]]; then
+        msg "Prepare [Base installation] (rootfs)"
+        local rootfs="${work_dir}/rootfs"
+
+        load_pkgs "rootfs"
+
+        prepare_dir "${rootfs}"
+
+        local args=()
+        if "${copy_pacconf}"; then
+            args+=(-P)
+        fi
+        basestrap "${basestrap_args[@]}" "${args[@]}" "${rootfs}" "${packages[@]}"
+
+        copy_overlay "${root_overlay}" "${rootfs}"
+
+        if ! "${HAS_LIVE}"; then
+            configure_chroot "${rootfs}"
+        fi
+
+        clean_up_chroot "${rootfs}"
+
+        : > "${work_dir}"/rootfs.lock
+
+        msg "Done [Base installation] (rootfs)"
+    fi
+}
+
+make_livefs() {
+    if [[ ! -e ${work_dir}/livefs.lock ]]; then
+        msg "Prepare [Live installation] (livefs)"
+        local livefs="${work_dir}/livefs"
+
+        load_pkgs "livefs"
+
+        prepare_dir "${livefs}"
+
+        mount_overlayfs "${livefs}" "${work_dir}"
+
+        basestrap "${basestrap_args[@]}" "${livefs}" "${packages[@]}"
+
+        copy_overlay "${live_overlay}" "${livefs}"
+
+        configure_chroot "${livefs}"
+
+        umount_overlayfs
+
+        clean_up_chroot "${livefs}"
+
+        : > "${work_dir}"/livefs.lock
+
+        msg "Done [Live installation] (livefs)"
+    fi
+}
+
+make_bootfs() {
+    if [[ ! -e ${work_dir}/bootfs.lock ]]; then
+        msg "Prepare [/iso/boot]"
+
+        load_pkgs "bootfs"
+
+        prepare_dir "${iso_root}/boot"
+
+        cp "${work_dir}"/rootfs/boot/vmlinuz* "${iso_root}"/boot/vmlinuz-"${arch}"
+
+        local bootfs="${work_dir}/bootfs"
+
+        mount_overlayfs "${bootfs}" "${work_dir}"
+
+        if "${use_dracut}"; then
+            prepare_initramfs_dracut "${bootfs}"
+        else
+            basestrap "${basestrap_args[@]}" "${bootfs}" "${packages[@]}"
+            prepare_initramfs_mkinitcpio "${bootfs}"
+        fi
+
+        umount_overlayfs
+
+        rm -R "${bootfs}"
+        : > "${work_dir}"/bootfs.lock
+        msg "Done [/iso/boot]"
+    fi
+}
+
+make_grub(){
+    if [[ ! -e ${work_dir}/grub.lock ]]; then
+        msg "Prepare [/iso/boot/grub]"
+
+        local layer=${work_dir}/rootfs
+        if "${HAS_LIVE}"; then
+            layer=${work_dir}/livefs
+        fi
+
+        prepare_grub "${work_dir}/rootfs" "$layer"
+
+        if ${use_dracut}; then
+            configure_grub_dracut
+        else
+            configure_grub_mkinitcpio
+        fi
+
+        : > "${work_dir}"/grub.lock
+        msg "Done [/iso/boot/grub]"
+    fi
+}
+
+gen_iso_fn(){
+    local vars=("artix") name
+    vars+=("${profile}")
+    vars+=("${INITSYS}")
+    case "${STABILITY}" in
+        gremlins|goblins) vars+=("${STABILITY}") ;;
+    esac
+    vars+=("${ISO_VERSION}")
+    vars+=("${arch}")
+    for n in "${vars[@]}"; do
+        name=${name:-}${name:+-}${n}
+    done
+    printf "%s\n" "$name"
+}
+
+export_gpg_publickey() {
+    key_export="${WORKSPACE_DIR}"/pubkey.gpg
+    gpg --batch  --no-armor --output "${key_export}" --export "${GPG_KEY}"
+}
+
+prepare_build(){
+    load_profile
+    local pac_conf
+
+    pac_conf=iso-${arch}.conf
+    if [[ "${STABILITY}" != 'stable' ]]; then
+        pac_conf=iso-${STABILITY}-${arch}.conf
+    fi
+    pacman_conf="${DATADIR}/pacman.conf.d/${pac_conf}"
+    if [[ -f "${USER_CONF_DIR}/pacman.conf.d/${pac_conf}" ]]; then
+        pacman_conf="${USER_CONF_DIR}/pacman.conf.d/${pac_conf}"
+    fi
+
+    iso_file=$(gen_iso_fn).iso
+
+    iso_label="ARTIX_$(date +%Y%m)"
+
+    basestrap_args+=(-C "${pacman_conf}")
+    work_dir=${chroots_iso}/${profile}/artix
+
+    iso_dir="${ISO_POOL}/${profile}"
+
+    iso_root=${chroots_iso}/${profile}/iso
+    live_dir=/LiveOS
+
+    mnt_dir=${chroots_iso}/${profile}/mnt
+
+    if [[ -n "${GPG_KEY}" ]]; then
+        ${use_dracut} || export_gpg_publickey
+    fi
+}
+
+display_settings(){
+    msg "OPTIONS:"
+    msg2 "profile: %s" "${profile}"
+    msg2 "INITSYS: %s" "${INITSYS}"
+    [[ -n ${GPG_KEY} ]] && msg2 "GPG_KEY: %s" "${GPG_KEY}"
+
+    msg "ISO SETTINGS:"
+    msg2 "ISO_VERSION: %s" "${ISO_VERSION}"
+    msg2 "COMPRESSION: %s" "${COMPRESSION}"
+    [[ "${COMPRESSION}" == 'zstd' ]] && msg2 "COMPRESSION_LEVEL: %s" "${COMPRESSION_LEVEL}"
+
+    msg "BUILD:"
+    show_profile
+}
+
+mk_squash(){
+    make_sfs "${work_dir}/rootfs"
+    if [[ -d "${work_dir}/livefs" ]]; then
+        make_sfs "${work_dir}/livefs"
+    fi
+}
+
+mk_iso(){
+    touch "${iso_root}/.artix"
+    msg "Making bootable image"
+    # Sanity checks
+    [[ ! -d "${iso_root}" ]] && return 1
+    if [[ -f "${iso_dir}/${iso_file}" ]]; then
+        msg2 "Removing existing bootable image..."
+        rm -rf "${iso_dir:?}/${iso_file}"
+    fi
+    assemble_iso
+    chown -R "${owner}:$(id --group "${owner}")" "${iso_dir}"
+}
+
+mk_boot(){
+    run_safe "make_bootfs"
+    run_safe "make_grub"
+}
+
+mk_chroots(){
+    run_safe "make_rootfs"
+    if "${HAS_LIVE}"; then
+        run_safe "make_livefs"
+    fi
+}
+
+build(){
+    msg "Start building [%s]" "${profile}"
+    if ${clean_first};then
+        for copy in "${work_dir}"/*; do
+            [[ -d $copy ]] || continue
+            msg2 "Deleting chroot copy '%s'..." "$(basename "${copy}")"
+
+            lock 9 "$copy.lock" "Locking chroot copy '%s'" "$copy"
+
+            subvolume_delete_recursive "${copy}"
+            rm -rf --one-file-system "${copy}"
+        done
+        lock_close 9
+
+        rm -rf --one-file-system "${work_dir}"
+
+        msg "Deleting isoroot [%s] ..." "${iso_root##*/}"
+        rm -rf --one-file-system "${iso_root}"
+    fi
+
+    if ${chroot_only}; then
+        mk_chroots
+        warning "Continue squash: %s -p %s -sc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${boot_only}; then
+        mk_boot
+        warning "Continue iso: %s -p %s -zc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${squash_only}; then
+        mk_squash
+        warning "Continue boot: %s -p %s -bc ..." "${cmd}" "${profile}"
+        exit 1
+    elif ${iso_only}; then
+        [[ ! -d ${work_dir} ]] && die "Create chroot: %s -p %s -x" "${cmd}" "${profile}"
+        mk_iso
+    else
+        mk_chroots
+        mk_boot
+        mk_squash
+        mk_iso
+    fi
+    msg "Finished building [%s]" "${profile}"
+}
+
+clean_first=true
+pretend=false
+chroot_only=false
+iso_only=false
+persist=false
+use_dracut=false
+squash_only=false
+boot_only=false
+copy_pacconf=false
+
+basestrap_args=(-GMc)
+cmd=${0##*/}
+
+owner=${SUDO_USER:-$USER}
+profile='base'
+chroots_iso="${CHROOTS_DIR}/buildiso"
+arch=${ARCH}
+
+usage() {
+    printf 'Usage: %s [options]\n' "${cmd}"
+    printf '    -p <profile>       Profile [default: %s]\n' "${profile}"
+    printf '    -r <dir>           Chroots directory\n'
+    printf '                       [default: %s]\n' "${chroots_iso}"
+    printf '    -R <stability>     Build stability\n'
+    printf '                       [default: %s]\n' "${STABILITY}"
+    printf '    -a <arch>          Build arch\n'
+    printf '                       [default: %s]\n' "${arch}"
+    printf '    -t <dir>           Target directory\n'
+    printf '                       [default: %s]\n' "${ISO_POOL}"
+    printf '    -i <name>          Init system to use\n'
+    printf '                       [default: %s]\n' "${INITSYS}"
+    printf '    -g <key>           The gpg key for img signing\n'
+    printf '                       [default: none]\n'
+    printf '    -m                 Set SquashFS image mode to persistence\n'
+    printf '    -c                 Disable clean work dir\n'
+    printf '    -x                 Build chroot only\n'
+    printf '    -s                 Squash chroot only\n'
+    printf '    -b                 Generate iso boot only\n'
+    printf '    -z                 Generate iso only\n'
+    printf '                       Requires pre built images (-x)\n'
+    printf '    -d                 Use dracut instead of mkinitcpio for iso initramfs\n'
+    printf '    -w                 Copy the pacman.conf used to the rootfs\n'
+    printf '    -q                 Query settings and pretend build\n'
+    printf '    -h                 This help\n'
+    printf '\n'
+    printf '\n'
+    exit "$1"
+}
+
+orig_args=("$@")
+
+opts='p:r:R:t:i:g:a:czsbxwmdqh'
+
+while getopts "${opts}" arg; do
+    case "${arg}" in
+        p) profile="$OPTARG" ;;
+        a) arch="$OPTARG" ;;
+        R) STABILITY="$OPTARG" ;;
+        r) chroots_iso="$OPTARG" ;;
+        t) ISO_POOL="$OPTARG" ;;
+        i) INITSYS="$OPTARG" ;;
+        g) GPG_KEY="$OPTARG" ;;
+        c) clean_first=false ;;
+        x) chroot_only=true ;;
+        z) iso_only=true ;;
+        s) squash_only=true ;;
+        b) boot_only=true ;;
+        m) persist=true ;;
+        d) use_dracut=true ;;
+        w) copy_pacconf=true ;;
+        q) pretend=true ;;
+        h|?) usage 0 ;;
+    esac
+done
+
+shift $(( OPTIND - 1 ))
+
+prepare_build
+
+${pretend} && display_settings && exit 1
+
+check_root "" "${BASH_SOURCE[0]}" "${orig_args[@]}"
+
+prepare_dir "${mnt_dir}"
+prepare_dir "${iso_dir}"
+prepare_dir "${iso_root}"
+
+prepare_traps
+
+build

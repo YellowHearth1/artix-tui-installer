@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+shopt -s extglob
+
+LIBDIR=${LIBDIR:-'/usr/share/artools/lib'}
+
+# shellcheck source=src/lib/base/message.sh
+source "${LIBDIR}"/base/message.sh
+# shellcheck source=src/lib/base/mount.sh
+source "${LIBDIR}"/base/mount.sh
+# shellcheck source=src/lib/base/unshare-mount.sh
+source "${LIBDIR}"/base/unshare-mount.sh
+# shellcheck source=src/lib/base/chroot.sh
+source "${LIBDIR}"/base/chroot.sh
+
+
+artix-chroot() {
+    check_root "" "${BASH_SOURCE[0]}" "${orig_args[@]}"
+#     (( EUID == 0 )) || die 'This script must be run with root privileges'
+
+    [[ -d $chrootdir ]] || die "Can't create chroot on non-directory %s" "$chrootdir"
+
+    "$setup" "$chrootdir" || die "failed to setup chroot %s" "$chrootdir"
+    if (( ! keepresolvconf )); then
+        chroot_add_resolv_conf "$chrootdir" || die "failed to setup resolv.conf"
+    fi
+
+    if ! mountpoint -q "$chrootdir"; then
+        warning "$chrootdir is not a mountpoint. This may have undesirable side effects."
+    fi
+
+    chroot_args=()
+    [[ $userspec ]] && chroot_args+=(--userspec "$userspec")
+
+    SHELL=/bin/bash $pid_unshare chroot "${chroot_args[@]}" -- "$chrootdir" "${args[@]}"
+}
+
+usage() {
+    cat <<EOF
+usage: ${0##*/} chroot-dir [command] [arguments...]
+
+    -h                  Print this help message
+    -N                  Run in unshare mode as a regular user
+    -u <user>[:group]   Specify non-root user and optional group to use
+    -r                  Do not change the resolv.conf within the chroot
+
+If 'command' is unspecified, ${0##*/} will launch /bin/bash.
+
+Note that when using artix-chroot, the target chroot directory *should* be a
+mountpoint. This ensures that tools such as pacman(8) or findmnt(8) have an
+accurate hierarchy of the mounted filesystems within the chroot.
+
+If your chroot target is not a mountpoint, you can bind mount the directory on
+itself to make it a mountpoint, i.e. 'mount --bind /your/chroot /your/chroot'.
+
+EOF
+}
+
+orig_args=("$@")
+
+opts=':hNu:r'
+
+while getopts ${opts} arg; do
+    case "${arg}" in
+        h) usage; exit 0 ;;
+        N) unshare=1 ;;
+        u) userspec=$OPTARG ;;
+        r) keepresolvconf=1 ;;
+        :) die '%s: option requires an argument -- '\''%s'\' "${0##*/}" "$OPTARG" ;;
+        ?) die '%s: invalid option -- '\''%s'\' "${0##*/}" "$OPTARG" ;;
+    esac
+done
+
+(( $# )) || die 'No chroot directory specified'
+
+chrootdir="$1"
+shift
+
+args=("$@")
+if (( unshare )); then
+    setup=unshare_setup
+    "$mount_unshare" bash -c "$(declare_all); artix-chroot"
+else
+    setup=chroot_setup
+    artix-chroot
+fi

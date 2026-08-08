@@ -43,7 +43,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             Lang::Es => format!("  {}", t(app.lang, "lang.es")),
         })
         .collect();
-    widgets::select_list(f, rows[1], &items, app.cursor);
+    widgets::select_list_scrolled(f, rows[1], &items, app.cursor, app.marquee);
 
     widgets::action_row(
         f,
@@ -91,7 +91,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             apply(app);
             // After choosing the language, present the mode chooser (Install /
             // Recovery) rather than dropping straight into the install flow.
-            app.screen = crate::app::Screen::Mode;
+            app.goto(crate::app::Screen::Mode);
         }
         _ => {}
     }
@@ -104,13 +104,7 @@ fn apply(app: &mut App) {
         Lang::En => {
             app.config.lang = "en".into();
             app.config.locale = "en_US.UTF-8".into();
-            // Drop the Ukrainian layout only when the layouts are still on the
-            // Ukrainian-interface default ([gb, ua]) or an old [ua]-first list,
-            // so a deliberate custom choice isn't clobbered.
-            if app.config.xkb_layouts == vec!["gb".to_string(), "ua".to_string()]
-                || app.config.xkb_layouts == vec!["ua".to_string(), "gb".to_string()]
-                || app.config.xkb_layouts == vec!["ua".to_string()]
-            {
+            if !app.keyboard_touched {
                 app.config.keymap = "gb".into();
                 app.config.xkb_layouts = vec!["gb".into()];
             }
@@ -124,14 +118,7 @@ fn apply(app: &mut App) {
         Lang::Es => {
             app.config.lang = "es".into();
             app.config.locale = "es_MX.UTF-8".into();
-            // Same guard as the English arm: only replace layouts that are
-            // still on an untouched Ukrainian-interface default, never a
-            // deliberate choice.
-            if app.config.xkb_layouts == vec!["gb".to_string(), "ua".to_string()]
-                || app.config.xkb_layouts == vec!["ua".to_string(), "gb".to_string()]
-                || app.config.xkb_layouts == vec!["ua".to_string()]
-                || app.config.xkb_layouts == vec!["gb".to_string()]
-            {
+            if !app.keyboard_touched {
                 app.config.keymap = "es".into();
                 app.config.xkb_layouts = vec!["es".into()];
             }
@@ -147,19 +134,128 @@ fn apply(app: &mut App) {
             // typing the LUKS passphrase. A Latin primary also keeps keyboard
             // shortcuts (which are defined against Latin keysyms) working in
             // every DE out of the box; Ukrainian is one toggle away as the
-            // second layout. Only applied while still on the untouched default,
-            // so a deliberate choice isn't overwritten.
-            if app.config.xkb_layouts == vec!["gb".to_string()] {
+            // second layout. Skipped once the user has chosen for themselves.
+            if !app.keyboard_touched {
                 app.config.keymap = "gb".into();
                 app.config.xkb_layouts = vec!["gb".into(), "ua".into()];
             }
         }
     }
+    // The console follows the language immediately: whatever layout this
+    // language just chose is the one the next screens will be typed on.
+    let km =
+        crate::screens::keyboard::live_keymap(&app.config.lang, &app.config.keymap).to_string();
+    crate::screens::keyboard::apply_keymap(&km);
 }
 
 #[cfg(test)]
 mod tests {
+    /// Choosing a language a SECOND time must not disturb what was chosen after
+    /// the first time.
+    ///
+    /// Reported from a real run: pick Ukrainian, pick a timezone, step back,
+    /// pick Spanish, step back, pick Ukrainian again — and the timezone screen
+    /// no longer highlighted the chosen zone. The config still held it; the
+    /// cursor did not, because Language and the mode menu both jumped by
+    /// assigning `app.screen` and so skipped the bookkeeping that parks the
+    /// cursor on the configured value. The next arrow key then committed a
+    /// different zone over the top of it.
+    #[test]
+    fn choosing_a_language_twice_does_not_lose_the_timezone() {
+        use crate::app::Screen;
+
+        let mut app = App::new();
+        // First pass: Ukrainian, then a timezone the user picked by hand.
+        app.cursor = OPTIONS.iter().position(|l| *l == Lang::Uk).unwrap();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Mode);
+        app.goto(Screen::Timezone);
+        app.config.timezone = "America/Argentina/Ushuaia".into();
+        app.goto(Screen::Language);
+
+        // Second pass: Spanish, back, Ukrainian again.
+        app.cursor = OPTIONS.iter().position(|l| *l == Lang::Es).unwrap();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        app.goto(Screen::Language);
+        app.cursor = OPTIONS.iter().position(|l| *l == Lang::Uk).unwrap();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        // Enter the flow through the mode menu itself, which is the path that
+        // was broken — calling goto() here by hand would test the fix instead
+        // of the journey.
+        app.mode_cursor = 0; // Install
+        crate::screens::mode::handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        // Whatever the first post-language step is — the keyboard now, so that
+        // the layout is settled before anything asks for text.
+        assert_eq!(app.screen, Screen::ALL[1]);
+        app.goto(Screen::Timezone);
+        assert_eq!(
+            app.config.timezone, "America/Argentina/Ushuaia",
+            "the language screen overwrote the chosen timezone"
+        );
+        // The cursor comes back AT THE TOP now — the list is searched, not
+        // browsed — so what has to survive is the CHOICE, not the position.
+        assert_eq!(app.cursor, 0, "the list did not open at the top");
+    }
+
     use super::*;
+
+    /// Switching languages must not leave the PREVIOUS language's layout behind.
+    ///
+    /// Reported from a real run: the user tried each language in turn, landed on
+    /// Spanish, then chose Ukrainian — and the keyboard step came up Spanish.
+    /// The guard compared the layout list against every known default, and that
+    /// list never included `["es"]`, so once Spanish had been visited every
+    /// later language kept its layout.
+    #[test]
+    fn walking_through_the_languages_leaves_the_last_ones_layout_behind() {
+        let mut app = App::new();
+        let pick = |app: &mut App, lang: Lang| {
+            app.cursor = OPTIONS.iter().position(|l| *l == lang).unwrap();
+            apply(app);
+        };
+
+        pick(&mut app, Lang::Es);
+        assert_eq!(app.config.xkb_layouts, vec!["es".to_string()]);
+
+        pick(&mut app, Lang::Uk);
+        assert_eq!(
+            app.config.xkb_layouts,
+            vec!["gb".to_string(), "ua".to_string()],
+            "Ukrainian kept the Spanish layout"
+        );
+
+        pick(&mut app, Lang::En);
+        assert_eq!(app.config.xkb_layouts, vec!["gb".to_string()]);
+
+        // Round and round: every order must end on the right layout.
+        for lang in [Lang::Es, Lang::En, Lang::Uk, Lang::Es, Lang::Uk] {
+            pick(&mut app, lang);
+        }
+        assert_eq!(
+            app.config.xkb_layouts,
+            vec!["gb".to_string(), "ua".to_string()]
+        );
+    }
+
+    /// A layout the user chose themselves survives a language change.
+    #[test]
+    fn a_deliberate_layout_is_never_overwritten() {
+        let mut app = App::new();
+        app.config.xkb_layouts = vec!["de".into()];
+        app.config.keymap = "de".into();
+        app.keyboard_touched = true;
+
+        for lang in [Lang::Es, Lang::Uk, Lang::En] {
+            app.cursor = OPTIONS.iter().position(|l| *l == lang).unwrap();
+            apply(&mut app);
+            assert_eq!(
+                app.config.xkb_layouts,
+                vec!["de".to_string()],
+                "{lang:?} overwrote a layout the user picked"
+            );
+        }
+    }
 
     /// Every language the binary carries a translation for is REACHABLE.
     ///

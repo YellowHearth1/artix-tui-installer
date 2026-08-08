@@ -358,7 +358,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
             app.tbwtest_scanned = false; // re-scan on the next draw
         }
-        KeyCode::Esc => app.screen = Screen::Mode,
+        KeyCode::Esc => app.goto(Screen::Mode),
         _ => {}
     }
 }

@@ -33,8 +33,22 @@ set -eu
 #
 #   REPO_DIR=/srv/artix ISO_DIR=/mnt/build sh scripts/release.sh
 #
-REPO_DIR="${REPO_DIR:-$HOME/artix-tui-installer}"
-ISO_DIR="${ISO_DIR:-$HOME/artools-workspace/iso/tui}"
+# Where the checkout is, worked out from where THIS SCRIPT is — not from a
+# hard-coded ~/artix-tui-installer. Anyone cloning the project somewhere else
+# (and anyone at all who is not the author) had every path in here point at a
+# directory they do not have.
+SELF_DIR=$(cd "$(dirname "$0")" && pwd -P)
+REPO_DIR="${REPO_DIR:-$(dirname "$SELF_DIR")}"
+# Where to find the image. `scripts/build-iso.sh` writes into the checkout's own
+# iso/ folder; older images may still be in the artools workspace, so that is
+# tried second rather than failing on a build that predates the move.
+if [ -n "${ISO_DIR:-}" ]; then
+    :
+elif ls "$REPO_DIR"/iso/artix-tui-dinit-*-x86_64.iso >/dev/null 2>&1; then
+    ISO_DIR="$REPO_DIR/iso"
+else
+    ISO_DIR="$HOME/artools-workspace/iso/tui"
+fi
 BIN="${BIN:-$REPO_DIR/installer/target/release/artix-installer}"
 ISO_ASSET_NAME="artix-tui-dinit-x86_64.iso"
 GH_REPO="${GH_REPO:-YellowHearth1/artix-tui-installer}"
@@ -117,8 +131,26 @@ esac
 # Deliberately bumped BEFORE publishing, not after: bumping afterwards meant the
 # second run of a day picked up the already-incremented number and published it,
 # which is exactly the behaviour this avoids.
-LAST_PUB=$(gh release list --repo "$GH_REPO" --limit 1 --json publishedAt \
-    -q '.[0].publishedAt' 2>/dev/null || true)
+# But FIRST: a version that has never been published is not due a bump at all.
+#
+# The day rule alone was wrong the moment anybody set the version by hand. Having
+# written 0.0.2 into Cargo.toml and a real 0.0.2 entry in the CHANGELOG, this
+# script would see "the last release was an earlier day", bump to 0.0.3, insert a
+# stub entry above the real one, and publish the stub — burying the notes
+# somebody had just written under a heading that says "(describe this release)".
+#
+# So the question is not "when was the last release" but "has THIS version been
+# released yet".
+ALREADY_PUBLISHED=0
+gh release view "v$VERSION" --repo "$GH_REPO" >/dev/null 2>&1 && ALREADY_PUBLISHED=1
+
+LAST_PUB=""
+if [ "$ALREADY_PUBLISHED" -eq 1 ]; then
+    LAST_PUB=$(gh release list --repo "$GH_REPO" --limit 1 --json publishedAt \
+        -q '.[0].publishedAt' 2>/dev/null || true)
+else
+    echo ">>> v$VERSION has never been published — releasing it as it stands."
+fi
 if [ -n "$LAST_PUB" ]; then
     # Compare in LOCAL days — that is the day the person doing the release is
     # living in. publishedAt is UTC; date -d converts it.

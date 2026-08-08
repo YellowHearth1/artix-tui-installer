@@ -1,0 +1,460 @@
+#!/bin/bash
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+shopt -s extglob
+
+LIBDIR=${LIBDIR:-'/usr/share/artools/lib'}
+
+# shellcheck source=src/lib/base/message.sh
+source "${LIBDIR}"/base/message.sh
+
+#{{{ filesystems
+
+declare -A pseudofs_types=([anon_inodefs]=1
+                        [apparmorfs]=1
+                        [autofs]=1
+                        [bdev]=1
+                        [binder]=1
+                        [binfmt_misc]=1
+                        [bpf]=1
+                        [cgroup]=1
+                        [cgroup2]=1
+                        [configfs]=1
+                        [cpuset]=1
+                        [debugfs]=1
+                        [devfs]=1
+                        [devpts]=1
+                        [devtmpfs]=1
+                        [dlmfs]=1
+                        [dmabuf]=1
+                        [drm]=1
+                        [efivarfs]=1
+                        [fuse]=1
+                        [fuse.archivemount]=1
+                        [fuse.avfsd]=1
+                        [fuse.dumpfs]=1
+                        [fuse.encfs]=1
+                        [fuse.gvfs-fuse-daemon]=1
+                        [fuse.gvfsd-fuse]=1
+                        [fuse.lxcfs]=1
+                        [fuse.rofiles-fuse]=1
+                        [fuse.vmware-vmblock]=1
+                        [fuse.xwmfs]=1
+                        [fusectl]=1
+                        [hugetlbfs]=1
+                        [ipathfs]=1
+                        [mqueue]=1
+                        [nfsd]=1
+                        [none]=1
+                        [nsfs]=1
+                        [overlay]=1
+                        [pipefs]=1
+                        [proc]=1
+                        [pstore]=1
+                        [ramfs]=1
+                        [resctrl]=1
+                        [rootfs]=1
+                        [rpc_pipefs]=1
+                        [securityfs]=1
+                        [selinuxfs]=1
+                        [smackfs]=1
+                        [sockfs]=1
+                        [spufs]=1
+                        [sysfs]=1
+                        [tmpfs]=1
+                        [tracefs]=1
+                        [vboxsf]=1
+                        [virtiofs]=1)
+
+declare -A fsck_types=([btrfs]=0    # btrfs doesn't need a regular fsck utility
+                    [cramfs]=1
+                    [erofs]=1
+                    [exfat]=1
+                    [ext2]=1
+                    [ext3]=1
+                    [ext4]=1
+                    [f2fs]=1
+                    [fat]=1
+                    [jfs]=1
+                    [minix]=1
+                    [msdos]=1
+                    [reiserfs]=1
+                    [vfat]=1
+                    [xfs]=1)
+
+#}}}
+
+#{{{ functions
+
+fstype_is_pseudofs() {
+    (( pseudofs_types["$1"] ))
+}
+
+fstype_has_fsck() {
+    (( fsck_types["$1"] ))
+}
+
+try_cast() (
+    _=$(( $1#$2 ))
+) 2>/dev/null
+
+valid_number_of_base() {
+    local base="$1" len=${#2} i
+
+    for (( i = 0; i < len; i++ )); do
+        try_cast "$base" "${2:i:1}" || return 1
+    done
+
+    return 0
+}
+
+mangle() {
+    local i chr out
+    local {a..f}= {A..F}=
+
+    for (( i = 0; i < ${#1}; i++ )); do
+        chr=${1:i:1}
+        case $chr in
+            [[:space:]\\])
+                printf -v chr '%03o' "'$chr"
+                out+=\\
+            ;;
+        esac
+        out+=$chr
+    done
+
+    printf '%s' "$out"
+}
+
+unmangle() {
+    local i chr out len=$(( ${#1} - 4 ))
+    local {a..f}= {A..F}=
+
+    for (( i = 0; i < len; i++ )); do
+        chr=${1:i:1}
+        case $chr in
+            \\)
+                if valid_number_of_base 8 "${1:i+1:3}" ||
+                    valid_number_of_base 16 "${1:i+1:3}"; then
+                    printf -v chr '%b' "${1:i:4}"
+                    (( i += 3 ))
+                fi
+            ;;
+        esac
+        out+=$chr
+    done
+
+    printf '%s' "$out${1:i}"
+}
+
+dm_name_for_devnode() {
+    read -r dm_name <"/sys/class/block/${1#/dev/}/dm/name"
+    if [[ $dm_name ]]; then
+        printf '/dev/mapper/%s' "$dm_name"
+    else
+        # don't leave the caller hanging, just print the original name
+        # along with the failure.
+        error 'Failed to resolve device mapper name for: %s' "$1"
+    fi
+}
+
+optstring_match_option() {
+    local candidate pat patterns
+
+    IFS=, read -ra patterns <<<"$1"
+    for pat in "${patterns[@]}"; do
+        if [[ $pat = *=* ]]; then
+            # "key=val" will only ever match "key=val"
+            candidate=$2
+        else
+            # "key" will match "key", but also "key=anyval"
+            candidate=${2%%=*}
+        fi
+
+        [[ $pat = "$candidate" ]] && return 0
+    done
+
+    return 1
+}
+
+optstring_remove_option() {
+    local o options_ remove=$2 IFS=,
+
+    read -ra options_ <<<"${!1}"
+
+    for o in "${!options_[@]}"; do
+        optstring_match_option "$remove" "${options_[o]}" && unset 'options_[o]'
+    done
+
+    declare -g "$1=${options_[*]}"
+}
+
+optstring_normalize() {
+    local o options_ norm IFS=,
+
+    read -ra options_ <<<"${!1}"
+
+    # remove empty fields
+    for o in "${options_[@]}"; do
+        [[ $o ]] && norm+=("$o")
+    done
+
+    # avoid empty strings, reset to "defaults"
+    declare -g "$1=${norm[*]:-defaults}"
+}
+
+optstring_append_option() {
+    if ! optstring_has_option "$1" "$2"; then
+        declare -g "$1=${!1},$2"
+    fi
+
+    optstring_normalize "$1"
+}
+
+optstring_get_option() {
+    local _opts o
+
+    IFS=, read -ra _opts <<<"${!1}"
+    for o in "${_opts[@]}"; do
+        if optstring_match_option "$2" "$o"; then
+            declare -g "$o"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+optstring_has_option() {
+    local "${2%%=*}"
+
+    optstring_get_option "$1" "$2"
+}
+
+write_source() {
+    local src="$1" spec label uuid comment=()
+
+    label=$(lsblk -rno LABEL "$1" 2>/dev/null)
+    uuid=$(lsblk -rno UUID "$1" 2>/dev/null)
+
+    # bind mounts do not have a UUID!
+
+    case $bytag in
+        '')
+            [[ $uuid ]] && comment=("UUID=$uuid")
+            [[ $label ]] && comment+=("LABEL=$(mangle "$label")")
+        ;;
+        LABEL)
+            spec=$label
+            [[ $uuid ]] && comment=("$src" "UUID=$uuid")
+        ;;
+        UUID)
+            spec=$uuid
+            comment=("$src")
+            [[ $label ]] && comment+=("LABEL=$(mangle "$label")")
+        ;;
+        *)
+            [[ $uuid ]] && comment=("$1" "UUID=$uuid")
+            [[ $label ]] && comment+=("LABEL=$(mangle "$label")")
+            [[ $bytag ]] && spec=$(lsblk -rno "$bytag" "$1" 2>/dev/null)
+        ;;
+    esac
+
+    [[ -n ${comment[*]} ]] && printf '# %s\n' "${comment[*]}"
+
+    if [[ $spec ]]; then
+        printf '%-20s' "$bytag=$(mangle "$spec")"
+    else
+        printf '%-20s' "$(mangle "$src")"
+    fi
+}
+
+optstring_apply_quirks() {
+    local varname="$1" fstype="$2"
+
+    # SELinux displays a 'seclabel' option in /proc/self/mountinfo. We can't know
+    # if the system we're generating the fstab for has any support for SELinux (as
+    # one might install Arch from a Fedora environment), so let's remove it.
+    optstring_remove_option "$varname" seclabel
+
+    # Prune 'relatime' option for any pseudofs. This seems to be a rampant
+    # default which the kernel often exports even if the underlying filesystem
+    # doesn't support it. Example: https://bugs.archlinux.org/task/54554.
+    if awk -v fstype="$fstype" '$1 == fstype { exit 1 }' /proc/filesystems; then
+        optstring_remove_option "$varname" relatime
+    fi
+
+    case $fstype in
+        btrfs)
+            # Having only one of subvol= and subvolid= is enough for mounting a btrfs subvolume
+            # And having subvolid= set prevents things like 'snapper rollback' to work, as it
+            # updates the subvolume in-place, leaving subvol= unchanged with a different subvolid.
+            if optstring_has_option "$varname" subvol; then
+                optstring_remove_option "$varname" subvolid
+            fi
+        ;;
+        f2fs)
+            # These are build-time or runtime-unchangeable options for f2fs.
+            # The former means that kernels supporting the options will only
+            # provide the negative versions of these (e.g. noacl), and vice versa
+            # for kernels without support.
+            # The latter means that the options can only be specified/changed
+            # during the initial mount but not remount.
+            optstring_remove_option "$varname" noacl,acl,nouser_xattr,user_xattr,atgc
+        ;;
+        vfat)
+            # Before Linux v3.8, "cp" is prepended to the value of the codepage.
+            # shellcheck disable=SC2154
+            if optstring_get_option "$varname" codepage && [[ $codepage = cp* ]]; then
+                optstring_remove_option "$varname" codepage
+                optstring_append_option "$varname" "codepage=${codepage#cp}"
+            fi
+        ;;
+    esac
+}
+
+#}}}
+
+usage() {
+  cat <<EOF
+usage: ${0##*/} [options] root
+
+  Options:
+    -f <filter>    Restrict output to mountpoints matching the prefix FILTER
+    -L             Use labels for source identifiers (shortcut for -t LABEL)
+    -p             Exclude pseudofs mounts (default behavior)
+    -P             Include pseudofs mounts
+    -t <tag>       Use TAG for source identifiers (TAG should be one of: LABEL,
+                      UUID, PARTLABEL, PARTUUID)
+    -U             Use UUIDs for source identifiers (shortcut for -t UUID)
+
+    -h             Print this help message
+
+fstabgen generates output suitable for addition to an fstab file based on the
+devices mounted under the mountpoint specified by the given root.
+
+EOF
+}
+
+if [[ -z $1 || $1 = @(-h|--help) ]]; then
+    usage
+    exit $(( $# ? 0 : 1 ))
+fi
+
+while getopts ':f:LPpt:U' flag; do
+    case $flag in
+        L) bytag=LABEL ;;
+        U) bytag=UUID ;;
+        f) prefixfilter=$OPTARG ;;
+        P) pseudofs=1 ;;
+        p) pseudofs=0 ;;
+        t) bytag=${OPTARG^^} ;;
+        :) die '%s: option requires an argument -- '\''%s'\' "${0##*/}" "$OPTARG" ;;
+        ?) die '%s: invalid option -- '\''%s'\' "${0##*/}" "$OPTARG" ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+(( $# )) || die "No root directory specified"
+root=$(realpath -mL "$1"); shift
+
+if ! mountpoint -q "$root"; then
+    die "$root is not a mountpoint"
+fi
+
+# handle block devices
+while read -r src target fstype opts fsroot; do
+    if (( !pseudofs )) && fstype_is_pseudofs "$fstype"; then
+        continue
+    fi
+
+    [[ $target = "$prefixfilter"* ]] || continue
+
+    # default 5th and 6th columns
+    dump=0 pass=2
+
+    src=$(unmangle "$src")
+    target=$(unmangle "$target")
+    target=${target#"$root"}
+
+    if (( !foundroot )) && findmnt "$src" "$root" >/dev/null; then
+        # this is root. we can't possibly have more than one...
+        pass=1 foundroot=1
+    fi
+
+    # if there's no fsck tool available, then only pass=0 makes sense.
+    if ! fstype_has_fsck "$fstype"; then
+        pass=0
+    fi
+
+    if [[ $fsroot != / && $fstype != btrfs ]]; then
+        # it's a bind mount
+        src=$(findmnt -funcevo TARGET "$src")$fsroot
+        src="/${src#"$root"/}"
+        if [[ $src -ef $target ]]; then
+            # hrmm, this is weird. we're probably looking at a file or directory
+            # that was bound into a chroot from the host machine. Ignore it,
+            # because this won't actually be a valid mount. Worst case, the user
+            # just re-adds it.
+            continue
+        fi
+        fstype=none
+        opts+=,bind
+        pass=0
+    fi
+
+    # filesystem quirks
+    case $fstype in
+        fuseblk)
+            # well-behaved FUSE filesystems will report themselves as fuse.$fstype.
+            # this is probably NTFS-3g, but let's just make sure.
+            if ! newtype=$(lsblk -no FSTYPE "$src") || [[ -z $newtype ]]; then
+                # avoid blanking out fstype, leading to an invalid fstab
+                error 'Failed to derive real filesystem type for FUSE device on %s' "$target"
+            else
+                fstype=$newtype
+            fi
+        ;;
+    esac
+
+    optstring_apply_quirks "opts" "$fstype"
+
+    # write one line
+    write_source "$src"
+    printf '\t%-10s' "/$(mangle "${target#/}")" "$fstype" "$opts"
+    printf '\t%s %s' "$dump" "$pass"
+    printf '\n\n'
+done < <(findmnt -Recvruno SOURCE,TARGET,FSTYPE,OPTIONS,FSROOT "$root")
+
+# handle swaps devices
+{
+    # ignore header
+    read -r
+
+    while read -r device type _ _ prio; do
+        options=defaults
+        if (( prio >= 0 )); then
+            options+=,pri=$prio
+        fi
+
+        # skip files marked deleted by the kernel
+        [[ $device = *'\040(deleted)' ]] && continue
+
+        # skip devices not part of the prefix
+        [[ $device = "$prefixfilter"* ]] || continue
+
+        if [[ $type = file ]]; then
+            printf '%-20s' "${device#"${root%/}"}"
+        elif [[ $device = /dev/dm-+([0-9]) ]]; then
+            # device mapper doesn't allow characters we need to worry
+            # about being mangled, and it does the escaping of dashes
+            # for us in sysfs.
+            write_source "$(dm_name_for_devnode "$device")"
+        else
+            write_source "$(unmangle "$device")"
+        fi
+
+        printf '\t%-10s\t%-10s\t%-10s\t0 0\n\n' 'none' 'swap' "$options"
+    done
+} </proc/swaps

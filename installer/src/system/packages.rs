@@ -77,6 +77,12 @@ pub fn popular() -> Vec<Pkg> {
         // the first thing the user sees — keep it, swap to fish, or untick
         // both and stay on bash. Every entry unticks like any other.
         (
+            "xorg",
+            "X.Org server + xf86 drivers (default). Untick only if you intend to \
+             install a different X server yourself: with this off the installer \
+             names no X package at all and leaves the choice entirely to you.",
+        ),
+        (
             "zsh",
             "Powerful interactive shell (default; ships .zshrc + starship)",
         ),
@@ -217,6 +223,10 @@ pub fn aur_popular() -> Vec<Pkg> {
             "Microsoft's VS Code editor (official binary)",
         ),
         ("spotify", "Spotify music streaming client"),
+        (
+            "fluxer-bin",
+            "A free and open source instant messaging and VoIP platform built for friends, groups, and communities.",
+        ),
         (
             "vesktop-bin",
             "Discord client with Vencord + better Linux screenshare",

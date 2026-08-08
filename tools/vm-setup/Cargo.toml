@@ -1,0 +1,23 @@
+[package]
+name = "vm-setup"
+version = "0.0.1"
+edition = "2021"
+description = "Pick the QEMU test stand for the Artix TUI installer"
+license = "Apache-2.0"
+
+# A crate of its own, deliberately.
+#
+# It is a DEVELOPER tool: nothing here ships on the ISO, and the ISO build must
+# not pay to compile it. A second [[bin]] inside the installer crate would be
+# built by every `cargo build --release` the image build runs, for a program the
+# image never contains.
+#
+# Same ratatui/crossterm pair as the installer, so the two look identical and
+# there is one TUI stack in the project rather than two.
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+
+[[bin]]
+name = "vm-setup"
+path = "src/main.rs"

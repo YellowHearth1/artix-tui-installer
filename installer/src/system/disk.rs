@@ -380,35 +380,52 @@ fn scan_partitions() -> Result<Vec<Partition>, String> {
     Ok(out)
 }
 
-/// Bytes → a short human size ("512M", "40G", "1.5T"), locale-independent —
-/// lsblk's own -h output follows the locale (decimal comma) which would leak
-/// into shell-visible strings.
-pub(crate) fn human_size(b: u64) -> String {
+/// Bytes → a human size, locale-independent — lsblk's own `-h` output follows
+/// the locale (decimal comma), which would leak into shell-visible strings.
+///
+/// `wide` spells the unit out: **"512 MiB", "40 GiB"**. These ARE binary units —
+/// 40 GiB is 42.9 GB — and the bare "40G" both hid that and read like the
+/// decimal figure printed on the box the drive came in. The short form stays for
+/// panels too narrow to afford three more columns per number, and nowhere else.
+pub(crate) fn human_size_fmt(b: u64, wide: bool) -> String {
     const K: u64 = 1024;
     const M: u64 = K * K;
     const G: u64 = M * K;
     const T: u64 = G * K;
+    let unit = |short: &str| -> String {
+        if wide {
+            format!(" {short}iB")
+        } else {
+            short.to_string()
+        }
+    };
     if b >= T {
         let v = b as f64 / T as f64;
         if v < 10.0 {
-            format!("{v:.1}T")
+            format!("{v:.1}{}", unit("T"))
         } else {
-            format!("{v:.0}T")
+            format!("{v:.0}{}", unit("T"))
         }
     } else if b >= G {
         let v = b as f64 / G as f64;
         if v < 10.0 {
-            format!("{v:.1}G")
+            format!("{v:.1}{}", unit("G"))
         } else {
-            format!("{v:.0}G")
+            format!("{v:.0}{}", unit("G"))
         }
     } else if b >= M {
-        format!("{}M", b / M)
+        format!("{}{}", b / M, unit("M"))
     } else if b == 0 {
         "?".into()
     } else {
-        format!("{}K", b.div_ceil(K))
+        format!("{}{}", b.div_ceil(K), unit("K"))
     }
+}
+
+/// The spelled-out form — what the installer shows unless space forbids it.
+/// Callers that know their panel width pass `human_size_fmt` directly instead.
+pub(crate) fn human_size(b: u64) -> String {
+    human_size_fmt(b, true)
 }
 
 /// The partition NUMBER a path carries on `disk`, i.e. the inverse of
@@ -1460,7 +1477,12 @@ pub fn build_manual_plan(
         }
     }
 
-    if !c.manual_home.is_empty() {
+    // An ENCRYPTED /home is handed to the extra-disk machinery instead of being
+    // formatted here: that path already does LUKS, the keyfile, the crypttab
+    // entry and the mount, and it is already tested. The sanitiser in
+    // install/mod.rs turns the slot into an ExtraDisk before the plan is built,
+    // so by this point there is nothing left to do for it.
+    if !c.manual_home.is_empty() && !c.manual_home_encrypt {
         let home = c.manual_home.as_str();
         let home_fs = if c.manual_home_fs.is_empty() {
             "ext4"

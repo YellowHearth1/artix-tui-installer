@@ -55,6 +55,28 @@ jobs:
       - name: Test
         run: cargo test --release
 
+  # The VM setup helper is a crate of its own, so the job above never sees it.
+  # Unchecked code in the repository is code that rots: it is small, it builds in
+  # seconds, and the alternative is finding out it stopped compiling on the
+  # morning somebody needs it.
+  vm-setup:
+    name: vm-setup · clippy · fmt · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/vm-setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
   # The install plan embeds a lot of shell. `dash -n` parses it as POSIX sh —
   # the actual interpreter in the chroot — so a bashism or an unbalanced quote
   # is caught here rather than halfway through someone's installation.

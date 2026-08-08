@@ -17,11 +17,12 @@ use ratatui::{
 
 /// The kind of each visible row, so navigation and editing adapt to whether
 /// encryption is enabled (which reveals the scope + passphrase rows).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Row {
     Sudo,
     Escalation,
     Chaotic,
+    Auris,
     Mirrors,
     Encrypt,
     /// A non-interactive note shown in place of the encryption toggle when the
@@ -32,6 +33,23 @@ enum Row {
     UsbKey,
     UsbMode,
     EncPass,
+    /// A heading above the list of extra things that can be encrypted. Not
+    /// selectable — it exists so the checkboxes below it read as a group and
+    /// not as more options belonging to the root's own encryption.
+    EncExtraHead,
+    /// The separate /home, when it is on a disk of its own.
+    EncHome,
+    /// One per data partition that is going to be formatted. The index is into
+    /// the list `enc_data_targets` returns, not into `extra_disks` — a disk
+    /// kept as-is cannot be encrypted and must not take a row.
+    EncData(usize),
+    /// The sentence explaining where the keys for those live. Not selectable.
+    EncExtraNote,
+    Zswap,
+    ZswapCompressor,
+    ZswapPercent,
+    EarlyOom,
+    EarlyOomPercent,
     Bootloader,
     OsProber,
     BootId,
@@ -43,10 +61,145 @@ enum Row {
 /// storage step, so the root-encryption choice is made before per-disk choices)
 /// and the later "System options" step. The encryption scope row only appears
 /// with GRUB, since only GRUB can boot an encrypted /boot.
+/// The separate /home, if there is one worth offering to encrypt.
+///
+/// Only a /home on a disk of ITS OWN: on the system disk it is inside whatever
+/// the root already does, and on a disk shared with another OS it is not ours
+/// to encrypt. Returns (device, disk) so the row can name both.
+fn enc_home_target(app: &App) -> Option<(String, String)> {
+    let c = &app.config;
+    if !c.partition_mode.is_manual_family() || c.manual_home.is_empty() {
+        return None;
+    }
+    let disk = c.manual_home_disk.clone();
+    if disk.is_empty() {
+        return None;
+    }
+    // A /home ON THE DRIVE WE ARE ALREADY PARTITIONING needs no further proof:
+    // that disk is the one this plan is carving up, and its /home is a slot the
+    // plan itself creates. Requiring a SEPARATE drive was my own addition and it
+    // was wrong — a root and a /home side by side on one disk is the ordinary
+    // layout, and it was the one case the checkbox never appeared for.
+    //
+    // A /home somewhere ELSE still has to prove the drive is ours: one carrying
+    // somebody else's partitions is not ours to encrypt, even when the only
+    // thing we plan to write there is a new /home. Being wrong in that direction
+    // destroys data that was never ours.
+    let with_root = !c.manual_root_disk.is_empty() && disk == c.manual_root_disk;
+    if !with_root && !crate::screens::parts::home_disk_is_exclusively_ours(app) {
+        return None;
+    }
+    Some((c.manual_home.clone(), disk))
+}
+
+#[cfg(test)]
+mod home_encryption_tests {
+    use super::*;
+    use crate::app::PartitionMode;
+
+    /// A /home BESIDE THE ROOT ON ONE DISK is the ordinary layout, and it was
+    /// the one the encryption checkbox never appeared for.
+    ///
+    /// Reported from QEMU: a 30 GiB NVMe with an ESP, a root and a /home, root
+    /// encryption on — and "Шифрування інших розділів" listed only a data
+    /// partition on the other drive. The rule demanded /home have a drive to
+    /// itself, which was my own addition, not the safety check the user asked
+    /// for. That one is about drives holding somebody else's partitions.
+    #[test]
+    fn a_home_on_the_root_disk_can_still_be_encrypted() {
+        let mut app = App::new();
+        app.config.partition_mode = PartitionMode::Manual;
+        app.config.manual_solo = true;
+        app.config.manual_root = "/dev/nvme0n1p2".into();
+        app.config.manual_root_disk = "/dev/nvme0n1".into();
+        app.config.manual_home = "/dev/nvme0n1p3".into();
+        app.config.manual_home_disk = "/dev/nvme0n1".into();
+
+        let offered = enc_home_target(&app);
+        assert_eq!(
+            offered,
+            Some(("/dev/nvme0n1p3".into(), "/dev/nvme0n1".into())),
+            "a /home on the disk this very plan is partitioning was not offered"
+        );
+
+        // With no /home planned at all there is nothing to offer.
+        app.config.manual_home.clear();
+        assert!(enc_home_target(&app).is_none());
+    }
+}
+
+/// The data partitions that CAN be encrypted: the ones being formatted.
+///
+/// A partition kept as-is is kept precisely because its contents matter, and
+/// encrypting it would destroy them — so it never appears here, and there is
+/// no checkbox to tick by mistake.
+fn enc_data_targets(app: &App) -> Vec<(String, String)> {
+    app.config
+        .extra_disks
+        .iter()
+        .filter(|d| d.format && !d.mountpoint.is_empty() && d.mountpoint != "/home")
+        .map(|d| (d.disk.clone(), d.mountpoint.clone()))
+        .collect()
+}
+
+/// How many rows this entry needs when the screen is NOT compact.
+///
+/// One function, read by both the layout and the does-it-fit estimate: two
+/// numbers describing one layout drift apart, and when they did, choosing a USB
+/// key silently collapsed the whole screen.
+fn row_height(app: &App, row: &Row, width: u16) -> u16 {
+    // How tall a wrapped warning actually is at THIS width, rather than the
+    // worst case. The fixed 5 was sized for a narrow console, so on a wide one
+    // it left three empty rows under a one-line sentence — a gap twice the size
+    // of the spacing between every other option, right in the middle of the
+    // screen.
+    let wrapped = |key: &str| -> u16 {
+        let usable = width.saturating_sub(8).max(20) as usize;
+        let n = t(app.lang, key).chars().count();
+        // label + the warning's own lines, and never less than the plain row.
+        (1 + n.div_ceil(usable)) as u16
+    };
+    match row {
+        // A picked stick adds a red warning that has to fit inside the frame.
+        Row::UsbKey if !app.config.usb_key_device.is_empty() => wrapped("opt.usbkey_warn").max(3),
+        Row::UsbMode if app.config.usb_key_only => wrapped("opt.usbmode_only_warn").max(3),
+        // The extra-encryption block is a list: a heading and one line each.
+        Row::EncExtraHead | Row::EncHome | Row::EncData(_) => 1,
+        Row::EncExtraNote => 2,
+        _ => 3,
+    }
+}
+
 fn rows_for(app: &App) -> Vec<Row> {
     // System options step: packaging tweaks and passwordless sudo only.
     if app.screen == Screen::Options {
-        return vec![Row::Sudo, Row::Escalation, Row::Chaotic, Row::Mirrors];
+        // Memory tuning lives here, and its sub-rows only appear once the
+        // feature is on — three dead rows would otherwise sit in front of
+        // everyone who does not need them.
+        let mut v = vec![
+            Row::Sudo,
+            Row::Escalation,
+            Row::Chaotic,
+            Row::Auris,
+            Row::Mirrors,
+        ];
+        // zswap is a compressed cache IN FRONT OF the swap device. With no swap
+        // there is nothing behind it, so the row is not shown at all rather than
+        // offered and quietly ignored — a manual layout with no swap partition
+        // was being asked to choose a compression algorithm for a cache that
+        // could never hold anything.
+        if app.config.has_swap() {
+            v.push(Row::Zswap);
+            if app.config.zswap {
+                v.push(Row::ZswapCompressor);
+                v.push(Row::ZswapPercent);
+            }
+        }
+        v.push(Row::EarlyOom);
+        if app.config.earlyoom {
+            v.push(Row::EarlyOomPercent);
+        }
+        return v;
     }
     // Bootloader & encryption step. Bootloader first, with the encryption block
     // immediately after it (its sub-rows stay attached to the toggle) — the two
@@ -90,6 +243,23 @@ fn rows_for(app: &App) -> Vec<Row> {
             v.push(Row::EncPass);
         }
     }
+    // EVERYTHING ELSE THAT CAN BE ENCRYPTED, in one place with the root.
+    //
+    // These used to be set with `e` in the partition editor, which put the same
+    // word on two screens meaning two different mechanisms — and made the
+    // system disk look unencryptable there, because it is not a "data disk".
+    // One decision belongs in one place.
+    let targets = enc_data_targets(app);
+    if enc_home_target(app).is_some() || !targets.is_empty() {
+        v.push(Row::EncExtraHead);
+        if enc_home_target(app).is_some() {
+            v.push(Row::EncHome);
+        }
+        for i in 0..targets.len() {
+            v.push(Row::EncData(i));
+        }
+        v.push(Row::EncExtraNote);
+    }
     if app.config.bootloader == Bootloader::Grub {
         v.push(Row::OsProber);
     }
@@ -127,7 +297,22 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     // 59x15 panel that needs ~23 rows and there are 12, so below the threshold
     // each option collapses to a single line — and only the FOCUSED one keeps
     // its explanatory hint, which is the line the user is actually reading.
-    let full_need = 2 + visible.len() * 3 + visible.len() + 1;
+    // THE ESTIMATE AND THE LAYOUT MUST AGREE, so both ask the same function.
+    //
+    // The estimate assumed three rows for every entry. That was already a
+    // guess, and it became a wrong one: the extra-encryption block draws a
+    // single line per row, while picking a USB key makes two rows five lines
+    // tall. The sum overshot, the screen decided it did not fit, and EVERYTHING
+    // collapsed to one line each — a wall of text, triggered by choosing a
+    // stick. Two numbers describing one layout will always drift; there is now
+    // one.
+    let full_need: usize = 2
+        + visible
+            .iter()
+            .map(|r| row_height(app, r, body.width) as usize)
+            .sum::<usize>()
+        + visible.len()
+        + 1;
     let compact = (body.height as usize) < full_need;
 
     let mut constraints = vec![Constraint::Length(if compact { 1 } else { 2 })]; // intro
@@ -135,12 +320,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         if compact {
             constraints.push(Constraint::Length(if i == app.cursor { 2 } else { 1 }));
         } else {
-            let tall = match row {
-                Row::UsbKey => !app.config.usb_key_device.is_empty(),
-                Row::UsbMode => app.config.usb_key_only,
-                _ => false,
-            };
-            constraints.push(Constraint::Length(if tall { 5 } else { 3 }));
+            constraints.push(Constraint::Length(row_height(app, row, body.width)));
         }
     }
     constraints.push(Constraint::Min(0)); // spacer
@@ -210,6 +390,108 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     &t(app.lang, "opt.escalation"),
                     &val,
                     &hint,
+                );
+            }
+            Row::Zswap => {
+                let val = t(
+                    app.lang,
+                    if app.config.zswap {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.zswap"),
+                    &val,
+                    &t(app.lang, "opt.zswap_hint"),
+                );
+            }
+            Row::ZswapCompressor => {
+                // Mark the ones this kernel actually reports. It is a hint, not
+                // a filter: /proc/crypto lists what is REGISTERED, and a module
+                // nobody has used yet is simply absent from it.
+                let seen = crate::system::mem::available_compressors();
+                // The hint follows the SELECTED algorithm, the way the filesystem
+                // rows do. One sentence covering all five said only "zstd is best,
+                // lzo-rle is lighter", which does not answer the question anyone
+                // arriving here actually has: what does THIS one cost me.
+                let mut hint = t(app.lang, algo_hint_key(&app.config.zswap_compressor));
+                if !seen.contains(&app.config.zswap_compressor) {
+                    // This used to be a bare " (?)" appended to the value, which
+                    // read as "something is wrong with this choice". It isn't:
+                    // /proc/crypto lists what is REGISTERED, and crypto modules
+                    // register on first use, so an algorithm nobody has asked for
+                    // yet is simply absent. Say that instead of punctuating it.
+                    hint.push(' ');
+                    hint.push_str(&t(app.lang, "opt.zswap_algo_unseen"));
+                }
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.zswap_algo"),
+                    &app.config.zswap_compressor,
+                    &hint,
+                );
+            }
+            Row::ZswapPercent => {
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.zswap_pct"),
+                    &format!("{} %", app.config.zswap_percent),
+                    &t(app.lang, "opt.zswap_pct_hint"),
+                );
+            }
+            Row::EarlyOom => {
+                let val = t(
+                    app.lang,
+                    if app.config.earlyoom {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.earlyoom"),
+                    &val,
+                    &t(app.lang, "opt.earlyoom_hint"),
+                );
+            }
+            Row::EarlyOomPercent => {
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.earlyoom_pct"),
+                    &format!("{} %", app.config.earlyoom_percent),
+                    &t(app.lang, "opt.earlyoom_pct_hint"),
+                );
+            }
+            Row::Auris => {
+                let val = t(
+                    app.lang,
+                    if app.config.auris {
+                        "opt.on"
+                    } else {
+                        "opt.off"
+                    },
+                );
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.auris"),
+                    &val,
+                    &t(app.lang, "opt.auris_hint"),
                 );
             }
             Row::Chaotic => {
@@ -449,8 +731,16 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 // ONE intensity (gold = bold accent): mixing bold and non-bold
                 // spans triggers the VT's unreliable intensity-reset handling
                 // on incremental redraws (stale-bright first • while typing).
-                let caret = if focused { "▏" } else { "" };
-                let masked: String = "•".repeat(app.config.luks_passphrase.chars().count());
+                let caret = if focused { "|" } else { "" };
+                // Revealed on request: the passphrase typed here is the one
+                // the boot prompt will demand, on a layout the user may have
+                // just changed. A typo here is found at the next boot, with
+                // nothing left to fix it with.
+                let masked: String = if app.show_secrets {
+                    app.config.luks_passphrase.clone()
+                } else {
+                    "•".repeat(app.config.luks_passphrase.chars().count())
+                };
                 let line = Line::from(vec![
                     Span::styled(
                         format!("  {} ", if focused { "›" } else { " " }),
@@ -482,6 +772,72 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     area,
                 );
             }
+            // The heading and the closing note are TEXT, not controls: they
+            // group the checkboxes below so they do not read as more settings
+            // belonging to the root's own encryption.
+            Row::EncExtraHead => {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  {}", t(app.lang, "opt.enc_extra_head")),
+                        theme::heading(),
+                    ))),
+                    area,
+                );
+            }
+            Row::EncExtraNote => {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("      {}", t(app.lang, "opt.enc_extra_note")),
+                        theme::dim(),
+                    )))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                    area,
+                );
+            }
+            Row::EncHome | Row::EncData(_) => {
+                let (dev, label, on) = match row {
+                    Row::EncHome => {
+                        let (dev, disk) = enc_home_target(app).unwrap_or_default();
+                        (
+                            dev,
+                            format!("/home  ({} {})", disk, t(app.lang, "opt.enc_own_disk")),
+                            app.config.manual_home_encrypt,
+                        )
+                    }
+                    _ => {
+                        let i = if let Row::EncData(i) = row { *i } else { 0 };
+                        let t2 = enc_data_targets(app);
+                        let (dev, mp) = t2.get(i).cloned().unwrap_or_default();
+                        let on = app
+                            .config
+                            .extra_disks
+                            .iter()
+                            .any(|d| d.disk == dev && d.encrypt);
+                        (dev.clone(), mp, on)
+                    }
+                };
+                let marker = if focused { "\u{203a}" } else { " " };
+                let box_ = if on { "[x]" } else { "[ ]" };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!("  {marker} "), theme::gold()),
+                        Span::styled(
+                            format!("{box_} "),
+                            if on { theme::gold() } else { theme::mute() },
+                        ),
+                        Span::styled(
+                            format!("{label:<28}"),
+                            if focused {
+                                theme::gold()
+                            } else {
+                                theme::normal()
+                            },
+                        ),
+                        Span::styled(dev, theme::dim()),
+                    ])),
+                    area,
+                );
+            }
             Row::Bootloader => {
                 let val = app.config.bootloader.display_name();
                 // Warn only about the one incompatibility the bootloader choice
@@ -507,7 +863,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
             Row::BootId => {
-                let caret = if focused { "▏" } else { "" };
+                let caret = if focused { "|" } else { "" };
                 let line = Line::from(vec![
                     Span::styled(
                         format!("  {} ", if focused { "›" } else { " " }),
@@ -596,7 +952,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Up/Down navigation is common to all rows. The EncBlocked note is inert,
     // so navigation steps over it (landing there would look like a lost cursor).
-    let is_inert = |i: usize| visible.get(i) == Some(&Row::EncBlocked);
+    // The heading and the closing note of the extra-encryption block are text,
+    // like EncBlocked: landing on either would look like a lost cursor.
+    let is_inert = |i: usize| {
+        matches!(
+            visible.get(i),
+            Some(&Row::EncBlocked) | Some(&Row::EncExtraHead) | Some(&Row::EncExtraNote)
+        )
+    };
     match key.code {
         KeyCode::Up | KeyCode::Esc => {
             let mut n = app.cursor.saturating_sub(1);
@@ -692,13 +1055,52 @@ fn advance(app: &mut App) {
 
 fn toggle(app: &mut App, row: Row, forward: bool) {
     match row {
+        Row::Zswap => app.config.zswap = !app.config.zswap,
+        Row::EarlyOom => app.config.earlyoom = !app.config.earlyoom,
+        Row::ZswapCompressor => {
+            let list = crate::system::mem::COMPRESSORS;
+            let i = list
+                .iter()
+                .position(|x| *x == app.config.zswap_compressor)
+                .unwrap_or(0);
+            let next = if forward {
+                (i + 1) % list.len()
+            } else {
+                (i + list.len() - 1) % list.len()
+            };
+            app.config.zswap_compressor = list[next].to_string();
+        }
+        // Percentages step in fives: the difference between 20 and 21 is not
+        // something anyone can feel, and one press per point would be cruel.
+        Row::ZswapPercent => {
+            let v = app.config.zswap_percent as i16 + if forward { 5 } else { -5 };
+            app.config.zswap_percent = v.clamp(5, 50) as u8;
+        }
+        Row::EarlyOomPercent => {
+            let v = app.config.earlyoom_percent as i16 + if forward { 2 } else { -2 };
+            app.config.earlyoom_percent = v.clamp(2, 30) as u8;
+        }
         Row::Sudo => app.config.passwordless_sudo = !app.config.passwordless_sudo,
         Row::Escalation => app.config.use_doas = !app.config.use_doas,
         Row::Chaotic => app.config.chaotic_aur = !app.config.chaotic_aur,
+        Row::Auris => app.config.auris = !app.config.auris,
         Row::OsProber => app.config.os_prober = !app.config.os_prober,
         Row::SecureBoot => app.config.prepare_secureboot = !app.config.prepare_secureboot,
         Row::Mirrors => app.config.optimize_mirrors = !app.config.optimize_mirrors,
         Row::Encrypt => app.config.encrypt_disk = !app.config.encrypt_disk,
+        // Extra targets: one flag each, both living where the root's own
+        // encryption is decided. Setting them in the partition editor put the
+        // same word on two screens for two different mechanisms, and made the
+        // system disk look unencryptable there because it is not "data".
+        Row::EncHome => app.config.manual_home_encrypt = !app.config.manual_home_encrypt,
+        Row::EncData(i) => {
+            if let Some((dev, _)) = enc_data_targets(app).get(i).cloned() {
+                // Through the shared toggle, which refuses a partition that
+                // is being kept as-is: encrypting one would destroy the data it
+                // is being kept for.
+                crate::screens::parts::toggle_data_encryption(&mut app.config, &dev);
+            }
+        }
         Row::UsbKey => {
             // Refresh the removable-device list on every press so a stick
             // plugged in while on this screen shows up immediately. The
@@ -836,6 +1238,145 @@ pub fn dm_label(id: &str) -> &'static str {
     }
 }
 
+/// Which per-algorithm explanation belongs to a compressor name.
+///
+/// Falls back to zstd's line for anything unrecognised, so adding a compressor
+/// to `mem::COMPRESSORS` without a string cannot leave a blank hint on screen.
+fn algo_hint_key(name: &str) -> &'static str {
+    match name {
+        "lzo-rle" => "opt.zswap_algo_lzorle",
+        "lzo" => "opt.zswap_algo_lzo",
+        "lz4" => "opt.zswap_algo_lz4",
+        "deflate" => "opt.zswap_algo_deflate",
+        _ => "opt.zswap_algo_zstd",
+    }
+}
+
 pub fn footer_hint(app: &App) -> String {
-    t(app.lang, "opt.footer")
+    let base = t(app.lang, "opt.footer");
+    // The LUKS passphrase is the one string that must be typed again at every
+    // boot, on a layout chosen during this install. Being able to LOOK at it
+    // matters more here than anywhere else in the installer — so say so.
+    //
+    // ONLY on the passphrase row. It used to be advertised for the whole screen
+    // whenever encryption was on, so "F2 show password" sat under the bootloader
+    // row, the os-prober row and the UEFI-entry row — none of which have a
+    // password, and pressing F2 there does nothing anyone can see.
+    let rows = rows_for(app);
+    let on_passphrase = rows
+        .get(app.cursor.min(rows.len().saturating_sub(1)))
+        .is_some_and(|r| *r == Row::EncPass);
+    if on_passphrase {
+        let key = if app.show_secrets {
+            t(app.lang, "user.reveal_hide")
+        } else {
+            t(app.lang, "user.reveal_show")
+        };
+        format!("{base} · {key}")
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, PartitionMode, Screen};
+
+    /// zswap caches pages on their way to swap. With no swap there is nothing
+    /// behind the cache, so the row is not offered at all.
+    ///
+    /// The trap this guards is `swap_gib`: it defaults to 4 and the manual
+    /// editor never touches it, so asking the auto field about a manual layout
+    /// answers "4 GiB of swap" for a disk that has none. Reported from a manual
+    /// Artix-only install that was offered a compression algorithm for a cache
+    /// that could never hold a page.
+    #[test]
+    fn zswap_is_not_offered_when_there_is_no_swap() {
+        let mut app = App::new();
+        app.screen = Screen::Options;
+
+        // Auto with the default 4 GiB of swap: offered.
+        assert!(rows_for(&app).contains(&Row::Zswap));
+
+        // Auto, swap turned off on the disk step: gone.
+        app.config.swap_gib = 0;
+        assert!(!rows_for(&app).contains(&Row::Zswap));
+
+        // Manual with no swap partition: gone, even though swap_gib is back to
+        // its default — the manual editor writes manual_swap, not swap_gib.
+        app.config.swap_gib = 4;
+        app.config.partition_mode = PartitionMode::Manual;
+        assert!(
+            !rows_for(&app).contains(&Row::Zswap),
+            "a manual layout with no swap partition was offered zswap"
+        );
+
+        // Manual WITH a swap partition: offered again.
+        app.config.manual_swap = "/dev/vda3".into();
+        assert!(rows_for(&app).contains(&Row::Zswap));
+
+        // And a swap partition that is only planned counts too.
+        app.config.manual_swap.clear();
+        app.config.manual_swap_new_mib = 4096;
+        assert!(rows_for(&app).contains(&Row::Zswap));
+    }
+
+    /// The reveal key is advertised on the row that has a password, and nowhere
+    /// else. It used to be advertised for the whole screen whenever encryption
+    /// was on, so it followed the cursor onto rows where F2 does nothing.
+    #[test]
+    fn the_reveal_hint_belongs_to_the_passphrase_row_only() {
+        let mut app = App::new();
+        app.screen = Screen::Security;
+        app.config.encrypt_disk = true;
+        let rows = rows_for(&app);
+        let pass = rows
+            .iter()
+            .position(|r| *r == Row::EncPass)
+            .expect("no passphrase row with encryption on");
+
+        app.cursor = pass;
+        assert!(
+            footer_hint(&app).contains(&t(app.lang, "user.reveal_show")),
+            "the passphrase row does not advertise the reveal key"
+        );
+
+        for (i, row) in rows.iter().enumerate() {
+            if *row == Row::EncPass {
+                continue;
+            }
+            app.cursor = i;
+            assert!(
+                !footer_hint(&app).contains(&t(app.lang, "user.reveal_show")),
+                "{row:?} is not a password field but advertises F2"
+            );
+        }
+    }
+
+    /// Every compressor `mem::COMPRESSORS` offers has an explanation of its own.
+    /// A missing one would silently fall back to zstd's line, describing the
+    /// wrong algorithm rather than none at all.
+    #[test]
+    fn every_compressor_explains_itself() {
+        for lang in [
+            crate::i18n::Lang::Uk,
+            crate::i18n::Lang::En,
+            crate::i18n::Lang::Es,
+        ] {
+            let mut seen: Vec<String> = Vec::new();
+            for name in crate::system::mem::COMPRESSORS {
+                let text = t(lang, algo_hint_key(name));
+                assert!(
+                    !text.starts_with("opt."),
+                    "{name}: no description in {lang:?}"
+                );
+                assert!(
+                    !seen.contains(&text),
+                    "{name} in {lang:?} reuses another algorithm's description"
+                );
+                seen.push(text);
+            }
+        }
+    }
 }

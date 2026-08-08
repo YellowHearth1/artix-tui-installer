@@ -63,7 +63,7 @@ y un registro de instalación en vivo con scroll.
 > como corresponde. Cada versión pasa las pruebas, `clippy` y una compilación de
 > release.
 >
-> Lo que **no se puede** reproducir es el panorama real de hardware: el firmware
+> Lo que **no se puede** reproducir es la variedad de hardware real: el firmware
 > UEFI varía mucho entre fabricantes, y existen RAID, gráficas híbridas,
 > controladores poco comunes y portátiles con sus propias rarezas. Aquí está
 > exactamente dónde terminan mis pruebas:
@@ -89,6 +89,42 @@ y un registro de instalación en vivo con scroll.
 >   Indica la versión (abajo a la derecha en la primera pantalla) y qué ocurrió.
 >   No tengo tu hardware, así que sin tu reporte simplemente nunca me entero de
 >   que algo falló.
+---
+
+> ### 🌍 Sobre el idioma en el que escribo
+>
+> **No sé inglés y uso un traductor.** El inglés de este proyecto — este README,
+> las respuestas en los issues, los textos de la interfaz — pasa por él, así que
+> algo puede sonar raro o no decir exactamente lo que se pretendía.
+>
+> Un lenguaje sencillo ayuda. Y si algo se lee mal, dilo sin rodeos: no ofende, y
+> corregirlo es mejor que dejarlo.
+>
+> En ucraniano y español se puede escribir con toda libertad.
+
+---
+
+> ### 🖥️ Primero la TTY
+>
+> Este instalador está **optimizado para una consola de texto pura (TTY)**, y es
+> ahí donde se prueba: en mi imagen modificada de Artix, construida a partir de
+> `base`. Para instalar no hacen falta controladores gráficos, ni X, ni Wayland.
+>
+> **Por qué.** En las imágenes oficiales de Artix que ya traen un entorno de
+> escritorio, unos conocidos míos tuvieron problemas de gráficos: el instalador
+> simplemente no arrancaba y era imposible instalar el sistema. Una consola no
+> tiene esas dependencias: si la máquina muestra texto, el instalador funciona.
+>
+> **Sí** se puede ejecutar en un terminal gráfico (en un sistema ya instalado con
+> escritorio), y allí suele verse incluso mejor — pero ese no es el entorno
+> principal, así que **puede haber fallos visuales**: las esquinas de los
+> paneles, algunos caracteres o los colores quizá no se vean como se pretendía.
+> Los errores que solo aparecen en un terminal gráfico tienen menos prioridad que
+> cualquier cosa rota en la TTY.
+>
+> Aquí la fuente de consola no es decoración: de ella depende que la interfaz se
+> vea siquiera, y por eso elegirla es una entrada propia del menú.
+
 ---
 
 > ### 🌐 Cómo añadir tu idioma
@@ -194,8 +230,15 @@ y un registro de instalación en vivo con scroll.
   tipo AwesomeWM), XFCE, Cinnamon, MATE, LXDE, o ninguno.
 - **🎮Controladores de GPU** — NVIDIA (open-dkms), NVIDIA 580xx (legacy), nouveau, AMD,
   Intel; nouveau se bloquea automáticamente cuando se elige un driver propietario.
-- **🛟 Modo de recuperación del sistema** — monta una instalación existente (desbloqueando LUKS
-  si hace falta), detecta el cargador de arranque y abre un shell chroot para repararlo.
+- **🛟 Modo de recuperación del sistema** — para cuando el sistema ya no
+  arranca. Tú dices **qué es cada partición** (raíz, `/boot`, `/boot/efi`, swap,
+  `/home`, datos); la sugerencia ya viene puesta, así que normalmente solo la
+  confirmas. Luego «Diagnosticar» revisa el sistema y te dice **en tu idioma**
+  qué está roto de verdad: falta el kernel, falta el initramfs, el fstab nombra
+  un disco que ya no existe. Las reparaciones son botones aparte: reinstalar el
+  cargador de arranque, reconstruir el initramfs, regenerar fstab, arreglar
+  permisos tras un `chmod 777 /`. El chroot sigue ahí, como último recurso y no
+  como el único.
 - **Soporte AUR** — `paru` se construye desde el código fuente (así siempre coincide con
   el `libalpm` del sistema), y luego se usa para instalar los paquetes que seleccionaste.
 - **🧩Habilitación automática del servicio dinit** — cualquier paquete `*-dinit` instalado tiene 
@@ -542,16 +585,51 @@ El retroceso es **independiente del kernel live**: `/boot` mantiene un par conge
 
 ## 📀 Perfil de ISO (`iso-profile/`, para artools `buildiso`)
 
-- `Packages-Root` / `Packages-Live` — paquetes para la imagen live (dinit solo).
-- `profile.conf` — configuración de autologin/display-manager para la sesión live.
-- `live-overlay/usr/bin/installer-launch` — le da a la TUI un terminal controlador real
-  en tty1 (`setsid -c`), con un shell de respaldo en caso de fallo.
-- `live-overlay/etc/dinit.d/installer.conf` — el servicio de autostart que ejecuta el
-  instalador en lugar de un getty en tty1.
-- `grub-overrides/loopback.cfg` — arranca directamente hacia el instalador.
+**Aquí está todo para construir tu propia imagen live**, en cualquier máquina
+con `artools`. La imagen se basa en la imagen **base** de Artix: una consola de
+texto, sin escritorio ni controladores gráficos.
 
-Suelta el binario compilado en `live-overlay/usr/bin/artix-installer`, luego ejecuta
-`sudo buildiso -p <profile>`.
+```sh
+sh scripts/build-iso.sh
+```
+
+Un solo comando: compila el instalador, ejecuta las pruebas y `clippy`, copia
+este perfil al espacio de trabajo de artools y ejecuta `buildiso`. No hace falta
+crear el perfil a mano — el script lo despliega en cada ejecución, así que este
+repositorio sigue siendo la fuente de verdad y no puede desviarse del código.
+
+**La imagen se construye en cualquier Linux**: basta con Docker o Podman:
+
+```sh
+sh scripts/build-iso.sh --docker      # su daemon ya es root
+sh scripts/build-iso.sh --podman      # pide sudo: buildiso monta un devtmpfs y
+                                      # el EFI por loop, cosas que un espacio de
+                                      # nombres de usuario no permite
+```
+
+Sin Artix, sin `artools` y sin toolchain de Rust en el equipo: las herramientas
+de construcción están en `vendor/artools/` (tomadas de los paquetes de Artix, no
+de la máquina de nadie — su README explica por qué importa) y el instalador se
+compila dentro del contenedor. En Artix, el mismo comando sin bandera
+construye directamente.
+
+- `profile.yaml` — paquetes de la imagen y ajustes de la sesión live (autologin
+  como `artix`, sin gestor de pantalla).
+- `live-overlay/home/artix/.bash_profile` — esto es lo que arranca el instalador
+  en tty1. Ese es todo el mecanismo de autoarranque: ningún servicio de dinit.
+- `live-overlay/usr/bin/installer-start` — fija la fuente de consola y lanza el
+  instalador.
+- `live-overlay/usr/share/kbd/consolefonts/` — las fuentes que **ningún paquete
+  proporciona**; el origen y la licencia de cada una están junto a ellas en
+  `usr/share/licenses/`.
+- `grub-overrides/loopback.cfg` — arranca directamente en el instalador.
+
+**El binario va en `live-overlay`, no en `root-overlay`.** Este perfil construye
+una sesión live, así que es el primero el que llega a la imagen. Una copia en
+`root-overlay` falla en silencio: la construcción termina bien y la imagen
+conserva el binario anterior.
+
+Detalles en [`iso-profile/README.md`](iso-profile/README.md).
 
 ---
 
@@ -566,7 +644,8 @@ installer/        Rust sources (ratatui TUI + install logic)
   src/system/     disk, runner (PTY), install plan, packages, recovery
   src/assets/     configuraciones embebidas (kitty, fastfetch, waybar, wofi, pinnacle)
   i18n/           UI strings en.toml / uk.toml
-iso-profile/      artools buildiso profile + live-image overlay
+iso-profile/      perfil de artools buildiso + overlay de la imagen live
+iso/              imágenes construidas (nunca se suben — solo su README)
 screenshots/      screenshots para el README (15 wizard steps)
 ```
 
@@ -575,68 +654,72 @@ screenshots/      screenshots para el README (15 wizard steps)
 ## 📸 Capturas de pantalla
 
 > **Nota.** Todas las capturas de pantalla se tomaron en un emulador de terminal gráfico en una máquina con un entorno de escritorio instalado. En un TTY básico (p. ej. justo después de arrancar la imagen base de Artix) la interfaz se ve mucho más modesta: la consola del kernel ofrece solo 16 colores y su propia fuente fija, así que algunos de los efectos de ratatui — sombras suaves, tonos atenuados, bordes redondeados — no están disponibles o se simplifican allí. Funcionalmente todo funciona igual.
+>
+> **Las capturas son anteriores al reordenamiento de pasos**, así que dentro de la imagen todavía se ve la numeración antigua (`/15`) y el orden antiguo — el teclado era el cuarto paso, no el segundo. Los textos de abajo describen el asistente tal como es AHORA; las capturas se reharán.
 
-Un recorrido completo del asistente — todos los **15 pasos**. La interfaz está disponible en ucraniano, inglés y español; las capturas de abajo están en español.
+Un recorrido completo del asistente — todos los **16 pasos**. La interfaz está disponible en ucraniano, inglés y español; las capturas de abajo están en español.
 
-**Paso 1/15 — Idioma.** El idioma del instalador y del sistema.
+**Paso 1/16 — Idioma.** El idioma del instalador y del sistema.
 
 ![Paso 1 — Idioma](screenshots/es/01-language.png)
 
-**Paso 2/15 — Zona horaria.** Busca y elige tu zona horaria.
+**Paso 2/16 — Teclado.** Disposiciones multi-selección con un filtro; la primera con marca se vuelve la principal.
 
-![Paso 2 — Zona horaria](screenshots/es/02-timezone.png)
+![Paso 2 — Teclado](screenshots/es/04-keyboard.png)
 
-**Paso 3/15 — Red.** Omitir (cableado) o escanear Wi-Fi: elige un adaptador, una red y escribe la contraseña.
+**Paso 3/16 — Zona horaria.** Busca y elige tu zona horaria.
 
-![Paso 3 — Red](screenshots/es/03-wifi.png)
+![Paso 3 — Zona horaria](screenshots/es/02-timezone.png)
 
-**Paso 4/15 — Teclado.** Disposiciones multi-selección con un filtro; la primera con marca se vuelve la principal.
+**Paso 4/16 — Red.** Omitir (cableado) o escanear Wi-Fi: elige un adaptador, una red y escribe la contraseña.
 
-![Paso 4 — Teclado](screenshots/es/04-keyboard.png)
+![Paso 4 — Red](screenshots/es/03-wifi.png)
 
-**Paso 5/15 — Kernel.** Linux, Linux Zen, Linux Hardened o Linux LTS.
+**Paso 5/16 — Kernel.** Linux, Linux Zen, Linux Hardened o Linux LTS.
 
 ![Paso 5 — Kernel](screenshots/es/05-kernel.png)
 
-**Paso 6/15 — Escritorio.** Escritorios multi-selección y elección de la pantalla de inicio de sesión. Los escritorios que traen ambas sesiones (Plasma, LXQt) instalan X11 y Wayland — la sesión se elige al iniciar sesión.
+**Paso 6/16 — Escritorio.** Escritorios multi-selección y elección de la pantalla de inicio de sesión. Los escritorios que traen ambas sesiones (Plasma, LXQt) instalan X11 y Wayland — la sesión se elige al iniciar sesión.
 
 ![Paso 6 — Escritorio](screenshots/es/06-desktop.png)
 
-**Paso 7/15 — Paquetes.** Controladores de GPU + búsqueda y selección de paquetes populares.
+**Paso 7/16 — Paquetes.** Controladores de GPU + búsqueda y selección de paquetes populares.
 
 ![Paso 7 — Paquetes](screenshots/es/07-packages.png)
 
-**Paso 8/15 — AUR.** Busca el AUR y paquetes recomendados (construidos vía paru).
+**Paso 8/16 — AUR.** Busca el AUR y paquetes recomendados (construidos vía paru).
 
 ![Paso 8 — AUR](screenshots/es/08-aur.png)
 
-**Paso 9/15 — Disco y particiones.** UEFI/BIOS, selección de disco, partición SWAP, sistema de archivos del root.
+**Paso 9/16 — Modo de particionado.** Automático (disco entero), junto a un SO existente, en espacio libre que ya tengas, o manual — con un selector «Solo Artix» / «Arranque dual».
 
-![Paso 9 — Disco](screenshots/es/09-disk.png)
+**Paso 10/16 — Disco y particiones.** UEFI/BIOS, selección de disco, partición SWAP, sistema de archivos del root.
 
-**Paso 10/15 — Bootloader y cifrado.** GRUB / rEFInd / Limine / EFISTUB, os-prober, nombre de entrada UEFI, cifrado LUKS.
+![Paso 10 — Disco](screenshots/es/09-disk.png)
 
-![Paso 10 — Bootloader](screenshots/es/10-bootloader.png)
+**Paso 11/16 — Bootloader y cifrado.** GRUB / rEFInd / Limine / EFISTUB, os-prober, nombre de entrada UEFI, cifrado LUKS.
 
-**Paso 11/15 — Discos extra.** Monta otros discos y particiones existentes (p. ej. una de Windows NTFS — manteniendo sus datos).
+![Paso 11 — Bootloader](screenshots/es/10-bootloader.png)
 
-![Paso 11 — Almacenamiento](screenshots/es/11-storage.png)
+**Paso 12/16 — Discos extra.** Monta otros discos y particiones existentes (p. ej. una de Windows NTFS — manteniendo sus datos).
 
-**Paso 12/15 — Cuentas.** Nombre de host, usuario y contraseñas; modo de cuenta.
+![Paso 12 — Almacenamiento](screenshots/es/11-storage.png)
 
-![Paso 12 — Cuentas](screenshots/es/12-accounts.png) 
+**Paso 13/16 — Cuentas.** Nombre de host, usuario y contraseñas; modo de cuenta.
 
-**Paso 13/15 — Opciones de instalación.** Contraseña sudo, repo Chaotic-AUR, optimización de mirrors.
+![Paso 13 — Cuentas](screenshots/es/12-accounts.png) 
 
-![Paso 13 — Opciones](screenshots/es/13-options.png)
+**Paso 14/16 — Opciones de instalación.** Contraseña sudo, repo Chaotic-AUR, optimización de mirrors.
 
-**Paso 14/15 — Revisar e instalar.** Un resumen de cada elección antes de que comience.
+![Paso 14 — Opciones](screenshots/es/13-options.png)
 
-![Paso 14 — Resumen](screenshots/es/14-summary.png)
+**Paso 15/16 — Revisar e instalar.** Un resumen de cada elección antes de que comience.
 
-**Paso 15/15 — Finalizar.** Un código QR de donación para la defensa de Ucrania, además de una elección: reiniciar, apagar o ingresar al sistema instalado para pasos manuales.
+![Paso 15 — Resumen](screenshots/es/14-summary.png)
 
-![Paso 15 — Finalizar](screenshots/es/15-finish.png)
+**Paso 16/16 — Finalizar.** Un código QR de donación para la defensa de Ucrania, además de una elección: reiniciar, apagar o ingresar al sistema instalado para pasos manuales.
+
+![Paso 16 — Finalizar](screenshots/es/15-finish.png)
 
 ---
 

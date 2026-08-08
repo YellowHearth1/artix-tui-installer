@@ -80,11 +80,11 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
 
     let title = if max_scroll > 0 {
         let arrows = if scroll == 0 {
-            "\u{25bc}"
+            "v"
         } else if scroll >= max_scroll {
-            "\u{25b2}"
+            "^"
         } else {
-            "\u{25b2}\u{25bc}"
+            "^v"
         };
         format!(" {}  {arrows} ", t(app.lang, "sum.review"))
     } else {
@@ -353,14 +353,7 @@ fn draw_confirm_format(f: &mut Frame, app: &App, area: Rect) {
     let chrome = 4u16; // 2 borders + 1 gap + 1 hint
     let max_h = area.height.saturating_sub(2);
     let h = (chrome + body_h).min(max_h).max((chrome + 2).min(max_h));
-    let x = area.x + (area.width.saturating_sub(wbox)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: wbox,
-        height: h,
-    };
+    let modal = crate::screens::widgets::modal_rect_fit(f, wbox, h, app.modal_zoom);
     f.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -665,7 +658,7 @@ fn draw_install(f: &mut Frame, app: &mut App, area: Rect) {
             Line::from(vec![
                 Span::styled("  > ", theme::accent()),
                 Span::styled(app.prompt_input.clone(), theme::normal()),
-                Span::styled("▏", theme::accent()),
+                Span::styled("|", theme::accent()),
             ]),
             Line::from(Span::styled(
                 format!("  {}", t(app.lang, "sum.prompt_hint")),
@@ -740,7 +733,7 @@ fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(Span::styled(l.clone(), theme::accent()))
             } else if l.starts_with("!! ") {
                 Line::from(Span::styled(l.clone(), theme::warn()))
-            } else if l.starts_with("✓") {
+            } else if l.starts_with("x") {
                 Line::from(Span::styled(l.clone(), theme::ok()))
             } else {
                 Line::from(Span::styled(l.clone(), theme::normal()))
@@ -1010,7 +1003,7 @@ fn push_clean_log(app: &mut App, line: String) {
 /// Called by the main loop after a successful interactive step (the step index
 /// has already been advanced). Spawns the next step in the plan.
 pub fn resume_after_interactive(app: &mut App) {
-    app.push_log("✓ interactive step completed".to_string());
+    app.push_log("x interactive step completed".to_string());
     spawn_current(app);
 }
 
@@ -1118,7 +1111,7 @@ fn spawn_current(app: &mut App) {
         }
     } else {
         app.install_phase = Phase::Succeeded;
-        app.push_log("✓ all steps completed".to_string());
+        app.push_log("x all steps completed".to_string());
     }
 }
 

@@ -52,7 +52,7 @@ nmcli device set "$ap" managed no 2>/dev/null || true
 rfkill unblock wifi 2>/dev/null || true
 
 # ── 3. bring up the access point ─────────────────────────────────────────────
-command -v hostapd >/dev/null 2>&1 || die "hostapd is not installed on this ISO — add it to iso-profile/Packages-Live"
+command -v hostapd >/dev/null 2>&1 || die "hostapd is not installed on this ISO — add it to iso-profile/profile.yaml (rootfs.packages)"
 
 say "Starting access point \"$SSID\" on $ap…"
 cat > /tmp/hostapd.conf <<EOF

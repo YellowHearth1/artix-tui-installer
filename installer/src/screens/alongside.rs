@@ -292,7 +292,7 @@ fn draw_plan_box(f: &mut Frame, app: &App, area: Rect, plan: &Plan) {
     if let Some(key) = plan.blocked {
         // Not viable — say why, plainly, and what to do instead.
         lines.push(Line::from(Span::styled(
-            format!(" \u{26a0} {}", t(app.lang, key)),
+            format!(" [!] {}", t(app.lang, key)),
             theme::warn(),
         )));
         lines.push(Line::from(""));
@@ -487,9 +487,9 @@ fn draw_action_box(f: &mut Frame, app: &App, area: Rect, plan: &Plan, focused: b
     let line = match plan.blocked {
         None => Line::from(Span::styled(
             if focused {
-                format!("  \u{25b8} [Enter] {}", t(app.lang, "parts.continue"))
+                format!("  > [Enter] {}", t(app.lang, "parts.continue"))
             } else {
-                format!("  \u{25b8} {}", t(app.lang, "parts.continue"))
+                format!("  > {}", t(app.lang, "parts.continue"))
             },
             if focused {
                 theme::gold()
@@ -511,7 +511,7 @@ fn draw_disk_modal(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for (i, dk) in disks.iter().enumerate() {
         let sel = i == app.parts_disk_cursor.min(disks.len().saturating_sub(1));
-        let pre = if sel { "\u{25b8} " } else { "  " };
+        let pre = if sel { "> " } else { "  " };
         let p = analyse(app, &dk.path);
         let mut spans = vec![Span::styled(
             format!("{pre}{}  {}  {}", dk.path, dk.size, dk.model),
@@ -542,12 +542,7 @@ fn draw_disk_modal(f: &mut Frame, app: &App, area: Rect) {
     let h = (disks.len() as u16 + 4)
         .min(area.height.saturating_sub(2))
         .max(5);
-    let rect = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    let rect = crate::screens::widgets::modal_rect_fit(f, w, h, app.modal_zoom);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

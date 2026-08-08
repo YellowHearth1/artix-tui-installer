@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target
 /installer/target
+/tools/vm-setup/target
 
 # Editor / OS cruft
 *.rs.bk
@@ -21,6 +22,9 @@
 bin18*
 artix-installer-bin
 /versions
+# build-iso.sh installs the freshly built binary here on its way into the image.
+# It is a build product that happens to sit inside a tracked directory.
+/iso-profile/root-overlay/usr/bin/artix-tui-installer
 
 # Cargo.lock is NOT committed.
 #
@@ -45,6 +49,42 @@ uploaded/
 prev_backup/
 mockbin/
 
+# Локальні налаштування Claude Code. Вони вже ігноруються глобальним
+# ~/.config/git/ignore на машині автора — але це властивість МАШИНИ, а не
+# репозиторію: коміт з іншого комп'ютера підхопив би їх. Тека нікому, крім
+# власника чекауту, не потрібна.
+.claude/
+
 # Робоча інструкція для Claude Code — локальна, у репозиторій не публікується.
 # Вона їде в тарболах розробки й описує внутрішню кухню, а не продукт.
 CLAUDE.md
+
+# Python bytecode from scripts/ (psf-patch.py and friends).
+__pycache__/
+*.pyc
+
+# Built ISO images. The build script writes them into iso/ so there is one place
+# to look — but a live image is well over a gigabyte, and GitHub refuses any file
+# past 100 MB. They are release assets (see scripts/release.sh), never commits.
+/iso/*
+!/iso/README.md
+
+# The artools workspace: the profile deployed for buildiso, regenerated from
+# iso-profile/ on every build. Parts of it end up owned by root (buildiso runs
+# under sudo), which is one more reason it is not something git should carry.
+/workspace/
+
+# QEMU test drives (scripts/qemu-test.sh). The folder is not in the repository
+# at all: it MAKES ITSELF the first time someone runs the installer in a VM, and
+# what it holds is tens of gigabytes of disk images with installed test systems
+# in them. Nothing here belongs on GitHub, not even a placeholder — a fresh
+# checkout has no vm/ until it needs one. What it is and how to steer it is
+# documented in scripts/qemu-test.sh's header, which IS in the repository.
+/vm/
+
+# Junk a literal-tilde path creates: artools computes USER_HOME as `~name` under
+# sudo, and that never expands inside quotes, so a directory actually called
+# `~<user>` appears wherever the build ran. scripts/artools-prepare.sh now
+# refuses such a path outright, but one already exists in some checkouts and
+# must never be committed.
+~*/

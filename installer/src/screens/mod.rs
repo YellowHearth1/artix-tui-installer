@@ -1,6 +1,7 @@
 //! Screen dispatch. Every screen module exposes `draw`, `handle_key`, and may
 //! optionally provide `tick` (background work) and `footer_hint` (custom keys).
 
+pub mod fontpick;
 pub mod widgets;
 
 pub mod alongside;
@@ -9,7 +10,7 @@ mod desktop;
 mod disk;
 mod finish;
 mod kernel;
-mod keyboard;
+pub(crate) mod keyboard;
 mod language;
 mod mode;
 pub(crate) mod nav;
@@ -168,6 +169,12 @@ fn step(screen: Screen) -> Step {
             tick: tbwtest::tick,
             hint: |a| Some(tbwtest::footer_hint(a)),
         },
+        Screen::FontPick => Step {
+            draw: fontpick::draw,
+            key: fontpick::handle_key,
+            tick: |_| {},
+            hint: |a| Some(fontpick::hint(a)),
+        },
     }
 }
 
@@ -190,6 +197,37 @@ pub fn footer_hint(app: &App) -> Option<String> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+/// Step the console font up or down a size, WITHIN the family the user chose.
+///
+/// The only way to make a TTY's text bigger is to load a different font, so the
+/// size keys reach for `setfont`. What they must not do is change the typeface.
+///
+/// They used to walk a fixed ladder of `LatArCyrHeb-*` — a set chosen before the
+/// font screen existed — so `+` did not enlarge the font you were looking at, it
+/// REPLACED it with a different one, and `-` replaced it again. The two halves
+/// never met: one screen chose a font, one key pair ignored the choice. Worse,
+/// every rung of that ladder lacks `ґ` and all four arrows, so growing the text
+/// silently broke Ukrainian and blanked every key hint.
+///
+/// Now the family stays put and only the size moves, which is what "bigger"
+/// means. Best-effort: in a graphical terminal there is no console font to set
+/// and `setfont` is not installed, so the keys simply do nothing.
+pub(crate) fn apply_console_font(app: &mut crate::app::App, delta: i16) {
+    use crate::screens::fontpick;
+    let (fam, size) = fontpick::position_of(&app.config.console_font);
+    let sizes = fontpick::FAMILIES[fam].sizes.len() as i16;
+    let next = (size as i16 + delta).clamp(0, sizes - 1) as usize;
+    app.font_family = fam;
+    app.font_size_idx = next;
+    let name = fontpick::font_name(fam, next);
+    // Only record the choice if the console actually took it. Otherwise the
+    // remembered font and the visible font drift apart, and the NEXT press steps
+    // from a font nobody is looking at.
+    if fontpick::apply(name) {
+        app.config.console_font = name.to_string();
+    }
+}
+
 /// Plausible state for a screenshot: the choices a person would have made by
 /// the time they reach a given step. Without it every screen renders empty and
 /// the pictures show an installer nobody has touched.
@@ -251,11 +289,146 @@ mod tests {
         term.backend().to_string()
     }
 
+    /// A CONTEXT MENU MUST STILL OFFER CHOICES ON A TINY CONSOLE.
+    ///
+    /// The largest console font leaves the fewest cells, which is exactly when
+    /// someone who enlarged the font needs to read the menu. Reported from
+    /// QEMU with the logo picker: at maximum size the box showed one flag name
+    /// and the word "Esc" — nothing said it was a list of nine, and the rows it
+    /// did have went to chrome.
+    ///
+    /// Swept down to sizes no console reaches, because the failure is a squeeze
+    /// and the interesting part is where it starts to bite.
+    #[test]
+    fn a_context_menu_still_shows_choices_when_the_console_is_tiny() {
+        let variants = crate::system::logos::variants();
+        assert!(variants.len() > 1, "the picker has nothing to pick from");
+
+        for &(w, h) in &[(80u16, 24u16), (60, 18), (44, 12), (36, 10)] {
+            let mut app = App::new();
+            app.screen = Screen::Packages;
+            app.logo_modal_open = true;
+            let out = render_at(&mut app, w, h);
+            let shown = variants.iter().filter(|v| out.contains(*v)).count();
+            assert!(
+                shown >= 1,
+                "on a {w}x{h} console the logo picker offered no flag at all:\n{out}"
+            );
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     // ── Rendering ─────────────────────────────────────────────────────────
+
+    /// The whole interface, on every display it might land on.
+    ///
+    /// Linux runs on machines that would not boot anything else, and it runs on
+    /// 4K panels. The console geometry that follows spans an enormous range — an
+    /// old laptop at 80x24, a 4K console at 16x32 giving roughly 240x67, the same
+    /// panel at 6x12 giving over 300 columns. A layout tuned to one of those can
+    /// lose its buttons on another, and the failure is invisible: ratatui clips
+    /// without complaining.
+    ///
+    /// Two things are checked, because a size sweep that only looks for panics
+    /// misses the failure that actually happens.
+    ///
+    /// 1. Nothing panics, and a frame is still drawn. Constraint arithmetic goes
+    ///    wrong at extremes in both directions.
+    /// 2. **A bigger display never shows LESS.** Whatever the smallest supported
+    ///    console manages to draw must still be there with more room — anything
+    ///    else means the layout stops scaling somewhere above 80x24, which is
+    ///    exactly the case nobody tests by hand.
+    #[test]
+    fn every_screen_survives_every_display_size() {
+        // (columns, rows, what it stands for)
+        const DISPLAYS: &[(u16, u16, &str)] = &[
+            (100, 30, "a small window"),
+            (128, 48, "1080p at 15x22"),
+            (240, 67, "4K at 16x32"),
+            (320, 90, "4K at 12x24"),
+            (200, 25, "wide and short — a stretched console"),
+            (82, 60, "narrow and tall — a rotated panel"),
+        ];
+        const FLOOR: (u16, u16) = (80, 24);
+
+        for lang in [Lang::Uk, Lang::En, Lang::Es] {
+            let next = crate::i18n::t(lang, "app.next");
+            let back = crate::i18n::t(lang, "app.back");
+            for screen in Screen::ALL {
+                let mut app = App::new();
+                app.lang = lang;
+                app.screen = screen;
+                let floor = render_at(&mut app, FLOOR.0, FLOOR.1);
+                assert!(
+                    floor.contains('\u{2500}') || floor.contains('\u{2502}'),
+                    "{screen:?} {lang:?} drew no frame at the 80x24 floor"
+                );
+
+                for &(w, h, why) in DISPLAYS {
+                    let mut app = App::new();
+                    app.lang = lang;
+                    app.screen = screen;
+                    let out = render_at(&mut app, w, h);
+                    assert!(
+                        out.contains('\u{2500}') || out.contains('\u{2502}'),
+                        "{screen:?} {lang:?} at {w}x{h} ({why}) drew no frame at all"
+                    );
+                    for label in [&next, &back] {
+                        if floor.contains(label.as_str()) {
+                            assert!(
+                                out.contains(label.as_str()),
+                                "{screen:?} {lang:?}: \"{label}\" is drawn at 80x24 \
+                                 but MISSING at {w}x{h} ({why}) — the layout stops \
+                                 scaling somewhere above the floor"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same sweep with a dialog open, on every console size.
+    ///
+    /// A LARGE CONSOLE FONT IS A SMALL CONSOLE. `+` enlarges the VT font, which
+    /// leaves fewer cells for the whole installer — so the sizes swept here are
+    /// what the dialog actually meets after a few presses, right down to a
+    /// display too narrow for the box it wants. It must come back inside the
+    /// screen rather than draw over the edge, and never collapse to a line.
+    #[test]
+    fn a_dialog_stays_on_screen_at_every_size() {
+        for &(w, h) in &[
+            (80u16, 24u16),
+            (100, 30),
+            (240, 67),
+            (82, 60),
+            (40, 12),
+            (30, 8),
+        ] {
+            for zoom in [-4i16, -1, 0, 1, 6, 12] {
+                let mut app = App::new();
+                app.screen = Screen::Desktop;
+                app.seat_modal_open = true;
+                app.modal_zoom = zoom;
+                // Drawing it is half the check: a dialog whose rect went silly
+                // panics here rather than on someone's console.
+                let out = render_at(&mut app, w, h);
+                assert!(!out.is_empty());
+                let rect = widgets::modal_rect_in(Rect::new(0, 0, w, h), 64, 13, zoom);
+                assert!(
+                    rect.x + rect.width <= w && rect.y + rect.height <= h,
+                    "zoom {zoom} pushed the dialog off a {w}x{h} display: {rect:?}"
+                );
+                assert!(
+                    rect.width >= 20 && rect.height >= 4,
+                    "zoom {zoom} shrank the dialog past readable on {w}x{h}: {rect:?}"
+                );
+            }
+        }
+    }
 
     /// Every screen must render without panicking. An unwrap on a missing
     /// translation key, an index into an empty list, an arithmetic overflow in
@@ -475,10 +648,14 @@ mod tests {
 
     /// A step with nothing to decide is walked past, in both directions.
     ///
-    /// In manual mode every drive can end up with a role, leaving the
-    /// extra-disks step with an empty list. An empty screen reads as a broken
-    /// step rather than an absent one, and it costs the user two keypresses to
-    /// get through in each direction.
+    /// Manual partitioning skips the extra-disks step OUTRIGHT, whether or not
+    /// drives are left over: the partition editor already mounts and creates
+    /// partitions on any drive through its "Data" role, and writes them to the
+    /// same `extra_disks` list this step edits. Two screens editing one list is
+    /// how one partition ends up with two mountpoints.
+    ///
+    /// In auto mode it is skipped only when empty — an empty screen reads as a
+    /// broken step rather than an absent one, and costs two keypresses each way.
     #[test]
     fn an_empty_extra_disks_step_is_skipped_both_ways() {
         let mut app = App::new();
@@ -511,7 +688,8 @@ mod tests {
             "an empty extra-disks step was shown on the way back"
         );
 
-        // With something left over, the step is shown as usual.
+        // Manual mode skips it even with every drive untouched: the editor is
+        // where those drives get handled now.
         let mut app = App::new();
         app.config.partition_mode = crate::app::PartitionMode::Manual;
         app.can_advance = true;
@@ -519,8 +697,23 @@ mod tests {
         app.goto_next();
         assert_eq!(
             app.screen,
+            Screen::User,
+            "manual partitioning still showed the extra-disks step, which only \
+             repeats what the partition editor already does"
+        );
+
+        // Auto mode keeps it: there the disk step claims one drive and says
+        // nothing about the others.
+        let mut app = App::new();
+        app.config.partition_mode = crate::app::PartitionMode::Auto;
+        app.can_advance = true;
+        app.screen = Screen::Security;
+        app.goto_next();
+        assert_eq!(
+            app.screen,
             Screen::Storage,
-            "the extra-disks step vanished while it still had disks to offer"
+            "the extra-disks step vanished from auto mode, where it is the only \
+             place the other drives are offered"
         );
     }
 
@@ -667,9 +860,10 @@ mod tests {
             out.contains(&t(app.lang, "parts.biosboot")),
             "the BIOS-boot partition is unlabelled in the confirmation"
         );
-        // Sizes: the fixed one by value, the rest-of-disk one by name.
+        // Sizes: the fixed one by value, the rest-of-disk one by name. Either
+        // spelling of the unit — a narrow panel drops the "iB".
         assert!(
-            out.contains("2.0G"),
+            out.contains("2.0 GiB") || out.contains("2.0G"),
             "a created partition's size is missing:\n{out}"
         );
         assert!(
@@ -768,7 +962,10 @@ mod tests {
                     v.dedup();
                     v.len()
                 };
-                let highlighted = cells[..x0].contains(&"\u{258e}");
+                // The cursor marker is "> " now, not the ▎ bar: that glyph is in
+                // ZERO of the 362 console fonts on the image, so on a bare TTY —
+                // this installer's first target — the cursor was invisible.
+                let highlighted = cells[..x0].contains(&">");
                 assert!(
                     distinct >= 5,
                     "slayfetch should run through the flag, but its letters used \
@@ -1330,7 +1527,18 @@ mod shots {
         };
         let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| "/tmp/shots".into());
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let (w, h) = (120u16, 34u16);
+        // Matched to the grid the Ukrainian and English screenshots were taken
+        // at (~137×39, measured off the images): a different grid means a
+        // different number of characters across the same displayed width, and
+        // the odd one out looks like it is using a giant font.
+        let w: u16 = std::env::var("SHOT_COLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(137);
+        let h: u16 = std::env::var("SHOT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(39);
 
         for (i, screen) in Screen::ALL.iter().enumerate() {
             let mut app = App::new();

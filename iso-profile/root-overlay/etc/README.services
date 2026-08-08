@@ -1,0 +1,12 @@
+Services are enabled from profile.yaml (`live-session.services`), not by
+symlinks here.
+
+There used to be an `etc/dinit.d/boot.d/` with absolute symlinks
+(`seatd -> /etc/dinit.d/seatd`). Absolute symlinks in an overlay resolve
+against the BUILD HOST, not the image: on a host without seatd installed the
+link dangles, artools' overlay copy dereferences it and the build dies with
+"cannot stat". It only showed up when the root filesystem was genuinely rebuilt
+— every other build reused the cached one and never touched the overlay.
+
+Both services it linked (seatd, NetworkManager) are already in profile.yaml's
+service list, so the links were doing nothing except waiting to break.

@@ -64,7 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 theme::normal()
             },
         ),
-        Span::styled("▏", theme::accent()),
+        Span::styled("|", theme::accent()),
     ]))
     .block(
         Block::default()
@@ -160,7 +160,7 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         .map(|p: &Pkg| {
             let checked = app.config.aur_packages.contains(&p.name);
             let (mark, mark_style, name_style) = if checked {
-                ("[✓] ", theme::ok(), theme::gold())
+                ("[x] ", theme::ok(), theme::gold())
             } else {
                 ("[ ] ", theme::mute(), theme::normal())
             };
@@ -180,7 +180,7 @@ fn draw_results(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     let list = List::new(rows)
         .highlight_style(theme::selected())
-        .highlight_symbol("▎ ");
+        .highlight_symbol("> ");
     let mut st = ListState::default();
     if !rows_source.is_empty() {
         let sel = app.aur_cursor.min(rows_source.len() - 1);

@@ -106,7 +106,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             run(app);
         }
         KeyCode::Esc => {
-            app.screen = Screen::Mode;
+            app.goto(Screen::Mode);
         }
         _ => {}
     }

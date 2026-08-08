@@ -1,0 +1,5 @@
+type        = scripted
+command     = /bin/sh -c "/usr/bin/passwd -d root; /usr/bin/passwd -d artix"
+restart     = false
+depends-on  = local.target
+before      = login.target

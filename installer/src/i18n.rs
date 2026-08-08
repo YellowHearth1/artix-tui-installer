@@ -128,6 +128,32 @@ mod tests {
         .collect()
     }
 
+    /// Every locale file PARSES, and none of them is empty.
+    ///
+    /// `table()` ends in `unwrap_or_default()`, so a syntax error — a duplicate
+    /// key, an unclosed quote — does not fail: it yields an EMPTY map, and every
+    /// string in that language silently becomes its own identifier. The parity
+    /// test above cannot catch it either, because two empty maps agree perfectly
+    /// with each other.
+    ///
+    /// This happened while adding a key by hand: `[de]` ended up with two
+    /// `footer` entries, en.toml stopped parsing, and nothing said so.
+    #[test]
+    fn every_locale_file_parses_and_is_not_empty() {
+        for (lang, name) in [
+            (Lang::Uk, "uk.toml"),
+            (Lang::En, "en.toml"),
+            (Lang::Es, "es.toml"),
+        ] {
+            let n = keys(lang).len();
+            assert!(
+                n > 100,
+                "{name} yielded {n} keys — it almost certainly failed to parse, \
+                 and every string in that language will render as its own key"
+            );
+        }
+    }
+
     /// EVERY shipped translation defines exactly the same keys.
     ///
     /// A key in one file and not another renders as the raw identifier on

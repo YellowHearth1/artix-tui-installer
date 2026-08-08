@@ -1,0 +1,13 @@
+# The build context is EMPTY on purpose.
+#
+# Containerfile has no COPY and no ADD: the checkout is bind-mounted at /repo
+# when the container runs (see scripts/build-iso.sh), so the image itself needs
+# nothing from here. Without this file `docker build` still uploads the whole
+# directory to the daemon before doing anything — which already meant shipping
+# the 1.2 GB ISO on every build, and became untenable once the QEMU disk images
+# moved into vm/ (tens of gigabytes of them).
+#
+# If a COPY is ever added to Containerfile, un-ignore exactly what it needs
+# rather than deleting this line. Sending the whole tree is never the answer
+# here: iso/ and vm/ are both large and both regenerable.
+*

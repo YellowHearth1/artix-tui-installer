@@ -1,0 +1,4 @@
+type = process
+command = /usr/bin/openvt -fsw -c 7 -- /usr/bin/installer-start
+restart = false
+depends-on = login.target

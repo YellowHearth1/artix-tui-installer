@@ -112,7 +112,7 @@ fn draw_auto_full(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             theme::border_dim()
         })
-        .title(" Disk ")
+        .title(format!(" {} ", t(app.lang, "disk.panel_disk")))
         .title_style(theme::dim());
     let inner = disk_block.inner(rows[1]);
     f.render_widget(disk_block, rows[1]);
@@ -270,7 +270,7 @@ fn draw_auto_compact(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             theme::border_dim()
         })
-        .title(" Disk ")
+        .title(format!(" {} ", t(app.lang, "disk.panel_disk")))
         .title_style(theme::dim());
     let inner = disk_block.inner(rows[1]);
     f.render_widget(disk_block, rows[1]);
@@ -335,7 +335,7 @@ fn render_disk_list(f: &mut Frame, app: &mut App, inner: Rect) {
     if d.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  no disks detected",
+                format!("  {}", t(app.lang, "disk.none_detected")),
                 theme::mute(),
             ))),
             inner,
@@ -350,15 +350,15 @@ fn render_disk_list(f: &mut Frame, app: &mut App, inner: Rect) {
             .map(|x| {
                 let mut row = format!("  {}   {}   {}", x.path, x.size, x.model);
                 if x.is_live {
-                    row.push_str(&format!("   ⚠ {}", t(app.lang, "disk.flag_live")));
+                    row.push_str(&format!("   [!] {}", t(app.lang, "disk.flag_live")));
                 }
                 if is_too_small(x) {
-                    row.push_str(&format!("   ⚠ {}", t(app.lang, "disk.flag_small")));
+                    row.push_str(&format!("   [!] {}", t(app.lang, "disk.flag_small")));
                 }
                 row
             })
             .collect();
-        widgets::select_list(f, inner, &items, app.disk_cursor);
+        widgets::select_list_scrolled(f, inner, &items, app.disk_cursor, app.marquee);
         app.can_advance = true;
         // NOT `app.config.disk = d[cursor]` — see commit_disk(). Painting must
         // not decide which disk gets wiped.
@@ -460,7 +460,7 @@ fn warning_line(app: &App) -> Line<'static> {
     } else {
         Line::from(vec![
             Span::styled(
-                format!("  ⚠ {}: {}   ", t(app.lang, "disk.warn"), app.config.disk),
+                format!("  [!] {}: {}   ", t(app.lang, "disk.warn"), app.config.disk),
                 theme::warn(),
             ),
             Span::styled(
@@ -590,14 +590,7 @@ pub(crate) fn draw_fs_opts_modal(f: &mut Frame, app: &mut App, area: Rect, fs: &
     let chrome = opts.len() as u16 + 4;
     let max_h = area.height.saturating_sub(2);
     let h = (chrome + desc_full).min(max_h).max((chrome + 2).min(max_h));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let modal = crate::screens::widgets::modal_rect_fit(f, w, h, app.modal_zoom);
     f.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -664,11 +657,11 @@ pub(crate) fn draw_fs_opts_modal(f: &mut Frame, app: &mut App, area: Rect, fs: &
     let base = t(app.lang, "disk.fsopt_modal_hint");
     let hint = if max_scroll > 0 {
         let arrows = if scroll == 0 {
-            "▼"
+            "v"
         } else if scroll >= max_scroll {
-            "▲"
+            "^"
         } else {
-            "▲▼"
+            "^v"
         };
         format!("{arrows}  {base}")
     } else {
@@ -717,14 +710,7 @@ fn draw_warn_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let chrome = 5u16;
     let max_h = area.height.saturating_sub(2);
     let h = (chrome + body_h).min(max_h).max((chrome + 2).min(max_h));
-    let x = area.x + (area.width.saturating_sub(wbox)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: wbox,
-        height: h,
-    };
+    let modal = crate::screens::widgets::modal_rect_fit(f, wbox, h, app.modal_zoom);
     f.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -760,11 +746,11 @@ fn draw_warn_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let base = t(app.lang, "disk.warnmodal_hint");
     let hint = if max_scroll > 0 {
         let arrows = if scroll == 0 {
-            "▼"
+            "v"
         } else if scroll >= max_scroll {
-            "▲"
+            "^"
         } else {
-            "▲▼"
+            "^v"
         };
         format!("{arrows}  {base}")
     } else {
@@ -810,9 +796,9 @@ fn boot_mode_card(
     let name_span = if selected {
         // Bright bold cyan ● + name — glows, no background fill (reversed
         // video reads as a muddy grey-on-cyan slab on real fbcon palettes).
-        Span::styled(format!(" ● {name} "), theme::gold())
+        Span::styled(format!(" * {name} "), theme::gold())
     } else {
-        Span::styled(format!(" ○ {name} "), theme::mute())
+        Span::styled(format!(" o {name} "), theme::mute())
     };
     let lines = vec![
         Line::from(vec![Span::raw(" "), name_span]),
@@ -835,7 +821,7 @@ fn pill(label: &str, selected: bool, focused: bool) -> Span<'static> {
         } else {
             theme::normal()
         };
-        Span::styled(format!("[ ● {label} ]"), st)
+        Span::styled(format!("[ * {label} ]"), st)
     } else {
         Span::styled(format!("[ {label} ]"), theme::mute())
     }

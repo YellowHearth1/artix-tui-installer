@@ -634,7 +634,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             };
             lines.push(Line::from(vec![
                 if is_sel {
-                    Span::styled("\u{258c} ", theme::accent())
+                    Span::styled("| ", theme::accent())
                 } else {
                     Span::raw("  ")
                 },
@@ -885,14 +885,7 @@ fn draw_storage_opts_modal(f: &mut Frame, app: &App, area: Rect) {
     let w = 72u16.min(area.width.saturating_sub(4));
     let desc_h = 6u16;
     let h = (opts.len() as u16 + desc_h + 5).min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
+    let modal = crate::screens::widgets::modal_rect_fit(f, w, h, app.modal_zoom);
     f.render_widget(Clear, modal);
 
     let block = Block::default()

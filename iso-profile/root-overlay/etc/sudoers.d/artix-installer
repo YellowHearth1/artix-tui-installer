@@ -1,0 +1,2 @@
+artix ALL=(ALL) NOPASSWD: /usr/bin/artix-tui-installer
+artix ALL=(ALL) NOPASSWD: /usr/bin/installer-start

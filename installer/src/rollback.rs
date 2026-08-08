@@ -671,7 +671,7 @@ fn draw_panel(
 
     let list = List::new(items)
         .highlight_style(theme::selected())
-        .highlight_symbol("▌ ");
+        .highlight_symbol("> ");
 
     let overflow = snaps.len() > chunks[1].height as usize;
     let list_area = if overflow {

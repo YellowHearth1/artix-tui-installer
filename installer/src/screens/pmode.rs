@@ -150,7 +150,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     if !app.pmode_status.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("\u{26a0} {}", app.pmode_status),
+            format!("[!] {}", app.pmode_status),
             theme::warn(),
         )));
     }

@@ -166,9 +166,23 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             Field::Mode => continue,
         };
         if compact {
-            widgets::input_inline(f, rows[ri], &label, value, focused, mask);
+            widgets::input_inline(
+                f,
+                rows[ri],
+                &label,
+                value,
+                focused,
+                mask && !app.show_secrets,
+            );
         } else {
-            widgets::input(f, rows[ri], &label, value, focused, mask);
+            widgets::input(
+                f,
+                rows[ri],
+                &label,
+                value,
+                focused,
+                mask && !app.show_secrets,
+            );
         }
     }
 
@@ -346,8 +360,29 @@ pub fn footer_hint(app: &App) -> String {
     let cur = flds
         .get(app.user_focus.min(flds.len().saturating_sub(1)))
         .copied();
-    match cur {
+    let base = match cur {
         Some(Field::Mode) => t(app.lang, "user.footer_mode"),
         _ => t(app.lang, "user.footer_field"),
+    };
+    // The reveal key is only worth advertising where there is a password to
+    // reveal, and the label says what the NEXT press does.
+    // Every field that is masked, confirmations included — you are just as
+    // likely to mistype the second one, and that is the mismatch that stops you
+    // from continuing with no way to see why.
+    if matches!(
+        cur,
+        Some(Field::UserPass)
+            | Some(Field::UserConfirm)
+            | Some(Field::RootPass)
+            | Some(Field::RootConfirm)
+    ) {
+        let key = if app.show_secrets {
+            t(app.lang, "user.reveal_hide")
+        } else {
+            t(app.lang, "user.reveal_show")
+        };
+        format!("{base} · {key}")
+    } else {
+        base
     }
 }
