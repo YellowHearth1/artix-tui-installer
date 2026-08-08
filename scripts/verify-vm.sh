@@ -16,7 +16,14 @@
 # want `modprobe nbd` and a mount in the host kernel.
 set -eu
 
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# `unset CDPATH` rather than the `CDPATH= cd` idiom: they do the same thing, but
+# the linter reads the second as a typo'd assignment (SC1007), and CI runs at
+# `-S warning`, so it fails the build. An idiom the linter cannot recognise is
+# not worth the cleverness.
+#
+# (A comment line must not START with the linter's own name either — that is
+# read as a malformed directive, SC1073. This one cost a second CI run.)
+SELF_DIR=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname -- "$SELF_DIR")
 VM_DIR="${ARTIX_VM_DIR:-$REPO_DIR/vm}"
 
