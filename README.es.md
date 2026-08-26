@@ -100,7 +100,7 @@ y un registro de instalación en vivo con scroll.
 > Un lenguaje sencillo ayuda. Y si algo se lee mal, dilo sin rodeos: no ofende, y
 > corregirlo es mejor que dejarlo.
 >
-> En ucraniano y español se puede escribir con toda libertad.
+> En ucraniano se puede escribir con toda libertad.
 
 ---
 
