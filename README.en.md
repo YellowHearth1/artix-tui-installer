@@ -97,7 +97,7 @@ segmented toggles, and a live scrollable install log.
 > Plain language helps. And if something reads badly, say so directly: no
 > offence taken, and fixing it beats leaving it.
 >
-> Ukrainian and Spanish can be written freely.
+> Ukrainian can be written freely.
 
 ---
 
