@@ -350,7 +350,18 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         loader: crate::app::Bootloader::Grub,
         brk: Break::Service,
         tweak: None,
-        passed: false,
+        // Verified 2026-09-06 by the author, and it is THE row this release
+        // exists for: the service was at the top of recovery's list (newest
+        // first), disabling it brought the machine back. Confirmed here on the
+        // disk as well — /etc/dinit.d/test-hang with its boot.d symlink, an
+        // hour newer than every other entry.
+        //
+        // What is proven is the RECOVERY half. The break half was still the
+        // racy `before = local.target` version at that point, which stops a
+        // boot only when it wins a race with local.target; it has since been
+        // replaced by one that cannot lose. So this row's repair is confirmed
+        // and its trigger is now more reliable than the run that confirmed it.
+        passed: true,
     },
     Scenario {
         name: "ext4 · AURIS + Chaotic-AUR",
