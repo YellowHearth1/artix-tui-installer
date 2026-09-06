@@ -643,22 +643,23 @@ mkdir -p "$ISO_DIR"
 # stops on the first one and says so — waiting an hour to be told the same
 # thing is worse than being told once.
 build_log=$(mktemp)
-build_fifo=$(mktemp -u)
-trap 'rm -f "$build_log" "$build_fifo"' EXIT INT TERM
+build_rc=$(mktemp)
+trap 'rm -f "$build_log" "$build_rc"' EXIT INT TERM
 attempt=1
 while :; do
-    # THE STATUS HAS TO BE buildiso'S, not tee'S. Piping into tee would give
-    # the pipeline the status of tee — always 0 — and the retry below would
-    # never once fire. A fifo keeps the output live on screen AND leaves the
-    # real exit code in $rc.
-    rm -f "$build_fifo"
-    mkfifo "$build_fifo" || die "cannot create $build_fifo"
-    tee "$build_log" < "$build_fifo" &
-    tee_pid=$!
-    sudo -E env PATH="$VENDOR/bin:$PATH" "$BUILDISO" -p "$PROFILE" -t "$ISO_DIR" \
-        > "$build_fifo" 2>&1
-    rc=$?
-    wait "$tee_pid" 2>/dev/null || true
+    # THE STATUS HAS TO BE buildiso'S, not tee'S. A plain `cmd | tee` gives the
+    # pipeline tee's status — always 0 — and the retry below would never once
+    # fire. So the status is written to a file from inside the pipeline: the
+    # output still streams to the screen, and $rc is buildiso's own.
+    #
+    # (A fifo did the same job and tripped shellcheck's SC2024 — sudo does not
+    # affect a redirect, which is true and harmless when the target is a fifo
+    # in /tmp, but a rule worth not arguing with when the alternative is
+    # shorter anyway.)
+    { sudo -E env PATH="$VENDOR/bin:$PATH" "$BUILDISO" -p "$PROFILE" -t "$ISO_DIR" 2>&1
+      echo "$?" > "$build_rc"
+    } | tee "$build_log"
+    rc=$(cat "$build_rc" 2>/dev/null || echo 1)
     [ "$rc" -eq 0 ] && break
 
     if ! grep -qE "failed to retrieve|Operation too slow|failed retrieving file|too many errors from" "$build_log"; then
