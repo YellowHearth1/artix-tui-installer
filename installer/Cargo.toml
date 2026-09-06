@@ -1,6 +1,6 @@
 [package]
 name = "artix-installer"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "TUI installer for an Artix/dinit based distribution"
 license = "Apache-2.0"
@@ -10,6 +10,21 @@ readme = "../README.md"
 [[bin]]
 name = "artix-installer"
 path = "src/main.rs"
+
+[features]
+# DEVELOPER TOOLS, OFF IN EVERY PUBLISHED BUILD.
+#
+# The mode menu carries two entries that exist only to test this installer: the
+# simulated Wi-Fi radio, and "Test", which finishes a real install by breaking
+# the system on purpose so recovery has something to repair. Neither is any use
+# to somebody installing Artix, and the second is destructive by design — a menu
+# row that wrecks a fresh install has no business in a release.
+#
+# A feature rather than deleted code: the tools stay in the tree, reviewable and
+# compiled by CI, and `cargo build --release` simply does not include them.
+#
+#     cargo build --release --features devtools     # to get them back
+devtools = []
 
 [dependencies]
 # TUI core. ratatui 0.30 + crossterm 0.29 (updated pair).

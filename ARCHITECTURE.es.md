@@ -3,6 +3,12 @@
 
 > Un mapa del proyecto para cualquier persona que quiera corregir o añadir algo,
 > incluso si Rust es nuevo para ti. Cada cambio común está vinculado a su archivo.
+>
+> **⚠ Esta traducción está desactualizada.** `ARCHITECTURE.md` (ucraniano) fue
+> reescrito y ahora incluye dos secciones que aquí faltan: el MODELO DEL SISTEMA
+> DESTINO (qué monta la raíz — la línea de comandos del kernel, no fstab —, cómo
+> lee dinit el fstab y qué implica eso para los fallos) y la cadena de arranque
+> UEFI. Si ambos difieren, el archivo ucraniano es el correcto.
 
 ## Flujo de datos en 30 segundos
 

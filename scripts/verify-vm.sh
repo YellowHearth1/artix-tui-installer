@@ -69,6 +69,18 @@ nbd_inspect() {
         sudo cryptsetup close artix_verify 2>/dev/null || true
         [ -n "$nbd_dev" ] && sudo qemu-nbd -d "$nbd_dev" >/dev/null 2>&1
         sudo umount "$work/key" 2>/dev/null || true
+        sudo umount "$work/esp" 2>/dev/null || true
+        sudo umount "$work/other" 2>/dev/null || true
+        # NEVER DELETE A TREE THAT STILL HAS SOMETHING MOUNTED IN IT. The ESP
+        # was still mounted when this ran, so `rm -rf` walked INTO it and tried
+        # to delete vmlinuz, the microcode and grubx64.efi. Only the read-only
+        # mount saved it. Refusing is the correct answer; the temporary
+        # directory is a few empty folders and losing it costs nothing.
+        if findmnt -rno TARGET 2>/dev/null | grep -q "^$work"; then
+            red "!! something is still mounted under $work — NOT deleting it"
+            findmnt -rno TARGET | grep "^$work" | sed 's/^/     /'
+            return
+        fi
         sudo rm -rf "$work"
     }
     trap undo EXIT INT TERM
@@ -101,11 +113,30 @@ nbd_inspect() {
         fi
     done
     [ -n "$nbd_dev" ] || { bad "no free nbd device"; return; }
-    sleep 2
+    # WAIT FOR THE PARTITIONS, do not guess. A fixed `sleep 2` was enough
+    # sometimes and not others: the device nodes survive a disconnect, so the
+    # next run could read stale ones and report "no Linux filesystem at all" on
+    # a disk that plainly has three. Poll until the kernel has actually read the
+    # table, then give up loudly.
+    sudo partprobe "$nbd_dev" 2>/dev/null || true
+    ready=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if sudo blkid -o device "$nbd_dev"p* 2>/dev/null | grep -q .; then
+            ready=yes
+            break
+        fi
+        sleep 1
+    done
+    [ -n "$ready" ] || { bad "$nbd_dev exposed no partitions — is the image empty?"; return; }
 
+    # `|| true`, AND IT IS NOT COSMETIC. The loop's last command is a test that
+    # is FALSE on a disk with no LUKS, so the command substitution exits
+    # non-zero — and under `set -e` that killed the whole script right here,
+    # printing nothing after "opening". A tool that dies silently on the
+    # ordinary case is worse than one that never worked.
     root_src=$(sudo blkid -o device "$nbd_dev"p* 2>/dev/null | while read -r p; do
         [ "$(sudo blkid -o value -s TYPE "$p")" = crypto_LUKS ] && { echo "$p"; break; }
-    done)
+    done || true)
     if [ -n "$root_src" ]; then
         [ -r "$key_img" ] || { skip "encrypted root and no $key_img to unlock it with"; return; }
         sudo mount -o loop,ro "$key_img" "$work/key" || { bad "the USB key image will not mount"; return; }
@@ -116,9 +147,27 @@ nbd_inspect() {
             || { bad "the keyfile does not open $root_src"; return; }
         root_dev=/dev/mapper/artix_verify
     else
-        root_dev=$(sudo blkid -o device "$nbd_dev"p* 2>/dev/null | while read -r p; do
-            [ "$(sudo blkid -o value -s TYPE "$p")" = btrfs ] && { echo "$p"; break; }
-        done)
+        # ANY LINUX FILESYSTEM, not just btrfs, and the BIGGEST one.
+        #
+        # This looked for btrfs alone, so an ext4 install produced an empty
+        # device path — and then every mount failed on "" and the run ended
+        # with nothing printed at all. A verifier that says nothing is worse
+        # than one that says no.
+        root_dev=""
+        biggest=0
+        for p in $(sudo blkid -o device "$nbd_dev"p* 2>/dev/null); do
+            case "$(sudo blkid -o value -s TYPE "$p")" in
+                ext4|ext3|ext2|xfs|btrfs|f2fs) ;;
+                *) continue ;;
+            esac
+            sz=$(sudo blockdev --getsize64 "$p" 2>/dev/null || echo 0)
+            if [ "$sz" -gt "$biggest" ]; then biggest=$sz; root_dev=$p; fi
+        done
+        if [ -z "$root_dev" ]; then
+            bad "no Linux filesystem on this disk at all — nothing to inspect"
+            return
+        fi
+        say "root looks like $root_dev ($(sudo blkid -o value -s TYPE "$root_dev"))"
     fi
     # A PLAIN READ-ONLY MOUNT FIRST, and `rescue=nologreplay` only if that
     # fails — with the fact said out loud.
@@ -135,7 +184,16 @@ nbd_inspect() {
     elif sudo mount -o ro "$root_dev" "$work/root" 2>/dev/null; then
         :
     elif sudo mount -o ro,rescue=nologreplay,subvol=@ "$root_dev" "$work/root" 2>/dev/null \
-        || sudo mount -o ro,rescue=nologreplay "$root_dev" "$work/root" 2>/dev/null; then
+        || sudo mount -o ro,rescue=nologreplay "$root_dev" "$work/root" 2>/dev/null \
+        || sudo mount -o ro,noload "$root_dev" "$work/root" 2>/dev/null \
+        || sudo mount -o ro,norecovery "$root_dev" "$work/root" 2>/dev/null; then
+        # One spelling per filesystem for the same idea — DO NOT REPLAY THE LOG.
+        # A machine switched off hard comes back with a dirty journal, and
+        # replaying it needs to WRITE, which a read-only nbd export cannot do:
+        # btrfs calls it rescue=nologreplay, ext2/3/4 noload, xfs norecovery.
+        # Each one was added after a report of "the root filesystem will not
+        # mount", which sounds like a failed install and means only that the VM
+        # was switched off rather than shut down.
         stale=yes
     else
         bad "the root filesystem will not mount"
@@ -156,7 +214,19 @@ nbd_inspect() {
         [ "$p" = "$root_src" ] && continue
         ty=$(sudo blkid -o value -s TYPE "$p")
         lbl=$(sudo blkid -o value -s PARTLABEL "$p")
-        case "$ty" in vfat|swap|crypto_LUKS|"") continue ;; esac
+        # The ESP is not "another partition" — it is half the boot path, so it
+        # gets its own report rather than a mount test.
+        if [ "$ty" = vfat ]; then
+            mkdir -p "$work/esp"
+            if sudo mount -o ro "$p" "$work/esp" 2>/dev/null; then
+                report_esp "$work/esp"
+                sudo umount "$work/esp"
+            else
+                bad "$p is vfat (the ESP) and WILL NOT MOUNT — see: sudo dmesg | tail"
+            fi
+            continue
+        fi
+        case "$ty" in swap|crypto_LUKS|"") continue ;; esac
         mkdir -p "$work/other"
         if sudo mount -o ro "$p" "$work/other" 2>/dev/null; then
             ok "$p ($ty, PARTLABEL=${lbl:-none}) mounts"
@@ -167,23 +237,162 @@ nbd_inspect() {
     done
 }
 
-# What the installed root has to say for itself.
+# WOULD THIS SYSTEM ACTUALLY BOOT AND LOG IN?
+#
+# The earlier version printed three files and checked that fstab had a root
+# line. That is not the question. A machine can have a perfect fstab and still
+# stop at a login screen with no session behind it, or boot to a rescue prompt
+# because the initramfs has no encrypt hook — both seen this week, and neither
+# visible in what was printed.
+#
+# So each check below is one REASON A SYSTEM DOES NOT COME UP, asked separately,
+# and named in the terms the failure appears in.
 report_root() {
     r="$1"
     say "inside the installed system"
-    for f in etc/fstab etc/X11/xorg.conf.d/00-keyboard.conf etc/dconf/db/local.d/00-input-sources; do
-        if sudo test -r "$r/$f"; then
-            printf '\n--- /%s ---\n' "$f"
-            sudo grep -v '^#' "$r/$f" | awk 'NF'
-        else
-            bad "/$f is missing"
+
+    # ── what it says about itself ──────────────────────────────────────────
+    rec="$r/etc/artix-tui/install.conf"
+    if sudo test -r "$rec"; then
+        ok "the install left its layout record"
+        sudo grep -E '^(version|date|hostname|scope|bootloader)' "$rec" 2>/dev/null | sed 's/^/       /'
+    else
+        bad "no /etc/artix-tui/install.conf — recovery would have to guess"
+    fi
+
+    # ── fstab ─────────────────────────────────────────────────────────────
+    fst="$r/etc/fstab"
+    if ! sudo test -r "$fst"; then
+        # NOT "cannot boot" — that was wrong, and it is the same wrong sentence
+        # the test aid used to print. The root is mounted from root=UUID= on the
+        # kernel command line; fstab is read afterwards, by one dinit service
+        # running `mount -a`, and nothing else. So a machine with no fstab comes
+        # up looking healthy and quietly mounts none of the rest.
+        bad "/etc/fstab is missing — it will still BOOT, and mount nothing else: no swap, no ESP"
+    else
+        n=$(sudo awk '!/^#/ && NF>=2' "$fst" | wc -l)
+        [ "$n" -gt 0 ] || bad "/etc/fstab has no entries (the package stub)"
+        sudo awk '!/^#/ && NF>=2 && $2 == "/"' "$fst" | grep -q . \
+            && ok "fstab names a root" || bad "fstab has NO root line"
+        sudo awk '!/^#/ && $2 ~ /^\/boot/' "$fst" | grep -q . \
+            && ok "fstab mounts /boot or /boot/efi" \
+            || bad "fstab has no /boot line — the kernel will not be updatable"
+        # A btrfs layout keeps /var/log in its own subvolume. Without that line
+        # every dinit service fails to open its log and the session dies.
+        if sudo grep -q 'subvol=/*@' "$fst"; then
+            sudo grep -q 'subvol=/*@log' "$fst" \
+                && ok "fstab mounts @log" \
+                || bad "btrfs layout but NO @log line — no dinit service will start"
         fi
+        sudo grep -q 'subvolid=' "$fst" \
+            && bad "fstab pins subvolid= — a rollback would mount the wrong snapshot" \
+            || ok "subvolumes named by name, not by id"
+        # THE SWAP LINE, because losing it is SILENT. Nothing about a machine
+        # with no swap looks wrong: it boots, it logs in, and the only sign is
+        # `swapon --show` printing nothing. That is exactly the damage a missing
+        # fstab does on a simple layout — the boot never fails, so the only way
+        # to tell the repair worked is to come and look.
+        if sudo blkid -o value -s TYPE 2>/dev/null | grep -qx swap ||
+            sudo grep -q '^swap|' "$rec" 2>/dev/null; then
+            sudo awk '!/^#/ && NF>=3 && $3 == "swap"' "$fst" | grep -q . \
+                && ok "fstab activates the swap partition" \
+                || bad "there IS a swap partition, but no fstab line for it — it will never be used"
+        fi
+    fi
+
+    # ── kernel side ───────────────────────────────────────────────────────
+    # THE KERNEL MAY LIVE ON THE ESP. With an encrypted root the installer puts
+    # the ESP at /boot, so the kernels are there and the root's own /boot is an
+    # empty mount point — reporting "no kernel" for that is a false alarm on a
+    # perfectly good system. The ESP is inspected separately; here the answer is
+    # only recorded when it can be given.
+    if sudo sh -c "ls $r/boot/vmlinuz-* >/dev/null 2>&1"; then
+        ok "a kernel is present in the root's /boot"
+        sudo sh -c "ls $r/boot/initramfs-*.img >/dev/null 2>&1" \
+            && ok "an initramfs is present" || bad "kernel but NO initramfs in /boot"
+    elif sudo sh -c "ls -A $r/boot 2>/dev/null | grep -q ." ; then
+        bad "/boot has files but no kernel — is the right partition mounted there?"
+    else
+        skip "the root's /boot is empty — the kernels are on the ESP (checked below)"
+    fi
+    mk="$r/etc/mkinitcpio.conf"
+    if sudo test -r "$mk" && sudo grep -q '/dev/mapper/' "$fst" 2>/dev/null; then
+        sudo grep '^HOOKS=' "$mk" | grep -q encrypt \
+            && ok "the initramfs is built with an encrypt hook" \
+            || bad "encrypted root but NO encrypt hook — it will not unlock"
+    fi
+
+    # ── the login path, which is where "it boots but I cannot get in" lives ─
+    users=$(sudo awk -F: '$3 >= 1000 && $3 < 65534 { print $1 " " $6 }' "$r/etc/passwd" 2>/dev/null)
+    if [ -z "$users" ]; then
+        bad "no ordinary user account exists"
+    else
+        printf '%s\n' "$users" | while read -r u h; do
+            [ -n "$u" ] || continue
+            if sudo test -d "$r$h"; then
+                cnt=$(sudo ls -A "$r$h" 2>/dev/null | wc -l)
+                if [ "$cnt" -gt 0 ]; then
+                    ok "home for $u exists ($cnt entries)"
+                else
+                    bad "home for $u is EMPTY — the login will loop with no message"
+                fi
+            else
+                bad "no home for $u at $h"
+            fi
+        done
+    fi
+    # A display manager with nothing to start is the exact shape of "SDDM comes
+    # up and the password does nothing".
+    dm=$(sudo sh -c "ls $r/etc/dinit.d/boot.d 2>/dev/null" | grep -iE 'sddm|lightdm|gdm|greetd' | head -1)
+    ses=$(sudo sh -c "ls $r/usr/share/xsessions $r/usr/share/wayland-sessions 2>/dev/null" | grep -c '\.desktop$' || true)
+    if [ -n "$dm" ]; then
+        if [ "${ses:-0}" -gt 0 ]; then
+            ok "login manager ($dm) and $ses session(s) to offer"
+        else
+            bad "login manager ($dm) is enabled but there is NO session to start"
+        fi
+    elif [ "${ses:-0}" -gt 0 ]; then
+        skip "sessions exist but no display manager is enabled (console login)"
+    else
+        skip "no desktop installed — console only"
+    fi
+}
+
+# WHAT IS ON THE ESP, which is the other half of "does it boot".
+#
+# Run against the ESP mounted read-only. The bootloader-id matters as much as
+# the files: a repair that installs under a NEW name leaves the firmware
+# pointing at the old, broken entry, and everything else here would still pass.
+report_esp() {
+    e="$1"
+    say "on the EFI system partition"
+    # DIRECTORIES ONLY. `ls` also listed artix-tui-layout.conf, a file this
+    # installer drops beside them, and the count then reported "more than one
+    # entry" on a perfectly normal ESP — a false alarm on the very check meant
+    # to catch a repair that added a second entry.
+    ids=$(sudo sh -c "find $e/EFI -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null" \
+          | grep -viE '^(boot|microsoft|tools)$' || true)
+    if [ -n "$ids" ]; then
+        ok "firmware entry director(y|ies): $(printf '%s' "$ids" | tr '\n' ' ')"
+        [ "$(printf '%s\n' "$ids" | wc -l)" -gt 1 ] \
+            && bad "MORE THAN ONE — a repair added a second entry instead of restoring the first"
+    else
+        bad "no bootloader directory on the ESP at all"
+    fi
+    sudo sh -c "find $e/EFI -iname '*.efi' 2>/dev/null" | grep -q . \
+        && ok "at least one .efi binary is present" \
+        || bad "no .efi binary anywhere on the ESP — nothing for the firmware to load"
+    # The kernels, when the ESP is what /boot is. Reported here so that "no
+    # kernel in the root" above has an answer rather than a shrug.
+    sudo sh -c "ls $e/vmlinuz-* >/dev/null 2>&1" \
+        && ok "kernel(s) on the ESP: $(sudo sh -c "ls -1 $e/vmlinuz-* 2>/dev/null" | xargs -n1 basename | tr '\n' ' ')" \
+        || skip "no kernel on the ESP (expected when /boot is a separate partition)"
+    sudo test -f "$e/EFI/BOOT/BOOTX64.EFI" \
+        && ok "the removable fallback is in place" \
+        || skip "no \\EFI\\BOOT\\BOOTX64.EFI (only needed if the NVRAM entry is lost)"
+    for f in artix-tui-layout.conf artix-test-install.log; do
+        sudo test -r "$e/$f" && ok "$f is on the ESP"
     done
-    sudo awk '!/^#/ && NF>=2 && $2 == "/"' "$r/etc/fstab" | grep -q . \
-        && ok "fstab names a root" || bad "fstab has NO root line"
-    sudo awk '!/^#/ && $2 == "/home"' "$r/etc/fstab" | grep -q . \
-        && ok "fstab mounts a separate /home" \
-        || skip "no /home line in fstab (only a problem if you planned one)"
 }
 
 fails=0

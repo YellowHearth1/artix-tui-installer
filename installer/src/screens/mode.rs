@@ -24,15 +24,67 @@ use ratatui::{
 /// system just written, and the only ways out were `q` on the first screen and
 /// the power button. In a VM it matters more, because the ISO is still the boot
 /// device and the firmware has to be reached to change that.
-const ITEMS: [&str; 7] = [
-    "mode.install",
-    "mode.recovery",
-    "mode.wifitest",
-    "mode.tbw",
-    "mode.font",
-    "mode.reboot",
-    "mode.firmware",
-];
+/// One row of the mode menu, as a THING rather than a number.
+///
+/// It was an array of keys matched by index in `handle_key` — `if cursor == 4`.
+/// That already cost one bug (a hardcoded bound made everything past the fifth
+/// row unreachable), and it makes an optional row impossible: hiding one would
+/// silently renumber every row after it. Now the list is built for the build,
+/// and each row says what it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+// The two developer rows are not built into a release, so their variants are
+// unconstructed there. Kept in the enum regardless: one list of what a mode row
+// can be, whatever this build offers, is easier to read than two.
+#[cfg_attr(not(feature = "devtools"), allow(dead_code))]
+pub(crate) enum Item {
+    Install,
+    Recovery,
+    WifiTest,
+    Tbw,
+    Font,
+    Reboot,
+    Firmware,
+    Test,
+}
+
+impl Item {
+    fn key(self) -> &'static str {
+        match self {
+            Item::Install => "mode.install",
+            Item::Recovery => "mode.recovery",
+            Item::WifiTest => "mode.wifitest",
+            Item::Tbw => "mode.tbw",
+            Item::Font => "mode.font",
+            Item::Reboot => "mode.reboot",
+            Item::Firmware => "mode.firmware",
+            Item::Test => "mode.test",
+        }
+    }
+}
+
+/// The rows this build actually offers.
+///
+/// The Wi-Fi simulator and the deliberate-breakage "Test" row exist to test
+/// THIS INSTALLER and are compiled in only under the `devtools` feature. A
+/// published build has neither: one is noise to somebody installing Artix, and
+/// the other ends a real install by wrecking it.
+pub(crate) fn items() -> Vec<Item> {
+    let mut v = vec![Item::Install, Item::Recovery];
+    #[cfg(feature = "devtools")]
+    v.push(Item::WifiTest);
+    // Drive wear stays in every build: reading a disk's SMART write total is
+    // something a person choosing where to install genuinely wants.
+    v.push(Item::Tbw);
+    v.extend([Item::Font, Item::Reboot, Item::Firmware]);
+    #[cfg(feature = "devtools")]
+    v.push(Item::Test);
+    v
+}
+
+/// What "Test" will break, in the order the strip cycles.
+#[cfg(feature = "devtools")]
+pub(crate) const TEST_SCENARIOS: [&str; 3] =
+    ["mode.test_fstab", "mode.test_boot", "mode.test_both"];
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
@@ -53,10 +105,35 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         rows[0],
     );
 
-    let items: Vec<String> = ITEMS
+    let rows_list = items();
+    let labels: Vec<String> = rows_list
         .iter()
-        .map(|k| format!("  {}", t(app.lang, k)))
+        .map(|it| {
+            #[cfg(feature = "devtools")]
+            if *it == Item::Test {
+                // The chosen sabotage is spelled out on the row itself, with the
+                // alternatives beside it — the same reveal strip the partition
+                // editor uses, and for the same reason: a switch must not hide
+                // what it switches to. Doubly so here, where the choice decides
+                // which way the machine will be broken.
+                let strip: Vec<String> = TEST_SCENARIOS
+                    .iter()
+                    .enumerate()
+                    .map(|(j, sk)| {
+                        let name = t(app.lang, sk);
+                        if j == app.test_scenario {
+                            format!("<{name}>")
+                        } else {
+                            name
+                        }
+                    })
+                    .collect();
+                return format!("  {}  {}", t(app.lang, it.key()), strip.join(" \u{b7} "));
+            }
+            format!("  {}", t(app.lang, it.key()))
+        })
         .collect();
+    let items = labels;
     widgets::select_list_scrolled(f, rows[1], &items, app.mode_cursor, app.marquee);
 
     widgets::action_row(
@@ -70,74 +147,96 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    let rows_list = items();
+    let cur = rows_list
+        .get(app.mode_cursor)
+        .copied()
+        .unwrap_or(Item::Install);
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.mode_cursor = app.mode_cursor.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
-            app.mode_cursor = (app.mode_cursor + 1).min(ITEMS.len() - 1)
+            app.mode_cursor = (app.mode_cursor + 1).min(rows_list.len() - 1)
         }
-        KeyCode::Enter => {
-            if app.mode_cursor == 0 {
-                // Install: enter the normal flow at its first post-language
-                // step — whichever that IS.
-                //
-                // This named Timezone outright, and naming it was a trap: moving
-                // the keyboard step ahead of the timezone would have made this
-                // jump straight over it, so choosing "Install" from the menu
-                // silently skipped the layout while stepping back from Timezone
-                // still reached it. A wizard whose first step depends on how you
-                // entered it is a wizard with two different orders.
+        // The sabotage picker rides on its own row, like every other reveal
+        // strip in this installer: the choice is visible instead of hidden
+        // behind a key nobody thinks to press.
+        #[cfg(feature = "devtools")]
+        KeyCode::Left | KeyCode::Right if cur == Item::Test => {
+            let n = TEST_SCENARIOS.len();
+            app.test_scenario = if matches!(key.code, KeyCode::Right) {
+                (app.test_scenario + 1) % n
+            } else {
+                (app.test_scenario + n - 1) % n
+            };
+        }
+        KeyCode::Enter => match cur {
+            // Install: enter the normal flow at its first post-language step —
+            // whichever that IS.
+            //
+            // This named Timezone outright, and naming it was a trap: moving the
+            // keyboard step ahead of the timezone would have made this jump
+            // straight over it, so choosing "Install" from the menu silently
+            // skipped the layout while stepping back from Timezone still reached
+            // it. A wizard whose first step depends on how you entered it is a
+            // wizard with two different orders.
+            Item::Install => {
+                app.test_mode = false;
                 app.goto(Screen::ALL[1]);
-            } else if app.mode_cursor == 2 {
-                // Wi-Fi test: bring up a simulated radio + access point so the
-                // network screen can be exercised inside a VM with no wireless
-                // hardware. Harmless elsewhere (the module just won't load).
+            }
+            // A NORMAL INSTALL that ends by breaking one specific thing, so what
+            // comes out is a genuine system in a known-bad state — which is what
+            // recovery has to be tested against.
+            Item::Test => {
+                app.cursor = 0;
+                app.goto(Screen::TestMenu);
+            }
+            Item::Recovery => app.goto(Screen::Recovery),
+            // Wi-Fi test: bring up a simulated radio + access point so the
+            // network screen can be exercised inside a VM with no wireless
+            // hardware. Harmless elsewhere (the module just won't load).
+            Item::WifiTest => {
                 app.wifitest_log.clear();
                 app.wifitest_running = false;
                 app.goto(Screen::WifiTest);
-            } else if app.mode_cursor == 4 {
-                // Console font: a bare TTY is this installer's first target, and
-                // there the font decides whether the interface is legible at
-                // all. Lands on the font currently in use.
+            }
+            // Drive wear (TBW): read each disk's SMART write total. The scan is
+            // kicked off lazily the first time the screen draws.
+            Item::Tbw => {
+                app.tbwtest_scanned = false;
+                app.tbwtest_running = false;
+                app.tbwtest_rows.clear();
+                app.goto(Screen::TbwTest);
+            }
+            // Console font: a bare TTY is this installer's first target, and
+            // there the font decides whether the interface is legible at all.
+            // Lands on the font currently in use.
+            Item::Font => {
                 let (fam, size) = crate::screens::fontpick::position_of(&app.config.console_font);
                 app.font_family = fam;
                 app.font_size_idx = size;
                 app.font_focus = 0;
                 app.goto(Screen::FontPick);
-            } else if app.mode_cursor == 3 {
-                // Drive wear (TBW): read each disk's SMART write total. The scan
-                // is kicked off lazily the first time the screen draws.
-                app.tbwtest_scanned = false;
-                app.tbwtest_running = false;
-                app.tbwtest_rows.clear();
-                app.goto(Screen::TbwTest);
-            } else if app.mode_cursor == 5 {
-                // Reboot. The confirmation is the menu itself: this entry does
-                // nothing that a power button would not, and it is reached only
-                // by choosing it deliberately from a five-item list.
+            }
+            // Reboot. The confirmation is the menu itself: this entry does
+            // nothing a power button would not.
+            Item::Reboot => {
                 app.pending_reboot = true;
                 app.should_quit = true;
-            } else if app.mode_cursor == 6 {
-                // Into the firmware. `efibootmgr` cannot ask for this, and the
-                // kernel can: a reboot flagged with the EFI "boot to firmware
-                // setup" bit lands in the BIOS/UEFI menu instead of booting.
-                // On a BIOS machine there is no such bit, so it degrades to an
-                // ordinary reboot and says so.
+            }
+            // Into the firmware. `efibootmgr` cannot ask for this and the kernel
+            // can: a reboot flagged with the EFI "boot to firmware setup" bit
+            // lands in the BIOS/UEFI menu. On a BIOS machine there is no such
+            // bit, so it degrades to an ordinary reboot and says so.
+            Item::Firmware => {
                 app.pending_firmware = true;
                 app.should_quit = true;
-            } else {
-                // Recovery: jump to the recovery tool and start a fresh scan.
-                app.recovery_focus = 0;
-                app.recovery_unlock = 0;
-                app.recovery_passphrase.clear();
-                app.recovery_status.clear();
-                app.recovery_mounted = false;
-                app.goto(Screen::Recovery);
             }
-        }
-        KeyCode::Esc => {
-            // Back to the language screen.
-            app.goto(Screen::Language);
-        }
+        },
+        // Esc leaves the menu for the language screen — the one place in this
+        // installer where quitting is offered. The mode menu is off the linear
+        // wizard, so the global handler deliberately does not move it; this
+        // screen owns its own way back, and a guard test checks that it has one.
+        KeyCode::Esc => app.goto(Screen::Language),
         _ => {}
     }
 }
@@ -163,16 +262,16 @@ mod tests {
     fn the_cursor_reaches_the_last_menu_item() {
         let mut app = App::new();
         app.mode_cursor = 0;
-        for _ in 0..ITEMS.len() * 2 {
+        for _ in 0..items().len() * 2 {
             handle_key(&mut app, KeyEvent::from(KeyCode::Down));
         }
         assert_eq!(
             app.mode_cursor,
-            ITEMS.len() - 1,
+            items().len() - 1,
             "the cursor cannot reach the bottom of the menu"
         );
         // And back up again, all the way.
-        for _ in 0..ITEMS.len() * 2 {
+        for _ in 0..items().len() * 2 {
             handle_key(&mut app, KeyEvent::from(KeyCode::Up));
         }
         assert_eq!(app.mode_cursor, 0);

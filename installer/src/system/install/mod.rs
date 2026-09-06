@@ -415,6 +415,25 @@ pub fn build_plan(app: &App) -> Vec<Action> {
         }
     }
     let home_on_extra_disk = c.extra_disks.iter().any(|d| d.mountpoint == "/home");
+    // WRITE DOWN WHAT IS ON THE DISK BEFORE DESTROYING IT — see
+    // `plan_prune_stale_boot_entries`. Every partition's GUID, taken while they
+    // still exist, is what lets the firmware's leftover boot entries be told
+    // apart afterwards: an entry naming a GUID that this install erased can
+    // never boot again, and one naming a GUID that is still there belongs to
+    // somebody and is not ours to remove.
+    if c.boot_mode.is_uefi() && !c.disk.is_empty() {
+        plan.push(act(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "lsblk -no PARTUUID {disk} 2>/dev/null | tr 'A-F' 'a-f' \
+                     | grep -v '^[[:space:]]*$' | sort -u > /tmp/artix-old-partuuids; true",
+                    disk = c.disk
+                ),
+            ],
+        ));
+    }
     if manual {
         plan.extend(disk::build_manual_plan(c, home_on_extra_disk, luks_pass));
     } else {
@@ -1298,7 +1317,293 @@ pub fn build_plan(app: &App) -> Vec<Action> {
     // 13) A record of how this system was actually laid out, for recovery.
     plan_install_manifest(&mut plan, c);
 
+    // 13a) Tidy the firmware's boot menu of entries this install just orphaned.
+    plan_prune_stale_boot_entries(&mut plan, c);
+
+    // 14) TEST MODE: break the finished system on purpose, one named way.
+    plan_sabotage(&mut plan, app);
+
     plan
+}
+
+/// Break the just-installed system, deliberately, for testing recovery.
+///
+/// Recovery is the part of this installer that only matters on the worst day,
+/// and until now the only way to exercise it was to wait for a real accident —
+/// which is how it shipped with a bootloader repair that had never once put a
+/// bootloader back. This produces the same broken states on demand, on a real
+/// install, so the repairs can be run against something genuine.
+///
+/// It is reachable ONLY from the "Test" row of the mode menu, whose label says
+/// in plain words that it breaks the system, and it runs as the very last step,
+/// after a complete and otherwise normal install. Nothing here can fire during
+/// an ordinary run: `test_scenario` is only consulted when that row started it.
+/// Where the test service goes, and what it says about itself.
+///
+/// It is loudly labelled — in its own name, in a comment, and in the message it
+/// prints — because the one thing worse than a machine that will not boot is
+/// one whose owner cannot tell why. Anyone who finds this on a system and
+/// wonders what it is has the answer in the file.
+///
+/// WHY IT DOES NOT SIMPLY HANG. The first version was a scripted service that
+/// slept forever with `before = local.target`, on the reasoning that dinit
+/// would then hold the boot. It did not, and the machine came up perfectly —
+/// reported from a real run, and the man page says why:
+///
+///     before: When starting the named service, IF THIS SERVICE IS ALSO
+///     STARTING, wait for this service to finish starting …
+///
+/// `before` is an ORDERING, not a dependency, and it only bites while our
+/// service happens to be starting. On a real boot `local.target` won that race
+/// and everything carried on. It is a genuine way for a hand-written service to
+/// break a boot — and it is a COIN TOSS, which makes it useless as a test.
+///
+/// So the service keeps the login DOWN instead of trying to hold the boot up:
+/// while it runs, sddm and the ttys are stopped as fast as they appear. That
+/// cannot race — whoever starts first, the result is the same — and it is
+/// undone by exactly the thing under test, removing the boot.d entry.
+const TEST_HANG_PATH: &str = "/mnt/etc/dinit.d/test-hang";
+const TEST_HANG_SERVICE: &str = "# artix-tui TEST SERVICE - deliberately makes this machine unusable.\n\
+     #\n\
+     # While it runs it stops the login (sddm and the ttys) as fast as they come\n\
+     # up, so the machine boots and never lets anybody in. Written by the\n\
+     # installer's test menu to try recovery's dinit service list. Nothing is\n\
+     # deleted and nothing is configured: stop enabling it and the login is back.\n\
+     #\n\
+     # From the ISO:  Recovery -> mount -> \"Disable dinit services\" -> test-hang\n\
+     # By hand:       rm /etc/dinit.d/boot.d/test-hang\n\
+     type          = scripted\n\
+     command       = /bin/sh -c 'while :; do for s in sddm greetd lightdm $(ls /etc/dinit.d/boot.d 2>/dev/null | grep \"^getty\"); do dinitctl --force stop \"$s\" >/dev/null 2>&1; done; sleep 2; done'\n\
+     start-timeout = 0\n\
+     before        = local.target\n";
+
+/// Take the fstab away — AND SAY WHAT THAT ACTUALLY COSTS ON THIS MACHINE.
+///
+/// This used to end with "reboot: it should fail", which is wrong on most
+/// layouts and cost a tester an evening. NOTHING MOUNTS THE ROOT FROM fstab:
+/// the kernel command line carries `root=UUID=`, the initramfs acts on it, and
+/// /etc/fstab is not read until the system is already up. On a root + ESP +
+/// swap layout its loss is therefore SILENT — no swap, an unmounted ESP, and a
+/// machine that looks perfectly well until the next kernel update has nowhere
+/// to write.
+///
+/// Where it does stop a boot is where fstab carries something the startup needs
+/// — a btrfs `@log` for /var/log (dinit services cannot open their logs and the
+/// session never appears), or a /home on another disk (the login screen loops).
+/// So the script reads the fstab it is about to remove and says which of the
+/// two this is, rather than promising a failure that will not come.
+const BREAK_FSTAB_SH: &str = "#!/bin/sh\n\
+     # Test aid: moves /etc/fstab aside, keeping a copy. Run as root.\n\
+     set -e\n\
+     [ \"$(id -u)\" = 0 ] || { echo 'run me as root: sudo ~/break-fstab.sh'; exit 1; }\n\
+     [ -f /etc/fstab ] || { echo '!! There is no /etc/fstab to remove.'; exit 1; }\n\
+     echo '>>> This is what it says now:'\n\
+     sed 's/^/      /' /etc/fstab\n\
+     critical=$(awk '!/^#/ && NF>=2 && ($2 == \"/var/log\" || $2 == \"/home\" || $2 == \"/usr\" || $2 == \"/var\") {print $2}' /etc/fstab | tr '\\n' ' ')\n\
+     lost=$(awk '!/^#/ && NF>=3 && $2 != \"/\" { print ($3 == \"swap\" ? \"swap\" : $2) }' /etc/fstab | tr '\\n' ' ')\n\
+     mv /etc/fstab /etc/fstab.test-backup\n\
+     echo\n\
+     echo '>>> /etc/fstab moved aside (kept as /etc/fstab.test-backup).'\n\
+     echo\n\
+     if [ -n \"$critical\" ]; then\n\
+     \x20   echo '>>> This layout keeps something the startup NEEDS in fstab:'\n\
+     \x20   echo \">>>    $critical\"\n\
+     \x20   echo '>>> Expect the next boot NOT to reach a login prompt.'\n\
+     else\n\
+     \x20   echo '>>> EXPECT THIS MACHINE TO BOOT ANYWAY, and that is the point.'\n\
+     \x20   echo '>>> Nothing mounts the root from fstab: the kernel command line'\n\
+     \x20   echo '>>> carries root=UUID= and the initramfs acts on it long before'\n\
+     \x20   echo '>>> anything reads /etc/fstab. What you lose is everything ELSE:'\n\
+     \x20   echo \">>>    $lost\"\n\
+     \x20   echo '>>> After the reboot, check the damage:'\n\
+     \x20   echo '>>>    swapon --show      (should be empty)'\n\
+     \x20   echo '>>>    ls /boot/efi       (should be empty)'\n\
+     \x20   echo '>>> Then boot the ISO and use Recovery: the diagnosis must say'\n\
+     \x20   echo '>>> the fstab is gone, and the repair must put it back.'\n\
+     fi\n";
+
+/// The same thing, as a script the tester runs after seeing the system work.
+const BREAK_SERVICE_SH: &str = "#!/bin/sh\n\
+     # Test aid: enables a dinit service that never finishes starting, which\n\
+     # holds the next boot indefinitely. Run as root.\n\
+     set -e\n\
+     [ \"$(id -u)\" = 0 ] || { echo 'run me as root: sudo ~/break-service.sh'; exit 1; }\n\
+     cat > /etc/dinit.d/test-hang <<'EOF'\n\
+     # artix-tui TEST SERVICE - stops the login while it runs. Safe to delete.\n\
+     type          = scripted\n\
+     command       = /bin/sh -c 'while :; do for s in sddm greetd lightdm $(ls /etc/dinit.d/boot.d 2>/dev/null | grep \"^getty\"); do dinitctl --force stop \"$s\" >/dev/null 2>&1; done; sleep 2; done'\n\
+     start-timeout = 0\n\
+     before        = local.target\n\
+     EOF\n\
+     mkdir -p /etc/dinit.d/boot.d\n\
+     ln -sf /etc/dinit.d/test-hang /etc/dinit.d/boot.d/test-hang\n\
+     echo '>>> test-hang is now enabled at boot.'\n\
+     echo '>>> Note the time: recovery lists services NEWEST FIRST, so it should'\n\
+     echo '>>> be at the top of that list.'\n\
+     echo '>>> Reboot: the machine will come up and let NOBODY in - no desktop,'\n\
+     echo '>>> no tty login. That is the failure this scenario is for.'\n";
+
+fn plan_sabotage(plan: &mut Vec<Action>, app: &App) {
+    if !app.test_mode {
+        return;
+    }
+    let (break_fstab, break_boot) = match app.test_scenario {
+        0 => (true, false),
+        1 => (false, true),
+        3 => (false, false), // the service scenario breaks neither of these
+        _ => (true, true),
+    };
+    let break_service = app.test_scenario == 3;
+
+    // BREAKING IT AT THE END OF THE INSTALL PROVES ONLY HALF OF WHAT MATTERS.
+    //
+    // A machine that never booted and a machine broken after it booted look the
+    // same from the firmware menu, so an install that failed quietly is
+    // indistinguishable from a sabotage that worked. Leaving the scripts in the
+    // home directory instead means the tester logs in, SEES a working desktop,
+    // and only then breaks it — which proves the system was sound first, and
+    // makes "it did not come up" a fact rather than a guess.
+    //
+    // Nothing runs on its own: these are plain scripts, executed by hand.
+    if !app.test_break_now {
+        let home = format!("/mnt/home/{}", app.config.username);
+        if break_fstab {
+            plan.push(write_target_file(
+                &format!("{home}/break-fstab.sh"),
+                BREAK_FSTAB_SH,
+            ));
+        }
+        if break_boot {
+            plan.push(write_target_file(
+                &format!("{home}/break-bootloader.sh"),
+                "#!/bin/sh\n                 # Test aid: removes the EFI binaries and grub.cfg, KEEPING the\n                 # entry directory names so the repair has an id to reuse.\n                 set -e\n                 [ \"$(id -u)\" = 0 ] || { echo 'run me as root: sudo ~/break-bootloader.sh'; exit 1; }\n                 echo '>>> firmware entry name(s), remember them:'\n                 ls -1 /boot/efi/EFI /boot/EFI 2>/dev/null | sed 's/^/      /'\n                 find /boot/efi/EFI /boot/EFI -type f -iname '*.efi' -delete 2>/dev/null || true\n                 rm -f /boot/grub/grub.cfg\n                 echo '>>> EFI binaries and grub.cfg removed (names kept).'\n                 echo '>>> Reboot: the firmware should find nothing to load.'\n",
+            ));
+        }
+        if break_service {
+            plan.push(write_target_file(
+                &format!("{home}/break-service.sh"),
+                BREAK_SERVICE_SH,
+            ));
+        }
+        plan.push(chroot(&format!(
+            "chmod +x {h}/break-*.sh 2>/dev/null; chown -R {u}:{u} {h} 2>/dev/null; true",
+            h = format!("/home/{}", app.config.username),
+            u = app.config.username
+        )));
+        // NAME THE SCRIPTS THAT WERE ACTUALLY WRITTEN. This was a fixed line
+        // listing break-fstab.sh and break-bootloader.sh, so the scenario that
+        // breaks a dinit service finished by telling the tester about two
+        // scripts it had not written and never mentioning the one it had.
+        let mut wrote: Vec<&str> = Vec::new();
+        if break_fstab {
+            wrote.push("break-fstab.sh");
+        }
+        if break_boot {
+            wrote.push("break-bootloader.sh");
+        }
+        if break_service {
+            wrote.push("break-service.sh");
+        }
+        let listed = wrote
+            .iter()
+            .map(|f| format!("sudo ~/{f}"))
+            .collect::<Vec<_>>()
+            .join("   /   ");
+        plan.push(act(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "echo '>>> TEST MODE: the system is INSTALLED AND WORKING.'; \
+                     echo '>>> Log in, check the desktop, then break it yourself:'; \
+                     echo '>>>     {listed}'"
+                ),
+            ],
+        ));
+        return;
+    }
+    plan.push(act(
+        "sh",
+        &[
+            "-c",
+            "echo '>>> TEST MODE: breaking the installed system on purpose.'",
+        ],
+    ));
+    if break_fstab {
+        // MOVED, not shredded: the point is a system that will not boot, not a
+        // forensic exercise. The copy also lets a tester confirm afterwards that
+        // the repair rebuilt an equivalent file rather than the same one.
+        plan.push(act(
+            "sh",
+            &[
+                "-c",
+                "mv /mnt/etc/fstab /mnt/etc/fstab.test-backup &&                  echo '>>> /etc/fstab removed (kept as /etc/fstab.test-backup)'",
+            ],
+        ));
+    }
+    if break_boot {
+        // Both halves of "the bootloader is gone", because they fail
+        // differently: without the EFI binaries the firmware finds nothing to
+        // load, and without grub.cfg it loads GRUB into a bare rescue prompt.
+        plan.push(act(
+            "sh",
+            &[
+                "-c",
+                // THE DIRECTORY NAMES SURVIVE, the binaries do not. Wiping EFI/*
+                // outright also erases the entry name, and then the repair has
+                // nothing left to reuse — so a test could never tell "kept the
+                // existing id" from "hardcoded a new one", which is the fault it
+                // exists to catch. Removing the .efi payloads leaves a machine
+                // that will not boot and a name that can still be checked.
+                "find /mnt/boot/efi/EFI /mnt/boot/EFI -type f -iname '*.efi' -delete 2>/dev/null; \
+                 rm -f /mnt/boot/grub/grub.cfg 2>/dev/null; \
+                 echo '>>> EFI binaries and grub.cfg removed (entry names kept)'; true",
+            ],
+        ));
+    }
+    if break_service {
+        // A service that never finishes STARTING, enabled at boot. dinit waits
+        // for every entry in boot.d to start or fail before it carries on, so
+        // one that does neither holds the boot there — with `start-timeout = 0`
+        // it does not even give up after a minute. No login prompt, no desktop,
+        // nothing on the machine itself to fix it with, which is the whole
+        // point: the way back is the ISO.
+        plan.push(write_target_file(TEST_HANG_PATH, TEST_HANG_SERVICE));
+        plan.push(chroot(
+            "mkdir -p /etc/dinit.d/boot.d && \
+             ln -sf /etc/dinit.d/test-hang /etc/dinit.d/boot.d/test-hang && \
+             echo '>>> test-hang enabled in boot.d — this system will not finish booting'",
+        ));
+    }
+    // THE LOG GOES SOMEWHERE STILL READABLE AFTER THE BREAKAGE.
+    //
+    // The install log normally lands in the new user's home — inside the root
+    // filesystem, which on an encrypted install can only be read after
+    // unlocking and mounting the very system that no longer boots. Useless for
+    // exactly this. The ESP is vfat, unencrypted and readable from the host with
+    // a loop mount, so a copy goes there along with the layout as it stood.
+    plan.push(act(
+        "sh",
+        &[
+            "-c",
+            "esp=$(findmnt -no TARGET --submounts /mnt | grep -E '/boot(/efi)?$' | head -1); \
+             [ -n \"$esp\" ] || esp=/mnt/boot; \
+             { echo '# artix-tui TEST install'; \
+               date -u '+# finished: %Y-%m-%dT%H:%M:%SZ'; \
+               echo '# --- layout as installed ---'; \
+               findmnt -rno TARGET,SOURCE,FSTYPE --submounts /mnt; \
+               echo '# --- blkid ---'; blkid; } > \"$esp/artix-test-install.log\" 2>&1; \
+             cp /tmp/installer.log \"$esp/artix-test-installer.log\" 2>/dev/null; \
+             echo \">>> Test log written to $esp/artix-test-install.log\"; true",
+        ],
+    ));
+    plan.push(act(
+        "sh",
+        &[
+            "-c",
+            "echo '>>> The system is now broken as requested. Reboot, watch it fail,';              echo '>>> then boot this image again and use Recovery.'",
+        ],
+    ));
 }
 
 /// Leave a description of this install where recovery can find it later.
@@ -1327,6 +1632,77 @@ pub fn build_plan(app: &App) -> Vec<Action> {
 /// that was supposed to tell it what to mount. The ESP is vfat and unencrypted
 /// by definition, so it can be read before anything is unlocked, which is when
 /// the answer is actually needed.
+/// Remove the firmware boot entries this install just orphaned.
+///
+/// A REINSTALL WIPES THE DISK; IT DOES NOT WIPE THE FIRMWARE. UEFI boot entries
+/// live in the machine's NVRAM, and `wipefs` and `sgdisk --zap-all` know nothing
+/// about them — so every reinstall leaves the previous one's entry behind,
+/// pointing at a partition that no longer exists. On the test stand, where each
+/// run gets a deliberately random bootloader-id, they pile up one per install;
+/// on real hardware they accumulate more slowly and are just as dead. Reported
+/// as "why do the old ids stay in the BIOS — should a reinstall not be clean?"
+///
+/// WHAT IT WILL AND WILL NOT REMOVE. An entry names the partition it boots from
+/// by GUID: `HD(1,GPT,<partuuid>,…)/\EFI\name\grubx64.efi`. Two things must both
+/// be true before one is deleted:
+///
+///   * the GUID was on the target disk BEFORE this install (captured then), and
+///   * that GUID is gone NOW.
+///
+/// The first keeps it away from every other disk in the machine — a Windows
+/// entry, another distribution, a removable drive that is not plugged in. The
+/// second is what makes it safe on a dual-boot disk where only some partitions
+/// were replaced: a neighbour that survived keeps its GUID, so its entry is
+/// left alone. Our own new entry cannot match either test, because sgdisk gives
+/// the fresh ESP a GUID that did not exist when the list was taken.
+///
+/// Everything it removes, it names.
+fn plan_prune_stale_boot_entries(plan: &mut Vec<Action>, c: &InstallConfig) {
+    if !c.boot_mode.is_uefi() || c.disk.is_empty() {
+        return;
+    }
+    plan.push(act("sh", &["-c", PRUNE_BOOT_ENTRIES]));
+}
+
+/// The pruning itself. Three knobs, all defaulted, so the whole thing can be
+/// RUN against fixtures instead of only read — deleting firmware entries is not
+/// something to ship on the strength of a careful reading. Same trick as
+/// `FIXPERM_ROOT` in the permission repair.
+const PRUNE_BOOT_ENTRIES: &str = "\
+             OLD=${ARTIX_OLD_PARTUUIDS:-/tmp/artix-old-partuuids}; \
+             EBM=${ARTIX_EFIBOOTMGR:-efibootmgr}; \
+             LIVE=${ARTIX_LIVE_PARTUUIDS:-}; \
+             [ -n \"$ARTIX_EFIBOOTMGR\" ] || [ -d /sys/firmware/efi ] || exit 0; \
+             [ -s \"$OLD\" ] || exit 0; \
+             command -v \"$EBM\" >/dev/null 2>&1 || exit 0; \
+             if [ -z \"$LIVE\" ]; then \
+               LIVE=/tmp/artix-live-partuuids; \
+               lsblk -no PARTUUID 2>/dev/null | tr 'A-F' 'a-f' \
+                 | grep -v '^[[:space:]]*$' | sort -u > \"$LIVE\"; \
+             fi; \
+             echo '>>> Checking the firmware boot menu for entries this install orphaned.'; \
+             \"$EBM\" -v 2>/dev/null | tr 'A-F' 'a-f' \
+               | grep -E '^boot[0-9a-f]{4}' \
+               | while read -r line; do \
+                   num=$(printf '%s' \"$line\" | sed -n 's/^boot\\([0-9a-f]\\{4\\}\\).*/\\1/p'); \
+                   [ -n \"$num\" ] || continue; \
+                   while read -r u; do \
+                     [ -n \"$u\" ] || continue; \
+                     case \"$line\" in \
+                       *\"$u\"*) \
+                         if grep -qx \"$u\" \"$LIVE\"; then \
+                           continue; \
+                         fi; \
+                         echo \"      removing Boot$num - it pointed at a partition this install erased\"; \
+                         \"$EBM\" -q -B -b \"$num\" 2>/dev/null || true; \
+                         break ;; \
+                     esac; \
+                   done < \"$OLD\"; \
+                 done; \
+             echo '>>> The boot menu now:'; \
+             \"$EBM\" 2>/dev/null | sed 's/^/      /'; \
+             true";
+
 fn plan_install_manifest(plan: &mut Vec<Action>, c: &InstallConfig) {
     let version = env!("CARGO_PKG_VERSION");
     let scope = if c.encrypt_disk {
@@ -3006,6 +3382,35 @@ fn plan_memory_tuning(plan: &mut Vec<Action>, c: &InstallConfig) {
             frag.trim_end()
         )));
     }
+    // zram: a compressed block device used AS swap. The ALTERNATIVE to zswap,
+    // and the same sanitiser reason applies from the other side — stacking a
+    // compressed cache in front of a compressed device compresses every page
+    // twice and pays for both. The screen only lets one be chosen; this makes
+    // sure a flag that survived a change of mind cannot reintroduce the pair.
+    if c.zram && !(c.zswap && c.has_swap()) {
+        // NOTHING IS WRITTEN BY HAND HERE. `zramen` and `zramen-dinit` are in
+        // Artix's galaxy repo — the service description, its stop-command and
+        // its env-file all ship with the package — so the install adds the
+        // packages and sets three values. The service is picked up by the
+        // `-dinit` autoscan that enables every packaged service, the same way
+        // every other one on the system is.
+        //
+        // Appended rather than substituted: the shipped file is documentation
+        // with every value commented out, and it is worth keeping for whoever
+        // opens it later. dinit reads the env-file top to bottom, so the block
+        // at the end is what takes effect.
+        plan.push(chroot(&format!(
+            "mkdir -p /etc/dinit.d/config && \
+             sed -i '/# --- artix-tui ---/,$d' /etc/dinit.d/config/zramen.conf 2>/dev/null; \
+             {{ echo '# --- artix-tui ---'; \
+                echo 'ZRAM_COMP_ALGORITHM={algo}'; \
+                echo 'ZRAM_SIZE={pct}'; \
+                echo 'ZRAM_PRIORITY=32767'; \
+             }} >> /etc/dinit.d/config/zramen.conf",
+            algo = c.zram_compressor,
+            pct = c.zram_percent
+        )));
+    }
     if c.earlyoom {
         plan.push(write_target_file(
             "/mnt/etc/dinit.d/earlyoom",
@@ -3068,7 +3473,50 @@ fn plan_gpu_and_snapshots(plan: &mut Vec<Action>, c: &InstallConfig) {
 
 fn plan_fstab(plan: &mut Vec<Action>, c: &InstallConfig) {
     // 3) fstab.
-    plan.push(act("sh", &["-c", "fstabgen -U /mnt >> /mnt/etc/fstab"]));
+    // THE fstab IS CHECKED, NOT ASSUMED.
+    //
+    // Found on a finished xfs install: /etc/fstab was the 126-byte comments-only
+    // stub the `filesystem` package ships, with the package's own October
+    // timestamp — `fstabgen -U /mnt >> /mnt/etc/fstab` had appended NOTHING, in
+    // silence, with no error on stdout or stderr and nothing in the install log
+    // but the command line itself. The system still booted, because GRUB passes
+    // root=UUID= on the kernel command line, so the fault stayed invisible: no
+    // swap, no ESP mounted, and any extra disk missing — on a machine that looks
+    // fine.
+    //
+    // Why it produced nothing that run is still not known. That is exactly why
+    // this no longer takes its word for it: the step records the exit status and
+    // the line count, checks that the file names a root, and writes one itself
+    // from findmnt and blkid if it does not. The generator is the one the repair
+    // uses, which needs nothing but util-linux.
+    let fstab_step = format!(
+        "{gen}\n\
+         fstabgen -U /mnt >> /mnt/etc/fstab\n\
+         rc=$?\n\
+         n=$(awk '!/^#/ && NF>=2' /mnt/etc/fstab 2>/dev/null | wc -l)\n\
+         echo \">>> fstabgen exit=$rc, entries now: $n\"\n\
+         if ! awk '!/^#/ && NF>=2 && $2 == \"/\"' /mnt/etc/fstab 2>/dev/null | grep -q .; then\n\
+         \x20   echo '!! fstabgen produced no root entry. Writing the fstab here instead.'\n\
+         \x20   # REPLACED, not appended: half an fstab plus a whole one is a\n\
+         \x20   # file with the ESP in it twice, and the next boot mounts both.\n\
+         \x20   if gen_fstab > /mnt/etc/fstab.new && [ -s /mnt/etc/fstab.new ]; then\n\
+         \x20       mv /mnt/etc/fstab.new /mnt/etc/fstab\n\
+         \x20   else\n\
+         \x20       rm -f /mnt/etc/fstab.new\n\
+         \x20   fi\n\
+         fi\n\
+         if ! awk '!/^#/ && NF>=2 && $2 == \"/\"' /mnt/etc/fstab 2>/dev/null | grep -q .; then\n\
+         \x20   echo '!! STILL no root entry in /etc/fstab. The installed system will'\n\
+         \x20   echo '!! boot from the kernel command line, but nothing else will be'\n\
+         \x20   echo '!! mounted. Recovery can rebuild it: Test/Recovery -> Regenerate fstab.'\n\
+         else\n\
+         \x20   echo '>>> /etc/fstab:'\n\
+         \x20   sed 's/^/      /' /mnt/etc/fstab\n\
+         fi\n\
+         true",
+        gen = crate::system::recovery::fstab_gen_fn("/mnt")
+    );
+    plan.push(act("sh", &["-c", &fstab_step]));
 
     // Existing partitions the user chose to mount as-is (e.g. an NTFS Windows
     // volume to dual-boot with): add an fstab entry by UUID and create the
@@ -3548,17 +3996,7 @@ fn plan_bootloader(plan: &mut Vec<Action>, c: &InstallConfig, uefi: bool) {
                 // the user put the ESP at /boot/efi (small reused Windows ESP,
                 // kernels on root); full-disk encryption always splits it that
                 // way; otherwise the ESP is /boot.
-                let efi_dir = if c.partition_mode.is_manual_family() {
-                    if c.manual_esp_mount == "/boot/efi" {
-                        "/boot/efi"
-                    } else {
-                        "/boot"
-                    }
-                } else if c.encrypt_disk && c.encrypt_scope == "full" {
-                    "/boot/efi"
-                } else {
-                    "/boot"
-                };
+                let efi_dir = crate::system::disk::esp_mountpoint(c);
                 let base_id = c.bootloader_id.replace('\'', "");
                 // Our root's filesystem UUID, for the .artix-tui-owned marker.
                 // findmnt answers from the udev/blkid cache, which inside a
@@ -5103,6 +5541,82 @@ mod tests {
     ///
     /// Written in two places because nothing reads both — xorg.conf.d for X11
     /// and Xwayland, XKB_DEFAULT_* for wlroots compositors, which never look at
+    /// THE ESP GOES TO /boot/efi UNLESS THE ROOT IS ENCRYPTED.
+    ///
+    /// `/boot/efi` is the layout nearly every guide and tool assumes, and it
+    /// keeps the kernels and both microcodes off a 512 MiB FAT partition where
+    /// a second kernel runs it out of space. But with root-scope LUKS a /boot
+    /// inside the root is inside the encryption, and GRUB cannot read a kernel
+    /// from there without cryptodisk — so an encrypted install keeps the ESP AT
+    /// /boot. Two layouts, one condition, and the condition is not cosmetic.
+    #[test]
+    fn the_esp_lands_at_boot_efi_unless_the_root_is_encrypted() {
+        let mut a = install_app();
+        a.config.partition_mode = crate::app::PartitionMode::Auto;
+        a.config.boot_mode = crate::app::BootMode::Uefi;
+
+        a.config.encrypt_disk = false;
+        let plain = plan_text(&build_plan(&a));
+        assert!(
+            plain.contains("mkdir -p /mnt/boot/efi"),
+            "an unencrypted install did not put the ESP at /boot/efi"
+        );
+
+        a.config.encrypt_disk = true;
+        a.config.encrypt_scope = "root".into();
+        let enc = plan_text(&build_plan(&a));
+        assert!(
+            !enc.contains("mkdir -p /mnt/boot/efi"),
+            "an encrypted root put /boot inside the encryption — GRUB cannot \
+             read a kernel from there without cryptodisk"
+        );
+    }
+
+    /// TEST MODE BREAKS ONLY WHEN IT WAS ASKED TO, and an ordinary install can
+    /// never reach it.
+    ///
+    /// The flag and the scenario are deliberately two fields: a scenario left at
+    /// its default 0 must not mean "delete the fstab". Anything else would put a
+    /// destructive step one uninitialised value away from every install.
+    #[test]
+    fn the_test_sabotage_cannot_fire_during_a_normal_install() {
+        let mut a = install_app();
+        for scenario in 0..3 {
+            a.test_mode = false;
+            a.test_scenario = scenario;
+            let t = plan_text(&build_plan(&a));
+            assert!(
+                !t.contains("TEST MODE"),
+                "scenario {scenario} sabotaged an ordinary install"
+            );
+            assert!(!t.contains("fstab.test-backup"));
+        }
+
+        a.test_mode = true;
+        a.test_scenario = 0;
+        let t = plan_text(&build_plan(&a));
+        assert!(t.contains("fstab.test-backup"), "fstab was not removed");
+        assert!(
+            !t.contains("grub.cfg 2>/dev/null"),
+            "the fstab scenario also broke the bootloader"
+        );
+
+        a.test_scenario = 1;
+        let t = plan_text(&build_plan(&a));
+        assert!(t.contains("grub.cfg"), "the bootloader was not broken");
+        assert!(
+            !t.contains("fstab.test-backup"),
+            "the bootloader scenario also removed the fstab"
+        );
+
+        a.test_scenario = 2;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("fstab.test-backup") && t.contains("grub.cfg"),
+            "the combined scenario did not do both"
+        );
+    }
+
     /// A LATIN GROUP IS ADDED ONLY WHEN THERE IS NONE.
     ///
     /// Some applications (native Steam, a few Electron ones) read keycodes
@@ -5402,6 +5916,303 @@ mod tests {
         assert!(
             !t.contains("earlyoom"),
             "earlyoom appears in a plan that never asked for it"
+        );
+    }
+
+    /// The boot-menu tidy-up removes ONLY what this install killed.
+    ///
+    /// RUN, against fixtures, because the alternative is shipping a routine that
+    /// deletes firmware boot entries on the strength of a careful reading. The
+    /// fixture is the case that matters: our own dead entries, a Windows entry
+    /// on another disk, and a neighbour on the SAME disk whose partition
+    /// survived. Only the first two of those four may go.
+    #[test]
+    fn stale_boot_entries_go_and_everybody_elses_stay() {
+        let dir = std::env::temp_dir().join(format!("artix-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // What efibootmgr would say: two entries of ours pointing at partitions
+        // that are gone, Windows on another disk, and a neighbour that survived.
+        let menu = "BootCurrent: 0003\n\
+             Boot0000* Windows Boot Manager\tHD(1,GPT,aaaa1111-2222-3333-4444-555566667777,0x800,0x100000)/\\EFI\\Microsoft\\Boot\\bootmgfw.efi\n\
+             Boot000A* maple-ember71\tHD(1,GPT,dead0000-0000-0000-0000-000000000001,0x800,0x100000)/\\EFI\\maple-ember71\\grubx64.efi\n\
+             Boot000B* cedar-cedar58\tHD(1,GPT,dead0000-0000-0000-0000-000000000002,0x800,0x100000)/\\EFI\\cedar-cedar58\\grubx64.efi\n\
+             Boot000C* neighbour-artix\tHD(3,GPT,bbbb1111-2222-3333-4444-555566667777,0x800,0x100000)/\\EFI\\neighbour\\grubx64.efi\n";
+        std::fs::write(dir.join("menu.txt"), menu).unwrap();
+        // A mock efibootmgr: -v prints the menu, -B records the deletion.
+        let mock = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  -v) cat {d}/menu.txt ;;\n  \
+             -q) shift 3; echo \"$1\" >> {d}/deleted ;;\n  *) echo menu ;;\nesac\n",
+            d = dir.display()
+        );
+        let ebm = dir.join("efibootmgr");
+        std::fs::write(&ebm, mock).unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x", ebm.to_str().unwrap()])
+            .status()
+            .unwrap();
+
+        // Everything that was on the target disk before, and everything that
+        // exists now: the neighbour survived, our two did not.
+        std::fs::write(
+            dir.join("old"),
+            "dead0000-0000-0000-0000-000000000001\n\
+             dead0000-0000-0000-0000-000000000002\n\
+             bbbb1111-2222-3333-4444-555566667777\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("live"),
+            "bbbb1111-2222-3333-4444-555566667777\n\
+             aaaa1111-2222-3333-4444-555566667777\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new("sh")
+            .args(["-c", PRUNE_BOOT_ENTRIES])
+            .env("ARTIX_EFIBOOTMGR", &ebm)
+            .env("ARTIX_OLD_PARTUUIDS", dir.join("old"))
+            .env("ARTIX_LIVE_PARTUUIDS", dir.join("live"))
+            .output()
+            .expect("run the prune step");
+        assert!(
+            out.status.success(),
+            "the step failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deleted = std::fs::read_to_string(dir.join("deleted")).unwrap_or_default();
+        let gone: Vec<&str> = deleted.split_whitespace().collect();
+        assert!(
+            gone.contains(&"000a") && gone.contains(&"000b"),
+            "the entries this install orphaned were left in the menu: {deleted:?}"
+        );
+        assert!(
+            !gone.contains(&"0000"),
+            "it deleted the Windows entry — that partition is on another disk \
+             and was never ours: {deleted:?}"
+        );
+        assert!(
+            !gone.contains(&"000c"),
+            "it deleted a neighbour whose partition SURVIVED this install — the \
+             one mistake that destroys somebody else's boot: {deleted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A test aid must not promise a failure that cannot happen.
+    ///
+    /// "Reboot: it should fail" is what this script used to end with, and on a
+    /// root + ESP + swap layout that is simply untrue: NOTHING MOUNTS THE ROOT
+    /// FROM fstab. The kernel command line carries `root=UUID=`, the initramfs
+    /// acts on it, and /etc/fstab is not read until the system is already up.
+    /// The tester removed the file, the machine booted, and the only reasonable
+    /// conclusion from the instructions was that the tool was broken — which
+    /// cost an evening and was my fault, not theirs.
+    ///
+    /// So the script now READS the fstab before removing it and says which of
+    /// the two cases this machine is: a layout whose startup needs something in
+    /// there (a btrfs @log for /var/log, a /home on another disk) and will not
+    /// reach a login prompt, or a simple one that will boot with silent damage —
+    /// and then names the damage and how to see it.
+    #[test]
+    fn the_fstab_test_aid_says_what_will_actually_happen() {
+        assert!(
+            !BREAK_FSTAB_SH.contains("it should fail"),
+            "the script still promises a failure that most layouts will not have"
+        );
+        assert!(
+            BREAK_FSTAB_SH.contains("EXPECT THIS MACHINE TO BOOT ANYWAY"),
+            "the ordinary case — booting with silent damage — must be stated"
+        );
+        assert!(
+            BREAK_FSTAB_SH.contains("/var/log") && BREAK_FSTAB_SH.contains("/home"),
+            "the layouts where it DOES stop the boot have to be recognised"
+        );
+        assert!(
+            BREAK_FSTAB_SH.contains("swapon --show") && BREAK_FSTAB_SH.contains("ls /boot/efi"),
+            "silent damage needs a way to be seen, or the run proves nothing"
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", BREAK_FSTAB_SH])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "break-fstab.sh is not valid sh:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// THE INSTALL CHECKS ITS OWN fstab, because one of them shipped empty.
+    ///
+    /// Found on a finished xfs install: /etc/fstab was the 126-byte
+    /// comments-only stub from the `filesystem` package, carrying the package's
+    /// own October timestamp — `fstabgen -U /mnt >> /mnt/etc/fstab` had appended
+    /// nothing at all, and said nothing about it on either stream. The machine
+    /// booted anyway, because GRUB passes root=UUID= on the command line, so
+    /// nothing about it looked wrong: no swap, no mounted ESP, and any extra
+    /// disk simply absent.
+    ///
+    /// Why fstabgen was silent that run is still unknown, and that is the point
+    /// of this: the step now records what it did, checks the file names a root,
+    /// and writes one itself if it does not.
+    #[test]
+    fn the_install_verifies_the_fstab_it_just_generated() {
+        let t = plan_text(&build_plan(&install_app()));
+        assert!(
+            t.contains("fstabgen -U /mnt >> /mnt/etc/fstab"),
+            "Artix's own tool is still the one asked first:\n{t}"
+        );
+        assert!(
+            t.contains("fstabgen exit=$rc"),
+            "the exit status has to reach the log — its silence is the whole \
+             reason this check exists"
+        );
+        assert!(
+            t.contains("gen_fstab > /mnt/etc/fstab.new"),
+            "there is no fallback: an empty fstab would ship again"
+        );
+        assert!(
+            t.contains("mv /mnt/etc/fstab.new /mnt/etc/fstab"),
+            "the fallback must REPLACE the file, not append to a partial one"
+        );
+        // And the fallback is aimed at the target, not at the live system.
+        assert!(
+            t.contains("-R /mnt") && t.contains("pfx=\"/mnt\""),
+            "the generator would describe the ISO's own mounts:\n{t}"
+        );
+    }
+
+    /// The service scenario breaks the boot the way a real one does.
+    ///
+    /// Not by removing a file — by adding a service that never finishes
+    /// starting, which is the failure the author keeps meeting and the one thing
+    /// no other scenario produces: a machine with nothing wrong on disk that
+    /// still never reaches a login prompt.
+    ///
+    /// `start-timeout = 0` is the load-bearing line. dinit gives a scripted
+    /// service sixty seconds by default and then gives up — which would make
+    /// this a one-minute pause rather than a broken boot, and a test that has
+    /// to be watched closely to see whether it worked is not one.
+    #[test]
+    fn the_service_scenario_installs_something_that_actually_holds_the_boot() {
+        let mut a = install_app();
+        a.test_mode = true;
+        a.test_scenario = 3;
+        a.test_break_now = true;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("start-timeout = 0"),
+            "without this dinit gives up after a minute and the boot continues:\n{t}"
+        );
+        // THE BREAK MUST NOT BE A RACE. `before` is an ordering that only bites
+        // while this service happens to be starting — on a real boot the login
+        // path won that race and the machine came up perfectly, which made the
+        // scenario worthless. What the service does while it RUNS is what makes
+        // the machine unusable, and that cannot be lost to timing.
+        assert!(
+            t.contains("dinitctl --force stop") && t.contains("sddm"),
+            "the scenario is back to hoping it wins a race with the login:\n{t}"
+        );
+        assert!(
+            t.contains("/etc/dinit.d/boot.d/test-hang"),
+            "the service was written but never enabled, so it would never run:\n{t}"
+        );
+        assert!(
+            !t.contains("fstab.test-backup") && !t.contains("iname '*.efi' -delete"),
+            "the service scenario must break ONLY the service — otherwise the \
+             repair being tested cannot be told apart from the other two:\n{t}"
+        );
+
+        // And as a script in the home directory, for the default order of
+        // events: see it work, then break it yourself.
+        let mut a = install_app();
+        a.test_mode = true;
+        a.test_scenario = 3;
+        a.test_break_now = false;
+        let t = plan_text(&build_plan(&a));
+        assert!(t.contains("break-service.sh"), "no script to run:\n{t}");
+        // And the closing message must NAME it. It used to list two scripts
+        // this scenario never writes and stay silent about the one it does, so
+        // the tester logged in, saw a working desktop, and had no idea what to
+        // run — which is exactly how a scenario gets reported as "does nothing".
+        assert!(
+            t.contains("sudo ~/break-service.sh"),
+            "the install finishes without telling anyone how to trigger it:\n{t}"
+        );
+        assert!(
+            !t.contains("sudo ~/break-fstab.sh"),
+            "it names a script this scenario never wrote:\n{t}"
+        );
+
+        // Both are shell that has to survive being read by /bin/sh — the
+        // heredoc in particular, whose terminator must sit at column 0 after
+        // Rust has eaten the line continuations.
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", BREAK_SERVICE_SH])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "break-service.sh is not valid sh:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            TEST_HANG_SERVICE
+                .lines()
+                .any(|l| l.starts_with("type") && l.contains("scripted")),
+            "dinit reads this file key by key; a stray indent changes what it means:\n\
+             {TEST_HANG_SERVICE}"
+        );
+    }
+
+    /// zram is packaged, not written here — and it is never zswap's companion.
+    ///
+    /// The tool exists in Artix's own galaxy repo (`zramen`) with its dinit
+    /// service beside it (`zramen-dinit`), so the install adds two packages and
+    /// three config values. BOTH packages, because the tool alone installs and
+    /// never runs — the same trap earlyoom fell into, where a systemd unit was
+    /// the only thing shipped and nothing on this system reads those.
+    ///
+    /// The pair is the other half: a compressed cache in front of a compressed
+    /// device compresses every page twice. The screen cannot express that, and
+    /// this makes sure a flag left behind by a change of mind cannot either.
+    #[test]
+    fn zram_is_the_packaged_alternative_to_zswap_and_never_its_companion() {
+        let mut a = install_app();
+        a.config.zram = true;
+        a.config.zram_compressor = "lzo-rle".into();
+        a.config.zram_percent = 150;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            t.contains("zramen") && t.contains("zramen-dinit"),
+            "the tool and its service must BOTH be installed:\n{t}"
+        );
+        assert!(
+            t.contains("ZRAM_COMP_ALGORITHM=lzo-rle") && t.contains("ZRAM_SIZE=150"),
+            "the chosen values never reached zramen's config:\n{t}"
+        );
+        assert!(
+            t.contains("/etc/dinit.d/config/zramen.conf"),
+            "the config was written somewhere the service does not read:\n{t}"
+        );
+        assert!(
+            !t.contains("zswap.enabled=1"),
+            "zram was chosen and zswap came along anyway:\n{t}"
+        );
+
+        // Both flags set — which the screen cannot produce, but a changed
+        // layout could leave behind. zswap keeps its place in front of a real
+        // swap partition; zram's config is not also written.
+        let mut a = install_app();
+        a.config.zram = true;
+        a.config.zswap = true;
+        a.config.swap_gib = 4;
+        let t = plan_text(&build_plan(&a));
+        assert!(
+            !t.contains("ZRAM_SIZE"),
+            "both compressed-swap schemes were configured at once:\n{t}"
         );
     }
 

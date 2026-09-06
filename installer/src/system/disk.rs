@@ -563,6 +563,37 @@ fn act(program: &str, args: &[&str]) -> Action {
 /// wipes the wrong partition — and it would type-check perfectly. The config is
 /// already at hand at the only call site; passing it means the field names do
 /// the disambiguating, and the compiler checks them.
+/// WHERE THE ESP IS MOUNTED — one answer, used by everything that needs it.
+///
+/// This was decided in two places: here, when the plan mounts it, and again in
+/// `plan_bootloader`, when `grub-install` is told `--efi-directory`. Moving the
+/// unencrypted layout to `/boot/efi` changed the first and not the second, and
+/// the install died at the very last step with "grub-install: /boot doesn't
+/// look like an EFI partition" — after every package was in place. Two copies
+/// of one rule is one copy too many.
+///
+/// * unencrypted — `/boot/efi`, the layout nearly everything else assumes, and
+///   it keeps the kernels off a 512 MiB FAT partition.
+/// * full-disk encryption — `/boot/efi` as well: `/boot` is its own encrypted
+///   filesystem and the ESP nests inside it.
+/// * root-scope encryption — `/boot` IS the ESP. A `/boot` inside the root
+///   would be inside the encryption, and GRUB cannot read a kernel from there
+///   without cryptodisk.
+pub fn esp_mountpoint(c: &InstallConfig) -> &'static str {
+    if c.partition_mode.is_manual_family() {
+        return if c.manual_esp_mount == "/boot/efi" {
+            "/boot/efi"
+        } else {
+            "/boot"
+        };
+    }
+    if !c.encrypt_disk || c.encrypt_scope == "full" {
+        "/boot/efi"
+    } else {
+        "/boot"
+    }
+}
+
 pub fn build_plan(c: &InstallConfig, luks_pass: &str, home_external: bool) -> Vec<Action> {
     let disk = c.disk.as_str();
     let uefi = c.boot_mode.is_uefi();
@@ -816,8 +847,28 @@ pub fn build_plan(c: &InstallConfig, luks_pass: &str, home_external: bool) -> Ve
         if let Some(ref e) = esp_dev {
             plan.push(act("mount", &[e, "/mnt/boot/efi"]));
         }
+    } else if uefi && esp_mountpoint(c) == "/boot/efi" {
+        // The ESP goes to /boot/efi, and /boot is a directory on the root
+        // filesystem. Where it goes is `esp_mountpoint`'s decision, not this
+        // branch's — `grub-install` reads the same function.
+        //
+        // This is the layout nearly every guide, tool and other distribution
+        // assumes, and it is what people who have installed Linux before expect
+        // to find. It also stops the kernels, both microcodes and grub/ from
+        // living on a 512 MiB FAT partition, where a second kernel is enough to
+        // run it out of space — and `mkinitcpio` then fails at update time with
+        // an error about a file, not about the partition.
+        plan.push(act("mkdir", &["-p", "/mnt/boot/efi"]));
+        if let Some(ref e) = esp_dev {
+            plan.push(act("mount", &[e, "/mnt/boot/efi"]));
+        }
     } else if uefi {
-        // Plain UEFI: ESP is /boot directly.
+        // ENCRYPTED ROOT: the ESP stays AT /boot, and this is not a style
+        // choice. With root-scope LUKS a /boot inside the root is inside the
+        // encryption, and GRUB cannot read the kernel from there without
+        // cryptodisk — which this installer does not promise. Kernels therefore
+        // live on the ESP, unencrypted, which is the accepted trade for a
+        // root-scope layout.
         plan.push(act("mkdir", &["-p", "/mnt/boot"]));
         if let Some(ref e) = esp_dev {
             plan.push(act("mount", &[e, "/mnt/boot"]));

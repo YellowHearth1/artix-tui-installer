@@ -52,8 +52,14 @@ ISO_DIR=/repo/iso
 # different toolchain versions there means a full rebuild each way, every time.
 say "compiling the installer"
 cd /repo/installer
-CARGO_TARGET_DIR=/build/target cargo build --release --offline 2>/dev/null \
-    || CARGO_TARGET_DIR=/build/target cargo build --release
+# The developer menu, if the outer script asked for it. Passed as an
+# environment variable rather than an argument because the container's
+# entrypoint takes none — `docker run` already carries -e across.
+feat=""
+[ "${DEVTOOLS:-0}" = 1 ] && { feat="--features devtools"; say "WITH the developer menu (--devtools)"; }
+# shellcheck disable=SC2086  # $feat is a deliberate word-split option pair
+CARGO_TARGET_DIR=/build/target cargo build --release $feat --offline 2>/dev/null \
+    || CARGO_TARGET_DIR=/build/target cargo build --release $feat
 BIN=/build/target/release/artix-installer
 [ -f "$BIN" ] || die "the build produced no binary"
 

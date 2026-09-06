@@ -2,6 +2,12 @@
 
 > A map of the project for anyone who wants to fix or add something,
 > even if Rust is new to you. Every common change is traced to its file.
+>
+> **⚠ This translation is behind.** `ARCHITECTURE.md` (Ukrainian) was rewritten
+> and now carries two sections this file does not: the MODEL OF THE TARGET
+> SYSTEM (what mounts the root — the kernel command line, not fstab — how dinit
+> reads fstab, and what that means for failure modes) and the UEFI boot chain.
+> Where the two disagree, the Ukrainian file is right.
 
 ## Data flow in 30 seconds
 

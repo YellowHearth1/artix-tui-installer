@@ -26,10 +26,31 @@
 #     sh scripts/build-iso.sh --bin      # build and sync only, no ISO
 #     sh scripts/build-iso.sh --fast     # skip tests/clippy/fmt (know why)
 #     sh scripts/build-iso.sh --clean    # rebuild the cached rootfs from scratch
+#
+#     sh scripts/build-iso.sh --devtools # ADD THE DEVELOPER MENU to the image:
+#                                        # the Wi-Fi simulator, and "Test",
+#                                        # which finishes a real install by
+#                                        # breaking the system on purpose so the
+#                                        # recovery repairs can be tried against
+#                                        # something genuine. Never in a release.
+#                                        # Combines with --docker/--podman.
+#
 #     sh scripts/build-iso.sh --podman   # build in a container — works on ANY
 #     sh scripts/build-iso.sh --docker   # Linux, with neither artools nor Rust
 #                                        # installed. Name the engine; there is
 #                                        # no auto-detect on purpose.
+#
+# DEBUGGING AN INSTALL, in the order the questions usually come:
+#
+#     sh scripts/build-iso.sh --devtools        # an image that can break itself
+#     sh scripts/qemu-test.sh                   # install it in a VM
+#     sh scripts/verify-vm.sh --nbd             # read the installed disk, no boot
+#     sh scripts/collect-logs.sh /mnt           # bundle the logs of a mounted system
+#
+#  A test install also leaves two files ON THE ESP, which is vfat and
+#  unencrypted, so they can be read from the host without unlocking anything:
+#      artix-test-install.log      the layout as installed, plus blkid
+#      artix-test-installer.log    the full installer log
 #
 # Paths follow the maintainer's layout and can be overridden:
 #     PROFILE_DIR=/srv/tui ISO_DIR=/mnt/big sh scripts/build-iso.sh
@@ -125,19 +146,26 @@ do_iso=1
 do_checks=1
 do_clean=0
 do_container=0
+do_devtools=0
 engine_want=
 for arg in "$@"; do
     case "$arg" in
         --bin)   do_iso=0 ;;
         --fast)  do_checks=0 ;;
         --clean) do_clean=1 ;;
+        # THE DEVELOPER MENU, WHICH A RELEASE MUST NOT CARRY. It adds two rows
+        # to the mode menu: the simulated Wi-Fi radio, and "Test", which
+        # finishes a real install by breaking the system on purpose so the
+        # recovery repairs have something genuine to work on. Off unless asked
+        # for, so an image built the usual way can be handed to anybody.
+        --devtools) do_devtools=1 ;;
         --docker)    do_container=1; engine_want=docker ;;
         --podman)    do_container=1; engine_want=podman ;;
         # Kept only to answer for itself. It used to pick an engine on its own,
         # and a build running under something you did not name is exactly the
         # kind of thing people keep the two apart to avoid.
         --container) die "say which one: --docker or --podman" ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,56p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -261,8 +289,43 @@ if [ "$do_container" -eq 1 ]; then
         -v "$cache:/var/lib/artools/buildiso" \
         -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
         -e "PROFILE=$PROFILE" \
+        -e "DEVTOOLS=$do_devtools" \
         artix-tui-iso
     exit 0
+fi
+
+# ── 0-pre. Clear mounts a failed build left behind ───────────────────────────
+# A build that dies partway leaves its chroot mounts in place — `/sys`, and the
+# `efivarfs` artools mounts inside it. The next run then fails at exactly the
+# same point ("target is busy") without ever saying that the cause is the
+# PREVIOUS run, and `--clean` refuses to delete a tree with mounts inside it. So
+# a repeat failure looks like a new problem and is not.
+#
+# Unmounted DEEPEST FIRST, because that is the only order that works: `umount`
+# on a parent whose child is still mounted just fails. Bounded to the artools
+# work directory, and it only ever unmounts — nothing here deletes anything.
+stale_mounts() {
+    findmnt -rno TARGET 2>/dev/null \
+        | grep -F "/var/lib/artools/buildiso" \
+        | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-
+}
+if [ -n "$(stale_mounts)" ]; then
+    say "clearing mounts left behind by an earlier build"
+    # NO LAZY UNMOUNT AS A FALLBACK. `umount -l` detaches the mount from the
+    # tree but keeps it alive until the last reference goes, and the overlayfs
+    # the next build stacks on top then fails with "fsconfig() failed: Stale
+    # file handle" — a worse error than the one being papered over, and one that
+    # points at the wrong place entirely. If a plain unmount will not work,
+    # something is genuinely holding it and that is worth stopping for.
+    stale_mounts | while read -r m; do
+        sudo umount "$m" 2>/dev/null || true
+    done
+    if [ -n "$(stale_mounts)" ]; then
+        printf '\n\033[1;31m!!\033[0m these are still mounted and the build will fail on them:\n' >&2
+        stale_mounts | sed 's/^/     /' >&2
+        echo "     (find what holds them:  sudo fuser -vm <path>)" >&2
+        die "unmount them by hand (deepest first) and run again"
+    fi
 fi
 
 # ── 0. Optional: throw away the cached chroot ────────────────────────────────
@@ -339,8 +402,15 @@ if [ "$do_checks" -eq 1 ]; then
     say "checks (fmt, clippy, tests)"
     cd "$REPO_DIR/installer"
     cargo fmt --check || die "cargo fmt --check failed — run 'cargo fmt'"
-    cargo clippy --all-targets -- -D warnings || die "clippy failed"
-    cargo test --quiet || die "tests failed"
+    # Linted and tested in the CONFIGURATION BEING BUILT — a feature that only
+    # compiles when nobody looks at it is a feature that breaks unnoticed.
+    if [ "$do_devtools" -eq 1 ]; then
+        cargo clippy --all-targets --features devtools -- -D warnings || die "clippy failed"
+        cargo test --quiet --features devtools || die "tests failed"
+    else
+        cargo clippy --all-targets -- -D warnings || die "clippy failed"
+        cargo test --quiet || die "tests failed"
+    fi
 else
     say "checks SKIPPED (--fast)"
 fi
@@ -348,7 +418,13 @@ fi
 # ── 2. Build ─────────────────────────────────────────────────────────────────
 say "building the installer"
 cd "$REPO_DIR/installer"
-cargo build --release
+if [ "$do_devtools" -eq 1 ]; then
+    say "WITH the developer menu (--devtools): Wi-Fi simulator and the"
+    say "    deliberate-breakage Test row. Do not hand this image to anyone."
+    cargo build --release --features devtools
+else
+    cargo build --release
+fi
 [ -f "$BIN" ] || die "the build produced no binary at $BIN"
 
 version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$REPO_DIR/installer/Cargo.toml" | head -1)
@@ -554,7 +630,47 @@ mkdir -p "$ISO_DIR"
 # PATH has to be handed over separately: sudo replaces it from `secure_path` in
 # sudoers no matter what -E says, so buildiso called `basestrap` and got
 # "command not found" while the binary sat right beside it.
-sudo -E env PATH="$VENDOR/bin:$PATH" "$BUILDISO" -p "$PROFILE" -t "$ISO_DIR"
+#
+# RETRIED, because the commonest failure here is not ours. A mirror that was
+# serving at 16 MB/s drops to "Operation too slow, less than 1 bytes/sec",
+# pacman gives up on it mid-transaction, and `make_rootfs()` aborts after
+# downloading four hundred megabytes. Nothing is wrong with the profile or the
+# code; the answer is to run it again. The packages already fetched stay in
+# /var/cache/pacman/pkg, so a retry costs the download that failed and no more.
+#
+# Only DOWNLOAD failures are retried. A broken profile, a missing package name
+# or a failed mkinitcpio fails the same way three times in a row, so the run
+# stops on the first one and says so — waiting an hour to be told the same
+# thing is worse than being told once.
+build_log=$(mktemp)
+build_fifo=$(mktemp -u)
+trap 'rm -f "$build_log" "$build_fifo"' EXIT INT TERM
+attempt=1
+while :; do
+    # THE STATUS HAS TO BE buildiso'S, not tee'S. Piping into tee would give
+    # the pipeline the status of tee — always 0 — and the retry below would
+    # never once fire. A fifo keeps the output live on screen AND leaves the
+    # real exit code in $rc.
+    rm -f "$build_fifo"
+    mkfifo "$build_fifo" || die "cannot create $build_fifo"
+    tee "$build_log" < "$build_fifo" &
+    tee_pid=$!
+    sudo -E env PATH="$VENDOR/bin:$PATH" "$BUILDISO" -p "$PROFILE" -t "$ISO_DIR" \
+        > "$build_fifo" 2>&1
+    rc=$?
+    wait "$tee_pid" 2>/dev/null || true
+    [ "$rc" -eq 0 ] && break
+
+    if ! grep -qE "failed to retrieve|Operation too slow|failed retrieving file|too many errors from" "$build_log"; then
+        die "the build failed, and not on a download - see the output above"
+    fi
+    if [ "$attempt" -ge 3 ]; then
+        die "three tries, and the mirrors would not hand over the packages. Try again later, or put a faster mirror first in /etc/pacman.d/mirrorlist"
+    fi
+    attempt=$((attempt + 1))
+    say "a mirror stalled mid-download - retrying ($attempt/3); cached packages are kept"
+    sleep 5
+done
 
 # buildiso writes into <target>/<profile>/. Lift the artefacts one level so the
 # folder has the images in it and nothing else to open. A move inside the same

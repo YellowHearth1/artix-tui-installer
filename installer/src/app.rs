@@ -41,12 +41,19 @@ pub enum Screen {
     /// own text at all, so it is a first-class choice rather than a setting
     /// buried somewhere.
     FontPick = 20,
+    /// The scenario list behind the mode menu's "Test" row. Developer builds
+    /// only (`--features devtools`); a release never reaches it because the row
+    /// that opens it is not compiled in.
+    TestMenu = 21,
 }
 
 impl Screen {
     /// How many `Screen` variants exist — the size of every per-screen array.
     /// Counts the off-linear screens too, which `ALL` deliberately does not.
-    pub const COUNT: usize = Screen::FontPick as usize + 1;
+    // The LAST variant, whatever it is — every screen needs a nav_cursor slot,
+    // and naming one screen here meant a new one added after it silently had no
+    // slot at all. A guard test walks every variant and checks this.
+    pub const COUNT: usize = Screen::TestMenu as usize + 1;
 
     pub const ALL: [Screen; 16] = [
         Screen::Language,
@@ -922,6 +929,24 @@ pub struct InstallConfig {
     /// Share of RAM zswap may fill, as a PERCENTAGE — the same number then means
     /// the same thing on a 2 GB netbook and a 32 GB desktop.
     pub zswap_percent: u8,
+    /// A compressed block device used AS swap, run by `zramen` — the ALTERNATIVE
+    /// to zswap, never its companion.
+    ///
+    /// The two look alike and are not: zswap is a cache in FRONT of a real swap
+    /// partition, zram is swap that lives in RAM instead of one. Stacking them
+    /// means compressing a page, handing it to a device that compresses it
+    /// again, and paying for both — so the screen offers one strip with three
+    /// answers rather than two toggles that can contradict each other, and the
+    /// plan sanitises it a second time. zram needs no partition at all, which is
+    /// exactly why it is offered where zswap cannot be.
+    ///
+    /// `zramen` and `zramen-dinit` are packaged in Artix's own galaxy repo, so
+    /// there is nothing here to write ourselves beyond the config values.
+    pub zram: bool,
+    pub zram_compressor: String,
+    /// Percentage of RAM the zram device may grow to. Not an allocation: it is
+    /// the uncompressed ceiling, and pages inside it compress roughly 2–3×.
+    pub zram_percent: u8,
     /// Kill the biggest memory hog before the kernel's OOM killer would, while
     /// the machine can still respond.
     pub earlyoom: bool,
@@ -1204,6 +1229,12 @@ impl Default for InstallConfig {
             zswap: false,
             zswap_compressor: "zstd".into(),
             zswap_percent: 20,
+            zram: false,
+            zram_compressor: "zstd".into(),
+            // zramen's own default is 25; 100 is the figure the tool documents
+            // for a machine that wants zram to matter, and since it is a ceiling
+            // rather than an allocation it costs nothing until it is used.
+            zram_percent: 100,
             earlyoom: false,
             earlyoom_percent: 10,
             keymap: "ua".into(),
@@ -1642,6 +1673,33 @@ pub struct App {
     /// dialog closes — it is a preference the user set, not a property of one
     /// box.
     pub modal_zoom: i16,
+    /// Which deliberate breakage the "Test" mode applies at the END of an
+    /// otherwise normal install: 0 = delete /etc/fstab, 1 = wreck the
+    /// bootloader, 2 = both.
+    ///
+    /// Recovery exists for systems that will not boot, and until now the only
+    /// way to get one was to wait for a real accident. A reproducible broken
+    /// system is the difference between testing recovery and hoping.
+    pub test_scenario: usize,
+    /// Which entry of `testmenu::DESKTOPS` a test install puts on. Its own
+    /// field, not part of the scenario, because it is a speed/realism trade the
+    /// person running the test makes — not something the scenario is about.
+    ///
+    /// Only the developer build has a screen that reads it; a release compiles
+    /// the field and never touches it, which is cheaper than making every use
+    /// site conditional.
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
+    pub test_desktop: usize,
+    /// True = break the system at the END of the install (fast, one reboot).
+    /// False = leave `break-*.sh` in the tester's home and let them run it
+    /// after logging in, which also proves the system worked beforehand.
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
+    pub test_break_now: bool,
+    /// True only when the wizard was entered from the "Test" row of the mode
+    /// menu. Kept SEPARATE from the scenario number so that a scenario left at
+    /// its default can never mean "sabotage the install": an ordinary run has
+    /// this false, and `plan_sabotage` returns immediately.
+    pub test_mode: bool,
     /// Font chooser: which family, which of its sizes, and which of the two
     /// questions has focus.
     ///
@@ -1743,6 +1801,32 @@ pub struct App {
     /// Recovery: set once partitions are mounted, so Enter launches the chroot
     /// shell instead of re-running the mount.
     pub recovery_mounted: bool,
+    /// Recovery: the repair that is running or has just run, as an index into
+    /// the action list — for the panel's header and its verdict.
+    ///
+    /// The repairs used to hand the real terminal over, on the reasoning that
+    /// their output IS the answer. It is, and that turned out to be the problem:
+    /// the screen went away, the output scrolled past, and the person came back
+    /// to the same list of buttons with nothing to say whether the thing had
+    /// worked. Two broken things in one session made it worse — there was no
+    /// way to see that the first repair had landed before starting the second.
+    /// So a repair now runs where it can be watched, ends with a verdict, and
+    /// re-checks the system on its own.
+    pub recovery_job: Option<usize>,
+    /// Its output, newest last, capped like every other streamed log here.
+    pub recovery_log: Vec<String>,
+    /// `Some` exactly while a repair is running.
+    pub recovery_rx: Option<crossbeam_channel::Receiver<crate::system::runner::LogLine>>,
+    /// How it ended. `None` while it runs.
+    pub recovery_done: Option<Result<(), String>>,
+    /// Lines scrolled back from the bottom of the log; 0 follows the output.
+    pub recovery_scroll: u16,
+    /// The dinit boot list, while its picker is open: what is enabled, which
+    /// rows are marked for disabling, and where the cursor is.
+    pub recovery_svc_open: bool,
+    pub recovery_svc: Vec<crate::system::recovery::BootService>,
+    pub recovery_svc_marked: Vec<bool>,
+    pub recovery_svc_cursor: usize,
 }
 
 impl App {
@@ -1763,6 +1847,7 @@ impl App {
             || self.parts_modal_open
             || self.parts_mount_open
             || self.recovery_path_open
+            || self.recovery_svc_open
             || self.parts_wipe_ack_open
             || self.parts_wipe_open
             || self.seat_modal_open
@@ -1912,6 +1997,10 @@ impl App {
             pending_interactive: None,
             recovery_action: 0,
             modal_zoom: 0,
+            test_scenario: 0,
+            test_desktop: 0,
+            test_break_now: false,
+            test_mode: false,
             keyboard_touched: false,
             tz_touched: false,
             marquee: 0,
@@ -1938,6 +2027,15 @@ impl App {
             recovery_passphrase: String::new(),
             recovery_status: String::new(),
             recovery_mounted: false,
+            recovery_job: None,
+            recovery_log: Vec::new(),
+            recovery_rx: None,
+            recovery_done: None,
+            recovery_scroll: 0,
+            recovery_svc_open: false,
+            recovery_svc: Vec::new(),
+            recovery_svc_marked: Vec::new(),
+            recovery_svc_cursor: 0,
         }
     }
 
@@ -2103,6 +2201,7 @@ impl App {
         self.storage_opts_modal_open = false;
         self.recovery_path_open = false;
         self.recovery_path_input.clear();
+        self.recovery_svc_open = false;
         self.parts_modal_open = false;
         self.parts_modal_cursor = 0;
         self.parts_target.clear();
@@ -2266,6 +2365,7 @@ mod tests {
             Screen::WifiTest,
             Screen::TbwTest,
             Screen::FontPick,
+            Screen::TestMenu,
         ];
         for s in every {
             match s {
@@ -2289,7 +2389,8 @@ mod tests {
                 | Screen::Recovery
                 | Screen::WifiTest
                 | Screen::TbwTest
-                | Screen::FontPick => {}
+                | Screen::FontPick
+                | Screen::TestMenu => {}
             }
             assert!(
                 (s as usize) < Screen::COUNT,

@@ -45,9 +45,17 @@ enum Row {
     EncData(usize),
     /// The sentence explaining where the keys for those live. Not selectable.
     EncExtraNote,
-    Zswap,
+    /// Compressed swap, as ONE choice with three answers: none, zswap, zram.
+    ///
+    /// Two toggles could both be on, and that combination compresses every page
+    /// twice for no gain — zswap is a cache in FRONT of swap, zram is swap that
+    /// lives in RAM instead of a partition. A strip cannot express the
+    /// contradiction, so it is not left to a rule someone has to remember.
+    SwapCache,
     ZswapCompressor,
     ZswapPercent,
+    ZramCompressor,
+    ZramPercent,
     EarlyOom,
     EarlyOomPercent,
     Bootloader,
@@ -188,12 +196,19 @@ fn rows_for(app: &App) -> Vec<Row> {
         // offered and quietly ignored — a manual layout with no swap partition
         // was being asked to choose a compression algorithm for a cache that
         // could never hold anything.
-        if app.config.has_swap() {
-            v.push(Row::Zswap);
-            if app.config.zswap {
-                v.push(Row::ZswapCompressor);
-                v.push(Row::ZswapPercent);
-            }
+        // The strip is ALWAYS here, because zram needs no swap partition — it
+        // is the swap. Only the zswap ANSWER depends on there being a partition
+        // behind it (see `swap_cache_modes`), which is why the row that used to
+        // vanish entirely on a layout without swap now stays and simply offers
+        // one option fewer.
+        v.push(Row::SwapCache);
+        if app.config.zswap && app.config.has_swap() {
+            v.push(Row::ZswapCompressor);
+            v.push(Row::ZswapPercent);
+        }
+        if app.config.zram {
+            v.push(Row::ZramCompressor);
+            v.push(Row::ZramPercent);
         }
         v.push(Row::EarlyOom);
         if app.config.earlyoom {
@@ -392,22 +407,49 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     &hint,
                 );
             }
-            Row::Zswap => {
-                let val = t(
-                    app.lang,
-                    if app.config.zswap {
-                        "opt.on"
-                    } else {
-                        "opt.off"
-                    },
+            Row::SwapCache => {
+                // The options are SHOWN, not hidden behind ←/→: a switch must
+                // not conceal what it switches to. Same strip the partition
+                // editor uses for filesystems and wipe methods.
+                let modes = swap_cache_modes(&app.config);
+                let cur = swap_cache_index(&app.config);
+                let strip = strip_text(
+                    &modes.iter().map(|k| t(app.lang, k)).collect::<Vec<_>>(),
+                    cur,
                 );
+                draw_strip_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.swapcache"),
+                    &strip,
+                    &t(app.lang, swap_cache_hint(&app.config)),
+                );
+            }
+            Row::ZramCompressor => {
+                let seen = crate::system::mem::available_compressors();
+                let mut hint = t(app.lang, algo_hint_key(&app.config.zram_compressor));
+                if !seen.contains(&app.config.zram_compressor) {
+                    hint.push(' ');
+                    hint.push_str(&t(app.lang, "opt.zswap_algo_unseen"));
+                }
                 draw_choice_row(
                     f,
                     area,
                     focused,
-                    &t(app.lang, "opt.zswap"),
-                    &val,
-                    &t(app.lang, "opt.zswap_hint"),
+                    &t(app.lang, "opt.zram_algo"),
+                    &app.config.zram_compressor,
+                    &hint,
+                );
+            }
+            Row::ZramPercent => {
+                draw_choice_row(
+                    f,
+                    area,
+                    focused,
+                    &t(app.lang, "opt.zram_pct"),
+                    &format!("{} %", app.config.zram_percent),
+                    &t(app.lang, "opt.zram_pct_hint"),
                 );
             }
             Row::ZswapCompressor => {
@@ -920,6 +962,29 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_choice_row(f: &mut Frame, area: Rect, focused: bool, label: &str, value: &str, hint: &str) {
+    draw_value_row(f, area, focused, label, value, hint, true)
+}
+
+/// The same row, without the `‹ ›` around the value.
+///
+/// Those markers say "←/→ changes this", which every choice row needs — except
+/// the one whose value IS the list of choices with the current one already
+/// marked. There it nested one pair of guillemets inside another and read as a
+/// typo.
+fn draw_strip_row(f: &mut Frame, area: Rect, focused: bool, label: &str, value: &str, hint: &str) {
+    draw_value_row(f, area, focused, label, value, hint, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_value_row(
+    f: &mut Frame,
+    area: Rect,
+    focused: bool,
+    label: &str,
+    value: &str,
+    hint: &str,
+    decorate: bool,
+) {
     let marker = if focused { "›" } else { " " };
     let label_style = if focused {
         theme::gold()
@@ -937,7 +1002,14 @@ fn draw_choice_row(f: &mut Frame, area: Rect, focused: bool, label: &str, value:
     let line = Line::from(vec![
         Span::styled(format!("  {marker} "), theme::gold()),
         Span::styled(format!("{label}: "), label_style),
-        Span::styled(format!("‹ {value} ›"), value_style),
+        Span::styled(
+            if decorate {
+                format!("‹ {value} ›")
+            } else {
+                value.to_string()
+            },
+            value_style,
+        ),
     ]);
     let hint_line = Line::from(Span::styled(format!("      {hint}"), theme::dim()));
     f.render_widget(
@@ -1053,9 +1125,77 @@ fn advance(app: &mut App) {
     app.goto_next();
 }
 
+/// The answers the compressed-swap strip may take, in order.
+///
+/// zswap IS NOT OFFERED WITHOUT A SWAP PARTITION. It caches pages on their way
+/// to swap; with nowhere to send them the setting would be written into a
+/// system where it can never do anything. zram is always here: it does not need
+/// a partition, it IS one — which makes it the answer for exactly the layout
+/// where zswap has nothing to say.
+fn swap_cache_modes(c: &crate::app::InstallConfig) -> Vec<&'static str> {
+    let mut v = vec!["opt.swapcache_none"];
+    if c.has_swap() {
+        v.push("opt.swapcache_zswap");
+    }
+    v.push("opt.swapcache_zram");
+    v
+}
+
+fn swap_cache_index(c: &crate::app::InstallConfig) -> usize {
+    let modes = swap_cache_modes(c);
+    let key = if c.zram {
+        "opt.swapcache_zram"
+    } else if c.zswap {
+        "opt.swapcache_zswap"
+    } else {
+        "opt.swapcache_none"
+    };
+    modes.iter().position(|m| *m == key).unwrap_or(0)
+}
+
+fn swap_cache_hint(c: &crate::app::InstallConfig) -> &'static str {
+    if c.zram {
+        "opt.swapcache_zram_hint"
+    } else if c.zswap {
+        "opt.swapcache_zswap_hint"
+    } else {
+        "opt.swapcache_none_hint"
+    }
+}
+
+/// Step the strip, keeping the two flags mutually exclusive BY CONSTRUCTION.
+fn cycle_swap_cache(c: &mut crate::app::InstallConfig, forward: bool) {
+    let modes = swap_cache_modes(c);
+    let i = swap_cache_index(c);
+    let next = if forward {
+        (i + 1) % modes.len()
+    } else {
+        (i + modes.len() - 1) % modes.len()
+    };
+    c.zswap = modes[next] == "opt.swapcache_zswap";
+    c.zram = modes[next] == "opt.swapcache_zram";
+}
+
+/// `a · <b> · c` — the chosen one in guillemets, the others plainly visible.
+/// The same reveal the partition editor uses, in the plain text this row takes.
+fn strip_text(options: &[String], current: usize) -> String {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            if i == current {
+                format!("\u{2039}{o}\u{203a}")
+            } else {
+                o.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
 fn toggle(app: &mut App, row: Row, forward: bool) {
     match row {
-        Row::Zswap => app.config.zswap = !app.config.zswap,
+        Row::SwapCache => cycle_swap_cache(&mut app.config, forward),
         Row::EarlyOom => app.config.earlyoom = !app.config.earlyoom,
         Row::ZswapCompressor => {
             let list = crate::system::mem::COMPRESSORS;
@@ -1075,6 +1215,26 @@ fn toggle(app: &mut App, row: Row, forward: bool) {
         Row::ZswapPercent => {
             let v = app.config.zswap_percent as i16 + if forward { 5 } else { -5 };
             app.config.zswap_percent = v.clamp(5, 50) as u8;
+        }
+        Row::ZramCompressor => {
+            let list = crate::system::mem::COMPRESSORS;
+            let i = list
+                .iter()
+                .position(|x| *x == app.config.zram_compressor)
+                .unwrap_or(0);
+            let next = if forward {
+                (i + 1) % list.len()
+            } else {
+                (i + list.len() - 1) % list.len()
+            };
+            app.config.zram_compressor = list[next].to_string();
+        }
+        // zram's ceiling goes higher than zswap's share: it is not a slice of
+        // RAM set aside, it is how far the device may GROW, and pages inside it
+        // compress two- to threefold. zramen's own cap is 250.
+        Row::ZramPercent => {
+            let v = app.config.zram_percent as i16 + if forward { 25 } else { -25 };
+            app.config.zram_percent = v.clamp(25, 200) as u8;
         }
         Row::EarlyOomPercent => {
             let v = app.config.earlyoom_percent as i16 + if forward { 2 } else { -2 };
@@ -1295,31 +1455,73 @@ mod tests {
     fn zswap_is_not_offered_when_there_is_no_swap() {
         let mut app = App::new();
         app.screen = Screen::Options;
+        let zswap = "opt.swapcache_zswap";
+        let zram = "opt.swapcache_zram";
 
         // Auto with the default 4 GiB of swap: offered.
-        assert!(rows_for(&app).contains(&Row::Zswap));
+        assert!(swap_cache_modes(&app.config).contains(&zswap));
 
         // Auto, swap turned off on the disk step: gone.
         app.config.swap_gib = 0;
-        assert!(!rows_for(&app).contains(&Row::Zswap));
+        assert!(!swap_cache_modes(&app.config).contains(&zswap));
+        // But zram is still there, and this is the layout it is FOR: it needs
+        // no partition, so the row that used to disappear now offers the one
+        // answer that still works.
+        assert!(swap_cache_modes(&app.config).contains(&zram));
+        assert!(
+            rows_for(&app).contains(&Row::SwapCache),
+            "the strip itself must stay — zram does not need a swap partition"
+        );
 
         // Manual with no swap partition: gone, even though swap_gib is back to
         // its default — the manual editor writes manual_swap, not swap_gib.
         app.config.swap_gib = 4;
         app.config.partition_mode = PartitionMode::Manual;
         assert!(
-            !rows_for(&app).contains(&Row::Zswap),
+            !swap_cache_modes(&app.config).contains(&zswap),
             "a manual layout with no swap partition was offered zswap"
         );
 
         // Manual WITH a swap partition: offered again.
         app.config.manual_swap = "/dev/vda3".into();
-        assert!(rows_for(&app).contains(&Row::Zswap));
+        assert!(swap_cache_modes(&app.config).contains(&zswap));
 
         // And a swap partition that is only planned counts too.
         app.config.manual_swap.clear();
         app.config.manual_swap_new_mib = 4096;
-        assert!(rows_for(&app).contains(&Row::Zswap));
+        assert!(swap_cache_modes(&app.config).contains(&zswap));
+    }
+
+    /// The two can never be on together, whichever way the strip is walked.
+    ///
+    /// zswap is a cache in FRONT of swap; zram is swap that lives in RAM. Both
+    /// at once compresses every page twice and pays for both — so the flags are
+    /// set from one place that cannot express the pair, and the plan sanitises
+    /// it again in case a flag outlives a change of layout.
+    #[test]
+    fn compressed_swap_is_one_choice_and_never_both() {
+        let mut app = App::new();
+        app.config.swap_gib = 4;
+        for _ in 0..8 {
+            cycle_swap_cache(&mut app.config, true);
+            assert!(
+                !(app.config.zswap && app.config.zram),
+                "zswap and zram ended up on together"
+            );
+        }
+        for _ in 0..8 {
+            cycle_swap_cache(&mut app.config, false);
+            assert!(!(app.config.zswap && app.config.zram));
+        }
+        // Walking forward through every answer reaches zram and comes back.
+        app.config.zswap = false;
+        app.config.zram = false;
+        let mut seen_zram = false;
+        for _ in 0..swap_cache_modes(&app.config).len() {
+            cycle_swap_cache(&mut app.config, true);
+            seen_zram |= app.config.zram;
+        }
+        assert!(seen_zram, "zram is unreachable from the strip");
     }
 
     /// The reveal key is advertised on the row that has a password, and nowhere

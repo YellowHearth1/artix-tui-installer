@@ -902,6 +902,20 @@ fn scroll_log(app: &mut App, key: KeyEvent) {
 }
 
 fn start_install(app: &mut App) {
+    // NO TARGET, NO INSTALL. In automatic partitioning the whole plan is built
+    // around one device path, and an empty one does not fail early — it reaches
+    // `wipefs -a` with no argument twenty minutes in, after every package has
+    // been downloaded and installed, and reports "probing initialization
+    // failed: No such file or directory". Nothing in that names the disk step.
+    //
+    // The wizard cannot normally get here without a disk, but anything that
+    // jumps straight to this screen can, and did.
+    if matches!(app.config.partition_mode, crate::app::PartitionMode::Auto)
+        && app.config.disk.trim().is_empty()
+    {
+        app.pmode_status = t(app.lang, "sum.err_no_disk");
+        return;
+    }
     app.install_plan = install::build_plan(app);
     app.install_step = 0;
     app.install_phase = Phase::Installing;

@@ -103,6 +103,11 @@ fn leave_to_firmware_or_reboot(app: &App) {
         let _ = writeln!(out, ">> {}", t(app.lang, "ui.rebooting"));
         let _ = out.flush();
     }
+    // UNMOUNT FIRST, always. Recovery's way out is this path, and it leaves a
+    // repaired system mounted under /mnt with a LUKS mapping open behind it;
+    // rebooting through that is how a just-fixed filesystem picks up a dirty
+    // journal on the way to its first boot. A no-op when nothing is mounted.
+    crate::system::recovery::cleanup();
     let _ = Command::new("reboot").status();
 }
 
@@ -158,6 +163,47 @@ fn run(
             return Ok(());
         }
     }
+}
+
+/// What recovery actually mounted, printed just before the chroot shell opens.
+///
+/// WHY THIS EXISTS. Inside the chroot, `/proc` is the LIVE system's, so `lsblk`
+/// reports mountpoints as the outside sees them — `/mnt`, `/mnt/boot`,
+/// `/mnt/home` — not `/` and `/boot`. Someone checking their work there reads
+/// that as "nothing is mounted where it should be", which is both alarming and
+/// wrong, and it cannot be fixed from inside: it is what the kernel really
+/// knows. Reported from a repair on hardware as "lsblk looks crooked and I
+/// cannot tell what is mounted where".
+///
+/// So the answer is given BEFORE the shell opens, in the only place it can be
+/// stated plainly, with the outside path and the inside path side by side.
+fn mounted_summary() -> String {
+    use std::process::Command;
+    let out = Command::new("findmnt")
+        .args(["-rno", "TARGET,SOURCE,FSTYPE", "--submounts", "/mnt"])
+        .output();
+    let Ok(o) = out else { return String::new() };
+    let text = String::from_utf8_lossy(&o.stdout);
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("  Mounted for you (inside the chroot these are / and below):\n\n");
+    s.push_str("    inside          outside            device\n");
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(target), Some(source)) = (f.next(), f.next()) else {
+            continue;
+        };
+        let inside = target.strip_prefix("/mnt").unwrap_or(target);
+        let inside = if inside.is_empty() { "/" } else { inside };
+        s.push_str(&format!("    {inside:<15} {target:<18} {source}\n"));
+    }
+    s.push_str(
+        "\n  `lsblk` in here shows the OUTSIDE column — that is normal, and\n\
+         \x20 it does not mean the mounts are wrong.\n\
+         ============================================================\n\n",
+    );
+    s
 }
 
 /// Guidance shown on the bare terminal before the recovery chroot shell opens,
@@ -262,6 +308,7 @@ fn run_interactive_step(
                     _ => REC_GUIDE_EN,
                 }
             );
+            let _ = write!(out, "{}", mounted_summary());
         } else if finish {
             // Same idea, but they're the freshly-created user doing final setup.
             let who = if app.config.username.trim().is_empty() {
@@ -683,6 +730,8 @@ fn screen_title(app: &App) -> String {
         _ => {}
     }
     let key = match app.screen {
+        // The scenario list titles itself; a release cannot reach it at all.
+        Screen::TestMenu => "mode.test",
         Screen::Language => "lang.title",
         Screen::Timezone => "tz.title",
         Screen::Wifi => "wifi.title",

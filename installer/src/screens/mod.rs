@@ -22,6 +22,8 @@ mod recovery;
 pub(crate) mod storage;
 pub mod summary;
 pub(crate) mod tbwtest;
+#[cfg(feature = "devtools")]
+pub(crate) mod testmenu;
 pub(crate) mod timezone;
 mod user;
 pub mod wifi;
@@ -154,7 +156,7 @@ fn step(screen: Screen) -> Step {
         Screen::Recovery => Step {
             draw: recovery::draw,
             key: recovery::handle_key,
-            tick: no_tick,
+            tick: recovery::tick,
             hint: |a| Some(recovery::footer_hint(a)),
         },
         Screen::WifiTest => Step {
@@ -168,6 +170,24 @@ fn step(screen: Screen) -> Step {
             key: tbwtest::handle_key,
             tick: tbwtest::tick,
             hint: |a| Some(tbwtest::footer_hint(a)),
+        },
+        #[cfg(feature = "devtools")]
+        Screen::TestMenu => Step {
+            draw: testmenu::draw,
+            key: testmenu::handle_key,
+            tick: no_tick,
+            hint: |a| Some(testmenu::footer_hint(a)),
+        },
+        // A release has no way to reach this screen: the mode-menu row that
+        // opens it is not compiled in. Wired to the menu so the match stays
+        // exhaustive rather than gaining a catch-all arm, which is what used to
+        // let a screen ship with no tick and no hint.
+        #[cfg(not(feature = "devtools"))]
+        Screen::TestMenu => Step {
+            draw: mode::draw,
+            key: mode::handle_key,
+            tick: no_tick,
+            hint: |_| None,
         },
         Screen::FontPick => Step {
             draw: fontpick::draw,

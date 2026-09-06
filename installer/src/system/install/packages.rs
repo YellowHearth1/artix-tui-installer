@@ -632,6 +632,15 @@ pub(crate) fn system_packages(c: &InstallConfig) -> Vec<String> {
     if c.earlyoom {
         p.push("earlyoom".into());
     }
+    // zram, when it was chosen instead of zswap. BOTH packages: `zramen` is the
+    // tool and `zramen-dinit` is the service description for it — the tool on
+    // its own installs and never runs, which is the same trap earlyoom fell
+    // into. Both live in Artix's galaxy repo, so nothing here is written by
+    // hand or pulled from the AUR.
+    if c.zram {
+        p.push("zramen".into());
+        p.push("zramen-dinit".into());
+    }
     if c.extra_packages.iter().any(|x| x == "vlc") {
         // Modern Artix splits VLC's codecs/outputs into vlc-plugins-*; the
         // `vlc-plugins-all` metapackage depends on base/extra/video-output/

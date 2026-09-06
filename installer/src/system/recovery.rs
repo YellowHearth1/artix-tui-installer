@@ -49,6 +49,96 @@ pub const ROLE_KEYS: [&str; 8] = ["none", "root", "esp", "boot", "swap", "home",
 /// set up there is found again here under the name it was given.
 pub const DATA_PATHS: [&str; 4] = ["/mnt/data", "/mnt/storage", "/data", "/srv"];
 
+/// A service dinit starts at boot: the entry in `boot.d`, when it was put
+/// there, and what it points at.
+pub struct BootService {
+    pub name: String,
+    /// Where the symlink leads. Empty when the entry is a plain file.
+    pub target: String,
+    /// Local time, `YYYY-MM-DD HH:MM`.
+    pub stamp: String,
+}
+
+/// The directory dinit reads to decide what starts at boot, inside the mounted
+/// target.
+pub const BOOT_D: &str = "/mnt/etc/dinit.d/boot.d";
+
+/// List what is enabled at boot, NEWEST FIRST.
+///
+/// The order is the whole feature. A service that has been running for a year
+/// is not the one that just stopped the machine booting; the one enabled on
+/// Tuesday is. dinit records that for free — `enable` creates a symlink, and the
+/// symlink's OWN mtime is when it was created — so the list needs no state of
+/// its own, works on services written by hand, and is right even for a system
+/// this installer has never seen.
+///
+/// One `find` for the lot: a `stat` per entry is thirty processes for a list
+/// that is redrawn as soon as somebody presses a key. `-type l` is deliberately
+/// NOT used — dinit takes the NAME of the entry as the service name, so a plain
+/// file put there by hand enables a service too, and a list that hid it would
+/// hide exactly the hand-made thing this screen is for.
+const BOOT_D_SCAN: &str = "find @@DIR@@ -maxdepth 1 -mindepth 1 ! -name '.*' \
+     -printf '%T@|%TY-%Tm-%Td %TH:%TM|%f|%l\\n' 2>/dev/null | sort -rn";
+
+pub fn boot_services() -> Vec<BootService> {
+    parse_boot_services(&sh_out(&BOOT_D_SCAN.replace("@@DIR@@", &shquote(BOOT_D))))
+}
+
+/// Split the scan's output. Separate from running it so a test can feed it a
+/// directory of real symlinks and check both halves.
+pub fn parse_boot_services(text: &str) -> Vec<BootService> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(4, '|');
+            let _epoch = f.next()?;
+            let stamp = f.next()?.to_string();
+            let name = f.next()?.to_string();
+            let target = f.next().unwrap_or("").to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(BootService {
+                name,
+                target,
+                stamp,
+            })
+        })
+        .collect()
+}
+
+/// Take services out of the boot sequence, in the target.
+///
+/// `dinitctl` is the tool that owns this, and it is asked first — but it needs
+/// `--offline` here, because the system being repaired is not running, and
+/// older builds may not have that flag. When it will not do the job the symlink
+/// is removed directly, which is the same edit by hand.
+///
+/// EVERY LINE SAYS HOW TO PUT IT BACK. Disabling a service to see whether it was
+/// the problem is only a reasonable thing to try if getting it back is one
+/// command, and the person doing it is by definition mid-crisis.
+pub fn disable_services_script(names: &[String]) -> String {
+    let list = names
+        .iter()
+        .map(|n| shquote(n))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "set -e\n\
+         for s in {list}; do\n\
+         \x20   if dinitctl -o -d /etc/dinit.d disable \"$s\" 2>/dev/null; then\n\
+         \x20       echo \">>> $s: disabled (dinitctl)\"\n\
+         \x20   elif [ -e \"/etc/dinit.d/boot.d/$s\" ]; then\n\
+         \x20       rm -f \"/etc/dinit.d/boot.d/$s\"\n\
+         \x20       echo \">>> $s: disabled (entry removed from boot.d)\"\n\
+         \x20   else\n\
+         \x20       echo \">>> $s: was not enabled — nothing to do\"\n\
+         \x20   fi\n\
+         \x20   echo \"    to put it back:  dinitctl enable $s\"\n\
+         done\n\
+         echo \">>> Done. These services will not be started at the next boot.\"\n"
+    )
+}
+
 /// An lsblk SIZE ("20G", "512M", "1.5G", "9,5G") as whole MiB. Unparseable
 /// sizes come back as 0, which every caller treats as "cannot tell" — a
 /// partition of unknown size gets the full role list rather than a guess.
@@ -793,35 +883,148 @@ fn detect_bootloader() -> String {
 /// It reinstalls what is THERE; it does not choose a bootloader. Recovery
 /// repairs a system, it does not redesign one.
 pub const REINSTALL_BOOTLOADER: &str = r#"set -e
+# WHAT IS ACTUALLY ON THE ESP DECIDES — not what happens to be in /boot.
+#
+# This used to look for /boot/grub and give up if it was absent, which is the
+# state a broken system is often in (an unmounted or emptied /boot). It also
+# tested /boot/EFI/refind while the ESP was mounted at /boot/efi, so rEFInd and
+# Limine were never found at all. And it passed --bootloader-id=artix
+# unconditionally, creating a SECOND firmware entry beside the one that was
+# already there instead of restoring it.
+#
+# Reported after a real repair: "it did nothing, I had to do it by hand."
 esp=""
 for d in /boot/efi /efi /boot; do
     [ -d "$d/EFI" ] && { esp="$d"; break; }
 done
-if [ -d /boot/grub ] || [ -f /boot/grub/grub.cfg ]; then
-    echo ">>> GRUB found — reinstalling."
-    if [ -d /sys/firmware/efi ]; then
-        [ -n "$esp" ] || { echo "!! no EFI system partition is mounted (looked in /boot/efi, /efi, /boot)"; exit 1; }
-        echo ">>> UEFI, ESP at $esp"
-        grub-install --target=x86_64-efi --efi-directory="$esp" --bootloader-id=artix --recheck
+uefi=0
+[ -d /sys/firmware/efi ] && uefi=1
+
+if [ "$uefi" = 1 ]; then
+    # NVRAM HAS TO BE WRITABLE, or grub-install writes the files and never
+    # tells the firmware about them. That is the shape of "the repair said it
+    # worked and the machine still boots to the firmware menu": efivarfs
+    # unmounted (or mounted read-only, which some live images do) makes
+    # grub-install print one line about EFI variables not being supported and
+    # carry on regardless.
+    if [ -d /sys/firmware/efi/efivars ]; then
+        mountpoint -q /sys/firmware/efi/efivars \
+            || mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+        mount -o remount,rw /sys/firmware/efi/efivars 2>/dev/null || true
+    fi
+    if ! efibootmgr >/dev/null 2>&1; then
+        echo "!! The firmware's variables are not reachable from here, so no boot"
+        echo "   entry can be created. The loader will still be written to the ESP,"
+        echo "   including the removable path, which is what boots a machine whose"
+        echo "   entry is gone — but add the entry yourself later if the menu is"
+        echo "   still empty."
+    fi
+
+    if [ -z "$esp" ]; then
+        echo "!! No EFI system partition is mounted — looked in /boot/efi, /efi and /boot."
+        echo "   Go back and give the FAT32 partition the 'ESP' role, then try again."
+        exit 1
+    fi
+    echo ">>> ESP at $esp — this is what is on it:"
+    ls -1 "$esp/EFI" 2>/dev/null | sed 's/^/      EFI\//'
+    for f in $(find "$esp/EFI" -maxdepth 2 -iname '*.efi' 2>/dev/null | head -20); do
+        echo "      $(echo "$f" | sed "s|^$esp/||")"
+    done
+    echo ">>> Firmware boot entries it knows about:"
+    efibootmgr 2>/dev/null | sed 's/^/      /' || echo "      (efibootmgr says nothing — NVRAM may be unreadable)"
+fi
+
+# THE EXISTING DIRECTORY NAME IS THE ID TO REUSE. `grub-install
+# --bootloader-id=X` writes $esp/EFI/X and names the NVRAM entry X; passing a
+# fresh name leaves the old, broken entry in place and adds another. Microsoft
+# and the removable-media fallback (BOOT) are never candidates.
+bl_id=""
+bl_fallback=""
+if [ -n "$esp" ]; then
+    for d in "$esp"/EFI/*/; do
+        n=$(basename "$d")
+        case "$n" in
+            [Bb][Oo][Oo][Tt]|[Mm]icrosoft|[Tt]ools) continue ;;
+        esac
+        # PREFER the directory that still holds a GRUB payload; fall back to any
+        # other non-standard name. A broken machine very often has the name and
+        # not the binary — that IS what "the bootloader is gone" usually means —
+        # and the name is the part worth keeping.
+        [ -f "$d/grubx64.efi" ] && { bl_id="$n"; break; }
+        [ -z "$bl_fallback" ] && bl_fallback="$n"
+    done
+    [ -n "$bl_id" ] || bl_id="$bl_fallback"
+fi
+
+have_grub=0
+[ -d /boot/grub ] && have_grub=1
+[ -n "$bl_id" ] && have_grub=1
+
+if [ "$have_grub" = 1 ]; then
+    if [ "$uefi" = 1 ]; then
+        [ -n "$bl_id" ] || bl_id=artix
+        # A HARD RESET LEAVES THE FAT DIRTY. The ESP is vfat, it has no journal,
+        # and a machine that was switched off mid-write comes back with a
+        # half-updated directory. Writing a bootloader onto that produces a file
+        # the firmware cannot load — the exact "I reinstalled it and nothing
+        # changed" case. fsck needs the filesystem UNMOUNTED, so it is put back
+        # afterwards; if either step fails the repair stops rather than writing
+        # onto something it could not check.
+        espdev=$(findmnt -no SOURCE --target "$esp" 2>/dev/null || true)
+        if [ -n "$espdev" ] && [ "$(findmnt -no FSTYPE --target "$esp")" = vfat ] \
+           && command -v fsck.vfat >/dev/null 2>&1; then
+            echo ">>> Checking the ESP filesystem first (it is vfat and has no journal)."
+            if umount "$esp" 2>/dev/null; then
+                fsck.vfat -a "$espdev" || echo "   (fsck reported problems; it repaired what it could)"
+                mount "$espdev" "$esp" || {
+                    echo "!! The ESP could not be mounted again after the check."
+                    echo "   Nothing was written. Mount it and try again."
+                    exit 1
+                }
+            else
+                echo "   (busy, so it was left alone — skipping the check)"
+            fi
+        fi
+        echo ">>> GRUB, UEFI. Reinstalling into $esp under the id '$bl_id'."
+        grub-install --target=x86_64-efi --efi-directory="$esp" \
+                     --bootloader-id="$bl_id" --recheck
+        # THE REMOVABLE FALLBACK, ALWAYS. A firmware that lost its NVRAM entry
+        # — the common case after a CMOS reset, a firmware update, or another
+        # OS tidying up — boots ONLY \EFI\BOOT\BOOTX64.EFI. Without this the
+        # repair "succeeds" and the machine still goes straight to the firmware
+        # menu, which is exactly what a person calls "it did nothing".
+        echo ">>> Also writing the removable fallback \EFI\BOOT\BOOTX64.EFI."
+        grub-install --target=x86_64-efi --efi-directory="$esp" \
+                     --removable --recheck || true
     else
         # BIOS: the loader goes on the whole DISK that carries /boot, worked out
         # from the mount rather than guessed from a device name — /dev/nvme0n1
         # is a disk and ends in a digit, so trimming digits is wrong.
         part=$(findmnt -no SOURCE /boot 2>/dev/null || findmnt -no SOURCE /)
         disk=/dev/$(lsblk -no pkname "$part")
-        echo ">>> BIOS, installing to $disk"
+        echo ">>> GRUB, BIOS. Installing to $disk"
         grub-install --target=i386-pc --recheck "$disk"
     fi
-    grub-mkconfig -o /boot/grub/grub.cfg
-elif [ -d /boot/EFI/refind ]; then
-    echo ">>> rEFInd found — reinstalling."; refind-install
-elif [ -f /boot/limine.conf ] || [ -f /boot/EFI/limine/limine.conf ]; then
+    if [ -d /boot/grub ]; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+    else
+        echo "!! /boot/grub is missing, so the menu could not be regenerated."
+        echo "   The loader is installed; mount the right /boot and run"
+        echo "   grub-mkconfig -o /boot/grub/grub.cfg"
+    fi
+elif [ -n "$esp" ] && [ -d "$esp/EFI/refind" ]; then
+    echo ">>> rEFInd found on the ESP — reinstalling."
+    refind-install
+elif [ -f /boot/limine.conf ] || { [ -n "$esp" ] && [ -d "$esp/EFI/limine" ]; }; then
     echo ">>> Limine found. Its files are in place; re-run limine-install for your layout if needed."
 elif [ -d /boot/loader ]; then
     echo ">>> systemd-boot layout found, which this distribution does not manage. Nothing done."
 else
-    echo "!! No bootloader signature found in /boot — there is nothing to reinstall."
-    echo "   Install one first (e.g. pacman -S grub && grub-install ...)."
+    echo "!! Nothing recognisable is installed: no GRUB directory, and no"
+    echo "   grubx64.efi / refind / limine under the ESP listed above."
+    echo "   If the list above is empty, the ESP is either not the right"
+    echo "   partition or it was wiped. Install a loader first:"
+    echo "       pacman -S grub && grub-install ..."
     exit 1
 fi
 echo ">>> Done. Reboot and see."
@@ -845,8 +1048,92 @@ echo "    line of /etc/mkinitcpio.conf before rebooting."
 /// Deliberately keeps the old one. A generated fstab is a good guess and not a
 /// promise: it describes what recovery managed to mount, which may be less than
 /// the system had. The person can compare, and `fstab.bak` is often still there
+/// Write an fstab from what is actually mounted, using only util-linux.
+///
+/// SHARED BY THE INSTALL AND THE REPAIR, because they are the same job asked
+/// twice and the answer must not differ. The repair earned every line of it:
+/// `fstabgen` is artools and `genfstab` is arch-install-scripts, both live on
+/// the ISO and neither is in an installed system, so the repair that called
+/// them wrote nothing at all, run after run.
+///
+/// `@@ROOT@@` is where the target is mounted — empty when this runs inside it,
+/// `/mnt` when it runs from the ISO — and `@@SCOPE@@` limits findmnt to that
+/// subtree.
+const FSTAB_GEN_FN: &str = r#"gen_fstab() {
+    printf '# Generated by the Artix TUI installer on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '# <file system> <dir> <type> <options> <dump> <pass>\n'
+
+    # ONE LINE PER MOUNT POINT. Mounts stack: something mounted at /home and
+    # then something else mounted at /home leaves both visible to findmnt, and
+    # writing both into an fstab means the next boot mounts them in the same
+    # order and the wrong one wins. Keep the last, which is the one actually in
+    # use, and drop the rest.
+    findmnt -rn --real -o TARGET,SOURCE,FSTYPE,OPTIONS @@SCOPE@@ 2>/dev/null \
+    | awk '{ last[$1] = $0 } END { for (t in last) print last[t] }' \
+    | sort -k1,1 | while read -r tgt src fs opts; do
+        case "$fs" in
+            proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|efivarfs|bpf) continue ;;
+            tracefs|debugfs|mqueue|hugetlbfs|fusectl|configfs|pstore|ramfs|autofs) continue ;;
+            binfmt_misc|squashfs|overlay|selinuxfs|nfsd|rpc_pipefs) continue ;;
+            fuse|fuse.*|fuseblk|nfs|nfs4|cifs|smb3|iso9660|udf) continue ;;
+        esac
+        # Transient mounts belong to whoever made them, not in an fstab. A
+        # stray AppImage under /tmp/.mount_* was picked up on the first run of
+        # this generator, and a line like that would fail the next boot.
+        case "$tgt" in
+            /tmp/*|/run/*|/media/*|/proc/*|/sys/*|/dev/*|/var/lib/docker/*) continue ;;
+        esac
+        dev=$(printf '%s' "$src" | sed 's/\[.*//')
+        uuid=$(blkid -o value -s UUID "$dev" 2>/dev/null) || uuid=""
+        # A UUID survives a disk being renamed or enumerated differently; the
+        # device path does not. Falling back to the path is better than dropping
+        # the line, but it is worth saying so.
+        if [ -n "$uuid" ]; then
+            spec="UUID=$uuid"
+        else
+            spec="$dev"
+            echo "!! No UUID for $dev ($tgt) - wrote the device path instead." >&2
+        fi
+        # The mount points are relative to the TARGET. Running inside it the
+        # prefix is empty and this changes nothing; running from the ISO the
+        # target sits at /mnt, and an fstab full of /mnt/... would be nonsense.
+        pfx="@@ROOT@@"
+        tgt=${tgt#"$pfx"}
+        [ -n "$tgt" ] || tgt=/
+        if [ "$tgt" = / ]; then pass=1; else pass=2; fi
+        # DROP subvolid=. findmnt reports both subvolid= and subvol=, and they
+        # are redundant — but a pinned subvolid is actively wrong on a system
+        # with snapper: a rollback gives the subvolume a NEW id, and an fstab
+        # that names the old one keeps mounting the very snapshot that was
+        # rolled back. Keep the name, which survives.
+        opts=$(printf '%s' "$opts" | sed 's/subvolid=[0-9]*,//; s/,subvolid=[0-9]*//')
+        printf '%-42s %-16s %-7s %s 0 %s\n' "$spec" "$tgt" "$fs" "$opts" "$pass"
+    done
+}
+"#;
+
+/// The generator, aimed at a target mounted under `root` ("" = we are inside it).
+pub fn fstab_gen_fn(root: &str) -> String {
+    FSTAB_GEN_FN.replace("@@ROOT@@", root).replace(
+        "@@SCOPE@@",
+        if root.is_empty() {
+            String::new()
+        } else {
+            format!("-R {root}")
+        }
+        .as_str(),
+    )
+}
+
 /// from whatever they were doing when it broke.
-pub const REGENERATE_FSTAB: &str = r#"set -e
+/// The fstab repair, with the shared generator stitched in.
+pub fn regenerate_fstab() -> String {
+    // Inside the target: no prefix to strip, and every mount findmnt reports
+    // belongs to the system being repaired.
+    REGENERATE_FSTAB.replace("@@GEN_FSTAB@@", &fstab_gen_fn(""))
+}
+
+const REGENERATE_FSTAB: &str = r#"set -e
 # WRITE A COMPLETE fstab, OR WRITE NOTHING.
 #
 # fstabgen describes what is mounted RIGHT NOW. Run it with /boot missing and it
@@ -942,51 +1229,7 @@ echo ">>> Writing /etc/fstab from what is mounted now:"
 # diagnosis kept reporting while the repair claimed to have run.
 #
 # findmnt and blkid are util-linux. They are always there.
-gen_fstab() {
-    printf '# Generated by the Artix TUI recovery mode on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '# <file system> <dir> <type> <options> <dump> <pass>\n'
-
-    # ONE LINE PER MOUNT POINT. Mounts stack: something mounted at /home and
-    # then something else mounted at /home leaves both visible to findmnt, and
-    # writing both into an fstab means the next boot mounts them in the same
-    # order and the wrong one wins. Keep the last, which is the one actually in
-    # use, and drop the rest.
-    findmnt -rn --real -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null \
-    | awk '{ last[$1] = $0 } END { for (t in last) print last[t] }' \
-    | sort -k1,1 | while read -r tgt src fs opts; do
-        case "$fs" in
-            proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|efivarfs|bpf) continue ;;
-            tracefs|debugfs|mqueue|hugetlbfs|fusectl|configfs|pstore|ramfs|autofs) continue ;;
-            binfmt_misc|squashfs|overlay|selinuxfs|nfsd|rpc_pipefs) continue ;;
-            fuse|fuse.*|fuseblk|nfs|nfs4|cifs|smb3|iso9660|udf) continue ;;
-        esac
-        # Transient mounts belong to whoever made them, not in an fstab. A
-        # stray AppImage under /tmp/.mount_* was picked up on the first run of
-        # this generator, and a line like that would fail the next boot.
-        case "$tgt" in
-            /tmp/*|/run/*|/media/*|/proc/*|/sys/*|/dev/*|/var/lib/docker/*) continue ;;
-        esac
-        dev=$(printf '%s' "$src" | sed 's/\[.*//')
-        uuid=$(blkid -o value -s UUID "$dev" 2>/dev/null) || uuid=""
-        # A UUID survives a disk being renamed or enumerated differently; the
-        # device path does not. Falling back to the path is better than dropping
-        # the line, but it is worth saying so.
-        if [ -n "$uuid" ]; then
-            spec="UUID=$uuid"
-        else
-            spec="$dev"
-            echo "!! No UUID for $dev ($tgt) - wrote the device path instead." >&2
-        fi
-        if [ "$tgt" = / ]; then pass=1; else pass=2; fi
-        # DROP subvolid=. findmnt reports both subvolid= and subvol=, and they
-        # are redundant — but a pinned subvolid is actively wrong on a system
-        # with snapper: a rollback gives the subvolume a NEW id, and an fstab
-        # that names the old one keeps mounting the very snapshot that was
-        # rolled back. Keep the name, which survives.
-        opts=$(printf '%s' "$opts" | sed 's/subvolid=[0-9]*,//; s/,subvolid=[0-9]*//')
-        printf '%-42s %-16s %-7s %s 0 %s\n' "$spec" "$tgt" "$fs" "$opts" "$pass"
-    done
-}
+@@GEN_FSTAB@@
 # fstabgen is Artix's own tool (artools) and is what the Artix install guide
 # uses, so it is preferred whenever it is actually present. Arch's genfstab is
 # deliberately NOT used as a fallback: on a system without artools there is no
@@ -1116,6 +1359,41 @@ fi
 echo ">>> Check it before rebooting: this describes what recovery could mount,"
 echo "    which may be less than the system actually had."
 "#;
+
+/// Where the ESP is, which firmware entries it carries, and what the firmware
+/// could actually load from it. Prints `esp=`, `dir=` and `file=` lines.
+///
+/// SCOPED TO THE ESP, and nothing else — this is the whole point of it.
+///
+/// The question "is there a bootable EFI binary" was asked as `find /mnt/boot
+/// -iname '*.efi'`, and /boot/grub/x86_64-efi/ holds core.efi and grub.efi: two
+/// files from the grub PACKAGE, present on every GRUB system, that no firmware
+/// ever loads. So the check passed on a machine whose ESP had been emptied on
+/// purpose, the report said "nothing obviously broken", and the person reading
+/// it had just failed to boot that very machine. Reproduced on the disk image
+/// afterwards, which is the only reason it was found.
+///
+/// `@@ROOT@@` is the prefix the target is mounted under, so this can be run
+/// against a fabricated tree in a test rather than only against a real system.
+const ESP_PROBE: &str = r#"esp=""
+for d in @@ROOT@@/boot/efi @@ROOT@@/efi @@ROOT@@/boot; do
+    [ -d "$d/EFI" ] && { esp="$d"; break; }
+done
+[ -n "$esp" ] || exit 0
+echo "esp=${esp#@@ROOT@@}"
+for d in "$esp"/EFI/*/; do
+    [ -d "$d" ] || continue
+    b=${d%/}
+    echo "dir=${b##*/}"
+done
+find "$esp/EFI" -maxdepth 3 -type f -iname '*.efi' 2>/dev/null | while read -r f; do
+    echo "file=${f#"$esp"/}"
+done
+"#;
+
+fn esp_probe(root: &str) -> String {
+    ESP_PROBE.replace("@@ROOT@@", root)
+}
 
 /// Look the mounted system over and say what is wrong with it.
 ///
@@ -1329,6 +1607,7 @@ pub fn diagnose(lang: Lang) -> (String, usize) {
         let has_root = !sh_out("awk '!/^#/ && NF>=2 && $2 == \"/\"' /mnt/etc/fstab 2>/dev/null")
             .trim()
             .is_empty();
+        let unbootable = entries.trim() == "0" || !has_root;
         if entries.trim() == "0" {
             suggest = 3;
             check(
@@ -1352,23 +1631,46 @@ pub fn diagnose(lang: Lang) -> (String, usize) {
                 &t(lang, "rec.dg_fstab_no_root"),
             );
         }
-        check(
-            &mut out,
-            &mut problems,
-            &ok_tag,
-            &bad_tag,
-            missing.trim().is_empty(),
-            &t(lang, "rec.dg_fstab_ok")
-                .replace("{n}", entries.trim())
-                .replace(
-                    "{stat}",
-                    sh_out("stat -c '%s B, %y' /mnt/etc/fstab 2>/dev/null | cut -c1-28").trim(),
+        // AND THEN IT SAID "ok" ANYWAY. This check ran unconditionally, so an
+        // fstab that cannot boot anything got its verdict and, on the very next
+        // line, "present, 0 entries, and everything it names exists" — which is
+        // true of an empty file only in the way that every statement about an
+        // empty set is true. Two contradictory lines is worse than either alone:
+        // the reader picks the reassuring one. A file already known to be
+        // unbootable gets no second, softer verdict; only a genuine extra
+        // finding (a volume it names that is gone) is still worth printing.
+        if !unbootable {
+            check(
+                &mut out,
+                &mut problems,
+                &ok_tag,
+                &bad_tag,
+                missing.trim().is_empty(),
+                &t(lang, "rec.dg_fstab_ok")
+                    .replace("{n}", entries.trim())
+                    .replace(
+                        "{stat}",
+                        sh_out("stat -c '%s B, %y' /mnt/etc/fstab 2>/dev/null | cut -c1-28").trim(),
+                    ),
+                &t(lang, "rec.dg_fstab_bad").replace(
+                    "{list}",
+                    &missing.split_whitespace().collect::<Vec<_>>().join(", "),
                 ),
-            &t(lang, "rec.dg_fstab_bad").replace(
-                "{list}",
-                &missing.split_whitespace().collect::<Vec<_>>().join(", "),
-            ),
-        );
+            );
+        } else if !missing.trim().is_empty() {
+            check(
+                &mut out,
+                &mut problems,
+                &ok_tag,
+                &bad_tag,
+                false,
+                "",
+                &t(lang, "rec.dg_fstab_bad").replace(
+                    "{list}",
+                    &missing.split_whitespace().collect::<Vec<_>>().join(", "),
+                ),
+            );
+        }
     } else {
         // The loudest single cause there is, and it cascades: with no fstab
         // nothing else gets mounted either, so it is fixed FIRST and everything
@@ -1405,16 +1707,72 @@ pub fn diagnose(lang: Lang) -> (String, usize) {
     // An EFI system partition with something bootable on it. Only meaningful on
     // a UEFI machine, so it is reported as information there and skipped on BIOS.
     if std::path::Path::new("/sys/firmware/efi").exists() && !boot_unknown {
-        let efi = sh_out("find /mnt/boot -maxdepth 4 -iname '*.efi' 2>/dev/null | head -5");
-        check(
-            &mut out,
-            &mut problems,
-            &ok_tag,
-            &bad_tag,
-            !efi.trim().is_empty(),
-            &t(lang, "rec.dg_efi_ok"),
-            &t(lang, "rec.dg_efi_bad"),
-        );
+        let probe = sh_out(&esp_probe("/mnt"));
+        let esp_at = probe
+            .lines()
+            .find_map(|l| l.strip_prefix("esp="))
+            .unwrap_or("")
+            .to_string();
+        let dirs: Vec<&str> = probe
+            .lines()
+            .filter_map(|l| l.strip_prefix("dir="))
+            .collect();
+        let files: Vec<&str> = probe
+            .lines()
+            .filter_map(|l| l.strip_prefix("file="))
+            .collect();
+
+        if esp_at.is_empty() {
+            // NOT MOUNTED IS NOT "BROKEN". Nothing can be said about a partition
+            // nobody looked at, and saying it is empty would send someone to
+            // reinstall a bootloader that is sitting there intact.
+            unknowns += 1;
+            out.push_str(&format!(
+                "{}  {}\n",
+                t(lang, "rec.dg_unknown"),
+                t(lang, "rec.dg_efi_unknown")
+            ));
+        } else {
+            if files.is_empty() {
+                suggest = 1; // reinstall the bootloader
+            }
+            check(
+                &mut out,
+                &mut problems,
+                &ok_tag,
+                &bad_tag,
+                !files.is_empty(),
+                &t(lang, "rec.dg_efi_ok"),
+                &t(lang, "rec.dg_efi_bad"),
+            );
+            // THE EVIDENCE, both ways round. A verdict about a bootloader is
+            // unfalsifiable from the outside, and this one was wrong for weeks
+            // without anything on screen to hint at it.
+            let dash = "—";
+            out.push_str(&format!(
+                "      {}\n",
+                t(lang, "rec.dg_efi_evidence")
+                    .replace("{esp}", &esp_at)
+                    .replace(
+                        "{dirs}",
+                        if dirs.is_empty() {
+                            dash.to_string()
+                        } else {
+                            dirs.join(", ")
+                        }
+                        .as_str()
+                    )
+                    .replace(
+                        "{files}",
+                        if files.is_empty() {
+                            dash.to_string()
+                        } else {
+                            files.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+                        }
+                        .as_str()
+                    )
+            ));
+        }
         let entries = sh_out("efibootmgr 2>/dev/null | grep -c '^Boot0'");
         check(
             &mut out,
@@ -1681,6 +2039,213 @@ fn shquote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The check that said a machine with an emptied ESP was fine.
+    ///
+    /// It is RUN here, against a tree built to look like the failure: a GRUB
+    /// system whose /boot/grub/x86_64-efi holds core.efi and grub.efi (they
+    /// always do — they come with the package), and an ESP carrying the entry
+    /// directory and nothing inside it. That is a machine that cannot boot, and
+    /// the old query matched grub's own module files and called it healthy.
+    ///
+    /// Reading the code did not catch this and could not have: both spellings
+    /// look equally reasonable on the page. Only running it against the layout
+    /// tells them apart.
+    #[test]
+    fn grubs_own_module_files_are_not_something_the_firmware_can_load() {
+        let base = std::env::temp_dir().join(format!("artix-esp-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("boot/grub/x86_64-efi")).unwrap();
+        std::fs::write(base.join("boot/grub/x86_64-efi/core.efi"), b"not bootable").unwrap();
+        std::fs::write(base.join("boot/grub/x86_64-efi/grub.efi"), b"not bootable").unwrap();
+        std::fs::create_dir_all(base.join("boot/efi/EFI/maple-ember71")).unwrap();
+        std::fs::create_dir_all(base.join("boot/efi/EFI/BOOT")).unwrap();
+
+        let root = base.to_str().unwrap();
+        let out = sh_out(&esp_probe(root));
+        assert!(
+            out.contains("esp=/boot/efi"),
+            "the ESP is at /boot/efi and the probe must say so: {out}"
+        );
+        assert!(
+            out.contains("dir=maple-ember71"),
+            "the entry directory is the name a repair has to reuse: {out}"
+        );
+        assert!(
+            !out.contains("file="),
+            "an ESP with no payload must report NOTHING loadable — \
+             /boot/grub/x86_64-efi/*.efi belongs to the grub package and no \
+             firmware ever loads it: {out}"
+        );
+
+        // Put a real payload where the firmware looks, and the same probe finds it.
+        std::fs::write(
+            base.join("boot/efi/EFI/maple-ember71/grubx64.efi"),
+            b"bootable",
+        )
+        .unwrap();
+        let out = sh_out(&esp_probe(root));
+        assert!(
+            out.contains("file=EFI/maple-ember71/grubx64.efi"),
+            "a loader on the ESP must be found: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One generator, two callers, and the difference between them is a prefix.
+    ///
+    /// The repair runs INSIDE the target, where every mount point is already
+    /// what it will be at boot. The install runs from the ISO with the target at
+    /// /mnt, and an fstab full of `/mnt/boot/efi` would be nonsense — so the
+    /// prefix comes off, and the root, which strips to nothing, becomes `/`.
+    /// Both halves are checked here because getting either one wrong produces a
+    /// FILE, not an error: an fstab that looks plausible and mounts nothing.
+    #[test]
+    fn the_shared_fstab_generator_knows_where_the_target_is() {
+        let inside = fstab_gen_fn("");
+        let from_iso = fstab_gen_fn("/mnt");
+        assert!(
+            !inside.contains("@@ROOT@@") && !from_iso.contains("@@ROOT@@"),
+            "a placeholder survived into the script"
+        );
+        assert!(
+            from_iso.contains("-R /mnt"),
+            "from the ISO the scan has to be limited to the target's subtree"
+        );
+        assert!(
+            !inside.contains("-R "),
+            "inside the target there is no subtree to limit to: {inside}"
+        );
+        assert!(
+            from_iso.contains("pfx=\"/mnt\"") && from_iso.contains("[ -n \"$tgt\" ] || tgt=/"),
+            "the target prefix is not stripped from the mount points"
+        );
+        for script in [&inside, &from_iso] {
+            let out = std::process::Command::new("sh")
+                .args(["-n", "-c", script])
+                .output()
+                .expect("run sh -n");
+            assert!(
+                out.status.success(),
+                "the generator is not valid sh:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The boot list, scanned off a directory of real symlinks.
+    ///
+    /// RUN, not read: the whole feature rests on one `find` expression, and the
+    /// two things that could quietly be wrong about it — whether the mtime is
+    /// the SYMLINK's own or the service description's, and whether the newest
+    /// really comes first — are invisible on the page and obvious here. A link
+    /// pointing at a file written last year must still sort by the day it was
+    /// enabled, or the list answers a different question than the one asked.
+    #[test]
+    fn the_boot_list_is_newest_first_and_dated_by_the_link_not_its_target() {
+        let base = std::env::temp_dir().join(format!("artix-bootd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let d = base.join("boot.d");
+        std::fs::create_dir_all(&d).unwrap();
+        // An old service description, and three links made in order.
+        std::fs::write(base.join("ancient"), b"# service").unwrap();
+        for name in ["dbus", "elogind", "my-broken-thing"] {
+            std::os::unix::fs::symlink(base.join("ancient"), d.join(name)).unwrap();
+            // Same-second creation still orders correctly (find reports
+            // fractional seconds), but a nudge keeps it true on a filesystem
+            // with coarse timestamps.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        // A placeholder that is not a service, and must not be offered as one.
+        std::fs::write(d.join(".KEEP"), b"").unwrap();
+
+        let out = sh_out(&BOOT_D_SCAN.replace("@@DIR@@", &shquote(d.to_str().unwrap())));
+        let svc = parse_boot_services(&out);
+        let names: Vec<&str> = svc.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["my-broken-thing", "elogind", "dbus"],
+            "the list must put the most recently enabled service first"
+        );
+        assert!(
+            !names.contains(&".KEEP"),
+            "a dotfile placeholder is not a service"
+        );
+        assert!(
+            svc[0].target.ends_with("ancient"),
+            "each row must say where the link leads: {:?}",
+            svc[0].target
+        );
+        assert!(
+            svc[0].stamp.len() == 16 && svc[0].stamp.contains('-'),
+            "the date is what makes the order legible: {:?}",
+            svc[0].stamp
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Disabling says how to undo itself, and never mangles an odd name.
+    #[test]
+    fn disabling_a_service_is_reversible_and_says_how() {
+        let script =
+            disable_services_script(&["my-broken-thing".to_string(), "odd'name".to_string()]);
+        assert!(
+            script.contains("dinitctl -o -d /etc/dinit.d disable"),
+            "the tool that owns this job is asked first, offline: {script}"
+        );
+        assert!(
+            script.contains("rm -f \"/etc/dinit.d/boot.d/$s\""),
+            "and there is a fallback for a dinitctl without --offline"
+        );
+        assert!(
+            script.contains("dinitctl enable $s"),
+            "every line must say how to put the service back"
+        );
+        assert!(
+            script.contains("'odd'\\''name'"),
+            "a service name with a quote in it must not break out of the script"
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "the generated script is not valid sh:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// An ESP nobody mounted is a question, not an answer.
+    #[test]
+    fn an_unmounted_esp_is_reported_as_unknown_rather_than_empty() {
+        let base = std::env::temp_dir().join(format!("artix-esp-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("boot/efi")).unwrap();
+        let out = sh_out(&esp_probe(base.to_str().unwrap()));
+        assert!(
+            out.trim().is_empty(),
+            "with no EFI directory anywhere the probe says nothing at all, \
+             and the caller turns that into '?', not into a problem: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The reassuring line that followed the damning one.
+    #[test]
+    fn an_fstab_that_cannot_boot_gets_no_second_softer_verdict() {
+        let code = include_str!("recovery.rs");
+        let at = code
+            .find("let unbootable = entries.trim()")
+            .expect("the fstab section must know when the file cannot boot");
+        let tail = &code[at..at + 2200];
+        assert!(
+            tail.contains("if !unbootable {"),
+            "the 'present, and everything it names exists' verdict must be \
+             skipped for a file already known to be unbootable — an empty \
+             fstab satisfies it vacuously, and the reader believes the kind line"
+        );
+    }
+
     fn part(path: &str, size: &str, fstype: &str, label: &str) -> Partition {
         Partition {
             path: path.into(),
@@ -1750,7 +2315,8 @@ mod tests {
     /// the search checked it, and the search silently never happened.
     #[test]
     fn the_missing_home_search_is_triggered_across_the_subshell() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(
             s.contains("/run/home-missing"),
             "a flag file crosses the subshell boundary; a variable does not"
@@ -1797,7 +2363,8 @@ mod tests {
     /// five evenings of this, is not a reasonable thing to ask of anybody.
     #[test]
     fn a_missing_home_is_searched_for_on_the_other_partitions() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(s.contains("Looking for those home directories"));
         // Read-only, and only on filesystems that could hold a home.
         assert!(s.contains("mount -o ro") && s.contains("btrfs|ext2|ext3|ext4|xfs|f2fs"));
@@ -1819,7 +2386,7 @@ mod tests {
     #[test]
     fn a_generated_fstab_names_subvolumes_not_their_ids() {
         assert!(
-            REGENERATE_FSTAB.contains("s/subvolid=[0-9]*,//"),
+            regenerate_fstab().contains("s/subvolid=[0-9]*,//"),
             "subvolid is stripped from the options it writes"
         );
     }
@@ -1829,7 +2396,8 @@ mod tests {
     /// that mounts an EMPTY subvolume looks exactly like a correct one.
     #[test]
     fn the_repair_reports_the_state_of_each_home_directory() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(s.contains("Home directories as they stand right now"));
         assert!(
             s.contains("DOES NOT EXIST. The login will loop"),
@@ -1853,7 +2421,8 @@ mod tests {
     /// evenings were spent on that.
     #[test]
     fn the_fstab_repair_does_not_need_tools_the_target_lacks() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(s.contains("gen_fstab() {"), "it carries its own generator");
         assert!(
             s.contains("command -v fstabgen"),
@@ -1893,7 +2462,8 @@ mod tests {
     /// unbootable for the fifth time.
     #[test]
     fn the_repair_cross_checks_its_result_against_the_install_record() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(
             s.contains("/boot/artix-tui-layout.conf"),
             "it looks for the record on the ESP as well as in /etc"
@@ -1962,7 +2532,8 @@ mod tests {
     /// nothing", and it was true every time.
     #[test]
     fn a_regenerated_fstab_carries_the_subvolumes_and_the_swap() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         for sv in ["@home /home", "@log /var/log", "@cache /var/cache"] {
             assert!(s.contains(sv), "the repair mounts {sv} before generating");
         }
@@ -2074,7 +2645,8 @@ mod tests {
     /// fstab did nothing".
     #[test]
     fn the_fstab_repair_refuses_to_install_a_file_that_cannot_boot() {
-        let s = REGENERATE_FSTAB;
+        let s = regenerate_fstab();
+        let s = s.as_str();
         assert!(
             s.contains("ls /boot/vmlinuz-*"),
             "the gate is a kernel, not an empty directory"
@@ -2235,6 +2807,74 @@ mod tests {
     /// The mounting logic runs real commands against real disks, so there is
     /// nothing here a unit test can drive. What CAN be checked is that the gate
     /// asks about structure, which is what this does.
+    /// THE BOOTLOADER REPAIR READS THE ESP, and reuses the id already there.
+    ///
+    /// Reported after a real repair on hardware: "it did nothing, I had to do it
+    /// by hand." Three faults, each enough on its own.
+    ///
+    /// It decided what was installed by looking for `/boot/grub` — a directory
+    /// a broken system often does not have mounted — and gave up otherwise,
+    /// without ever listing `$esp/EFI`, which is where the answer is. The rEFInd
+    /// and Limine branches tested `/boot/EFI/...` while the ESP had been found
+    /// at `$esp` (usually `/boot/efi`), so neither could ever match. And
+    /// `--bootloader-id=artix` was hardcoded, which adds a SECOND firmware entry
+    /// beside the broken one instead of restoring it.
+    ///
+    /// The removable fallback matters just as much: a firmware that lost its
+    /// NVRAM entry boots only `\EFI\BOOT\BOOTX64.EFI`, so a repair that skips
+    /// it "succeeds" and the machine still goes to the firmware menu.
+    #[test]
+    fn the_bootloader_repair_reads_the_esp_and_keeps_the_existing_id() {
+        let s = REINSTALL_BOOTLOADER;
+        assert!(
+            s.contains("ls -1 \"$esp/EFI\""),
+            "the repair never lists what is on the ESP, which is the one place \
+             that says which loader is installed"
+        );
+        assert!(
+            s.contains("bl_fallback"),
+            "the id is only found when a grub payload survives — but a machine \
+             whose loader is gone still has the DIRECTORY, and that name is what \
+             the repair must put back"
+        );
+        assert!(
+            s.contains("grubx64.efi") && s.contains("bl_id=\"$n\""),
+            "the existing bootloader-id is not reused — a fresh one leaves the \
+             broken firmware entry in place and adds another beside it"
+        );
+        assert!(
+            s.contains("--removable"),
+            "no removable fallback: a machine whose NVRAM entry is gone boots \
+             only \\EFI\\BOOT\\BOOTX64.EFI and this repair would not restore it"
+        );
+        assert!(
+            s.contains("$esp/EFI/refind") && s.contains("$esp/EFI/limine"),
+            "rEFInd/Limine are still looked for under /boot/EFI instead of the \
+             ESP that was just located"
+        );
+        assert!(
+            !s.contains("[ -d /boot/EFI/refind ]"),
+            "the old /boot/EFI path is still there and can never match"
+        );
+        assert!(
+            s.contains("efivarfs") && s.contains("remount,rw"),
+            "efivarfs is never made writable, so grub-install writes the files \
+             and silently creates no firmware entry — the machine still boots \
+             to the setup menu and the repair looks like it did nothing"
+        );
+        assert!(
+            s.contains("fsck.vfat"),
+            "the ESP is never checked before being written to: a hard reset \
+             leaves the FAT dirty, and a loader written onto that is one the \
+             firmware cannot load"
+        );
+        assert!(
+            s.contains("efibootmgr"),
+            "the firmware's own boot entries are never shown, so the person \
+             cannot tell a missing entry from a missing loader"
+        );
+    }
+
     #[test]
     fn the_root_check_does_not_depend_on_the_file_most_likely_to_be_broken() {
         let whole = std::fs::read_to_string("src/system/recovery.rs")

@@ -90,6 +90,12 @@
 #               has drives goes straight to the VM. This is how you change your
 #               mind without emptying the folder.
 #
+#   --fresh-nvram   throw away ovmf-vars.fd, so the firmware comes up with an
+#               EMPTY boot menu. UEFI entries live in the firmware, not on the
+#               disk, so reinstalling over a drive leaves the old entry behind —
+#               after a dozen test installs the menu is a dozen dead ids long.
+#               The drives are not touched.
+#
 #   USBKEY=0  leave the stick out for one run without deleting it.
 set -eu
 
@@ -122,10 +128,18 @@ fi
 # helper, and a folder that already has drives goes straight to the VM. That is
 # right almost always, and wrong exactly when you want to change something.
 want_settings=0
+fresh_nvram=0
 args=""
 for a in "$@"; do
     case "$a" in
         --settings|--setup) want_settings=1 ;;
+        # THE FIRMWARE IS A FILE HERE, and it remembers. UEFI boot entries live
+        # in NVRAM, not on the disk, so wiping a drive and reinstalling leaves
+        # the old entry behind — on this stand that is ovmf-vars.fd, and after a
+        # dozen test installs the boot menu is a dozen dead ids long. The
+        # installer now removes the ones it orphans itself; this is the bigger
+        # hammer, for when the menu should look like a machine out of the box.
+        --fresh-nvram|--clean-bios) fresh_nvram=1 ;;
         *) args="$args $a" ;;
     esac
 done
@@ -139,11 +153,12 @@ mode="${1:-install}"
 case "$mode" in
     install|boot|pinnacle|bios|verify|disks|drive|key|type|shot|stop) ;;
     *)
-        echo "usage: $0 [install|boot|pinnacle|bios|verify|disks|drive|key|type|shot|stop] [--settings]" >&2
+        echo "usage: $0 [install|boot|pinnacle|bios|verify|disks|drive|key|type|shot|stop] [--settings] [--fresh-nvram]" >&2
         echo "       drive      — boot the ISO headless and LEAVE IT RUNNING" >&2
         echo "       key/type/shot/stop — drive that VM and photograph it" >&2
         echo "       disks      — set the stand up and stop there" >&2
         echo "       --settings — set it up, then carry on into the mode above" >&2
+        echo "       --fresh-nvram — forget every UEFI boot entry (factory firmware)" >&2
         echo "       USBKEY=0   — leave the stick out for this run" >&2
         exit 2
         ;;
@@ -662,7 +677,12 @@ if [ "$mode" = verify ] || [ "$mode" = drive ]; then
     rm -f "$VARS"
 fi
 
-gpu_args="-vga none -device virtio-vga -display gtk,show-cursor=on"
+# `zoom-to-fit=on` SCALES THE GUEST TO THE WINDOW. Without it the guest keeps
+# its own resolution and a maximised window shows that picture stranded in a
+# corner with the rest black — which reads as a broken display rather than as a
+# window bigger than what is inside it. Reported from a tiling setup, where the
+# window does not get to choose its own size.
+gpu_args="-vga none -device virtio-vga -display gtk,show-cursor=on,zoom-to-fit=on"
 fw_args="-drive if=pflash,format=raw,readonly=on,file=$CODE -drive if=pflash,format=raw,file=$VARS"
 cd_args=""
 
@@ -691,7 +711,7 @@ case "$mode" in
     boot)
         ;;
     pinnacle)
-        gpu_args="-vga none -device virtio-vga-gl -display gtk,gl=on,show-cursor=on"
+        gpu_args="-vga none -device virtio-vga-gl -display gtk,gl=on,show-cursor=on,zoom-to-fit=on"
         ;;
     bios)
         # Legacy boot: SeaBIOS, so no pflash at all.
@@ -710,6 +730,13 @@ case "$mode" in
         ;;
 esac
 
+if [ "$fresh_nvram" -eq 1 ] && [ -f "$VARS" ]; then
+    # Only the firmware's variables — the drives, and the systems on them, are
+    # not touched. The machine comes up with an empty boot menu and finds
+    # \EFI\BOOT\BOOTX64.EFI, the removable fallback every install writes.
+    rm -f "$VARS"
+    echo ">> UEFI NVRAM reset: the boot menu starts empty this run."
+fi
 [ -f "$VARS" ] || cp "$VARS_TEMPLATE" "$VARS"
 
 # ── Attach whatever drives the folder holds ──────────────────────────────────
